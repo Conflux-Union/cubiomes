@@ -13,6 +13,7 @@ set(CMAKE_C_FLAGS_DEBUG "-O0 -g3 -DDEBUG")
 
 set(HEADERS
 	finders.h
+	terrain_features.h
 	generator.h
 	layers.h
 	biomenoise.h
@@ -24,6 +25,7 @@ set(HEADERS
 )
 set(SOURCES
 	finders.c
+	terrain_features.c
 	generator.c
 	layers.c
 	biomenoise.c
@@ -41,5 +43,4 @@ add_library(cubiomes_static STATIC $<TARGET_OBJECTS:objects>)
 
 install(TARGETS cubiomes cubiomes_static DESTINATION lib)
 install(FILES ${HEADERS} DESTINATION include)
-
 

@@ -13,7 +13,7 @@ else
 	#RM = rm
 endif
 
-.PHONY : all debug release native libcubiomes clean
+.PHONY : all debug release native libcubiomes test_features clean
 
 all: release
 
@@ -30,10 +30,17 @@ release: CFLAGS += -fPIC
 endif
 
 
-libcubiomes: noise.o biomes.o layers.o biomenoise.o generator.o finders.o util.o quadbase.o
+libcubiomes: noise.o biomes.o layers.o biomenoise.o generator.o finders.o terrain_features.o util.o quadbase.o
 	$(AR) $(ARFLAGS) libcubiomes.a $^
 
+test_features: feature_tests.c libcubiomes
+	$(CC) $(CFLAGS) -o $@ feature_tests.c libcubiomes.a $(LDFLAGS)
+	./$@
+
 finders.o: finders.c finders.h
+	$(CC) -c $(CFLAGS) $<
+
+terrain_features.o: terrain_features.c terrain_features.h
 	$(CC) -c $(CFLAGS) $<
 
 generator.o: generator.c generator.h
@@ -61,5 +68,4 @@ quadbase.o: quadbase.c quadbase.h
 	$(CC) -c $(CFLAGS) $<
 
 clean:
-	$(RM) *.o *.a
-
+	$(RM) *.o *.a test_features

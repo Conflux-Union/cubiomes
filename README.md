@@ -184,6 +184,52 @@ int main()
 }
 ```
 
+### Minecraft 1.17.1 Terrain Features
+
+The `terrain_features.h` API adds chunk-scoped queries for a seed without
+loading or modifying a world save:
+
+```C
+#include "terrain_features.h"
+
+Generator g;
+setupGenerator(&g, MC_1_17_1, 0);
+applySeed(&g, DIM_OVERWORLD, 6512112982729996127ULL);
+
+NaturalTreeCandidate trees[64];
+NaturalStructure structures[8];
+size_t treeCount, structureCount;
+getChunkNaturalTreeCandidates(&g, 16, 0, trees, 64, &treeCount);
+// Returns FEATURE_PARTIAL because only the documented structure types have
+// bounds support.
+getChunkNaturalStructures(&g, 16, 0, structures, 8, &structureCount);
+
+uint8_t caveMask[4096]; // 16 * 16 * 128 bits
+getChunkCaveCarvingMask(&g, 16, 0, 0, 127,
+    caveMask, sizeof(caveMask));
+```
+
+These queries intentionally expose their accuracy instead of presenting
+estimated data as final block state:
+
+| Data | Accuracy |
+| --- | --- |
+| Structure start and type | Exact for six supported 1.17.1 structure types; the query returns `FEATURE_PARTIAL` |
+| Structure bounds | Approximate starting-template bounds; not the full jigsaw structure |
+| First tree-like vegetation candidate | Exact decorator X/Z and type; approximate Y |
+| Later tree-like vegetation candidates | Approximate because preceding feature generation consumes terrain-dependent random values |
+| Cave mask | Exact cave/canyon path RNG and geometry before terrain checks |
+
+Jungle bushes and huge mushrooms have distinct candidate types and can be
+filtered out when only trees are needed. Tree queries return `FEATURE_PARTIAL`
+for biomes whose vegetation pipeline is not implemented. The cave mask is a
+candidate mask, not a final `cave_air` block map. Vanilla
+can reject an entire carving region when it finds fluid, reject individual
+materials, place lava at Y=10 and below, and later overwrite blocks. Lakes,
+dungeons, and structures can also place `cave_air` independently. Reproducing
+those final states requires block-level terrain generation, which remains out
+of scope for cubiomes.
+
 #### Quad-Witch-Huts
 
 A commonly desired feature is Quad-Witch-Huts or similar multi-structure clusters. To test for these types of seeds, we can look a little deeper into how the generation attempts are determined. Notice that the positions depend only on the structure type, region coordinates, and the lower 48 bits of the seed. Also, once we have found a seed with the desired generation attempts, we can move them around by transforming the 48-bit seed using `moveStructure()`. This means there is a set of seed bases that can function as a starting point to generate all other seeds with similar structure placement.
@@ -303,8 +349,6 @@ int main()
     return 0;
 }
 ```
-
-
 
 
 
