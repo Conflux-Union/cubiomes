@@ -392,6 +392,10 @@ int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
         const double *amplitudes, int omin, int len, int nmax)
 {
     static const uint64_t md5_octave_n[][2] = {
+        {0xc613bf766619f992, 0x954753f86691b86a}, // md5 "octave_-16"
+        {0x7eee475a921c6cf5, 0xf2bd39426f8da413}, // md5 "octave_-15"
+        {0xfc0027cef9683114, 0xb758d3954dcbfdd3}, // md5 "octave_-14"
+        {0xd1fc8a05be565eca, 0xdc2a3915cbdda25b}, // md5 "octave_-13"
         {0xb198de63a8012672, 0x7b84cad43ef7b5a8}, // md5 "octave_-12"
         {0x0fd787bfbc403ec3, 0x74a4a31ca21b48b8}, // md5 "octave_-11"
         {0x36d326eed40efeb2, 0x5be9ce18223c636a}, // md5 "octave_-10"
@@ -406,23 +410,15 @@ int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
         {0xdffa22b534c5f608, 0xb9b67517d3665ca9}, // md5 "octave_-1"
         {0xd50708086cef4d7c, 0x6e1651ecc7f43309}, // md5 "octave_0"
     };
-    static const double lacuna_ini[] = { // -omin = 3..12
-        1, .5, .25, 1./8, 1./16, 1./32, 1./64, 1./128, 1./256, 1./512, 1./1024,
-        1./2048, 1./4096,
-    };
-    static const double persist_ini[] = { // len = 4..9
-        0, 1, 2./3, 4./7, 8./15, 16./31, 32./63, 64./127, 128./255, 256./511,
-    };
 #if DEBUG
-    if (-omin < 0 || -omin >= (int) (sizeof(lacuna_ini)/sizeof(double)) ||
-        len < 0 || len >= (int) (sizeof(persist_ini)/sizeof(double)))
+    if (omin < -16 || len < 1 || omin + len > 1)
     {
         printf("Fatal: octave initialization out of range\n");
         exit(1);
     }
 #endif
-    double lacuna = lacuna_ini[-omin];
-    double persist = persist_ini[len];
+    double lacuna = pow(2.0, omin);
+    double persist = pow(2.0, len-1) / (pow(2.0, len) - 1.0);
     uint64_t xlo = xNextLong(xr);
     uint64_t xhi = xNextLong(xr);
     int i = 0, n = 0;
@@ -432,8 +428,8 @@ int xOctaveInit(OctaveNoise *noise, Xoroshiro *xr, PerlinNoise *octaves,
         if (amplitudes[i] == 0)
             continue;
         Xoroshiro pxr;
-        pxr.lo = xlo ^ md5_octave_n[12 + omin + i][0];
-        pxr.hi = xhi ^ md5_octave_n[12 + omin + i][1];
+        pxr.lo = xlo ^ md5_octave_n[16 + omin + i][0];
+        pxr.hi = xhi ^ md5_octave_n[16 + omin + i][1];
         xPerlinInit(&octaves[n], &pxr);
         octaves[n].amplitude = amplitudes[i] * persist;
         octaves[n].lacunarity = lacuna;
@@ -552,10 +548,7 @@ int xDoublePerlinInit(DoublePerlinNoise *noise, Xoroshiro *xr,
         len--;
     for (i = 0; amplitudes[i] == 0.0; i++)
         len--;
-    static const double amp_ini[] = { // (5 ./ 3) * len / (len + 1), len = 2..9
-        0, 5./6, 10./9, 15./12, 20./15, 25./18, 30./21, 35./24, 40./27, 45./30,
-    };
-    noise->amplitude = amp_ini[len];
+    noise->amplitude = (5.0 / 3.0) * len / (len + 1.0);
     return n;
 }
 
@@ -570,4 +563,3 @@ double sampleDoublePerlin(const DoublePerlinNoise *noise,
 
     return v * noise->amplitude;
 }
-

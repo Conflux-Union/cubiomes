@@ -624,20 +624,7 @@ int mapApproxHeight(float *y, int *ids, const Generator *g, const SurfaceNoise *
     {
         if (g->bn.nptype != -1 && g->bn.nptype != NP_DEPTH)
             return 1;
-        int64_t i, j;
-        for (j = 0; j < h; j++)
-        {
-            for (i = 0; i < w; i++)
-            {
-                int flags = 0;//SAMPLE_NO_SHIFT;
-                int64_t np[6];
-                int id = sampleBiomeNoise(&g->bn, np, x+i, 0, z+j, 0, flags);
-                if (ids)
-                    ids[j*w+i] = id;
-                y[j*w+i] = np[NP_DEPTH] / 76.0;
-            }
-        }
-        return 0;
+        return mapOverworldTerrainHeight(y, ids, &g->bn, x, z, w, h);
     }
     else if (g->mc <= MC_B1_7)
     {
@@ -765,7 +752,6 @@ int mapApproxHeight(float *y, int *ids, const Generator *g, const SurfaceNoise *
     free(depth);
     return 0;
 }
-
 
 
 

@@ -125,13 +125,47 @@ enum
     NP_WEIRDNESS        = 5,
     NP_MAX
 };
+
+enum
+{
+    TN_SPAGHETTI_3D_RARITY,
+    TN_SPAGHETTI_3D_THICKNESS,
+    TN_SPAGHETTI_3D_1,
+    TN_SPAGHETTI_3D_2,
+    TN_SPAGHETTI_ROUGHNESS,
+    TN_SPAGHETTI_ROUGHNESS_MODULATOR,
+    TN_CAVE_ENTRANCE,
+    TN_NOODLE,
+    TN_NOODLE_THICKNESS,
+    TN_NOODLE_RIDGE_A,
+    TN_NOODLE_RIDGE_B,
+    TN_PILLAR,
+    TN_PILLAR_RARENESS,
+    TN_PILLAR_THICKNESS,
+    TN_SPAGHETTI_2D,
+    TN_SPAGHETTI_2D_ELEVATION,
+    TN_SPAGHETTI_2D_MODULATOR,
+    TN_SPAGHETTI_2D_THICKNESS,
+    TN_CAVE_LAYER,
+    TN_CAVE_CHEESE,
+    TN_MAX,
+};
 // Overworld biome generator for 1.18+
 STRUCT(BiomeNoise)
 {
     DoublePerlinNoise climate[NP_MAX];
     PerlinNoise oct[2*23]; // buffer for octaves in double perlin noise
+    DoublePerlinNoise jagged;
+    PerlinNoise jaggedOct[2*16];
+    DoublePerlinNoise terrainNoise[TN_MAX];
+    PerlinNoise terrainNoiseOct[TN_MAX][18];
+    SurfaceNoise terrain;
     Spline *sp;
+    Spline *factorSp;
+    Spline *jaggedSp;
     SplineStack ss;
+    SplineStack factorSs;
+    SplineStack jaggedSs;
     int nptype;
     int mc;
 };
@@ -274,6 +308,22 @@ void setClimateParaSeed(BiomeNoise *bn, uint64_t seed, int large, int nptype, in
 double sampleClimatePara(const BiomeNoise *bn, int64_t *np, double x, double z);
 
 /**
+ * Maps the 1.18+ Overworld surface using the same offset/factor/jaggedness
+ * splines and terrain noise that feed Vanilla's sloped-cheese density. The
+ * horizontal coordinates are at biome scale (one sample per four blocks).
+ */
+int mapOverworldTerrainHeight(float *y, int *ids, const BiomeNoise *bn,
+    int x, int z, int w, int h);
+
+/**
+ * Generates a 2D biome map at the predicted surface instead of the cave-level
+ * Y=0 plane. Scale 1 applies Vanilla's 3D Voronoi access; scale 4 returns the
+ * quart-grid biome noise used as its source.
+ */
+int mapOverworldSurfaceBiome(int *out, const BiomeNoise *bn, uint64_t sha,
+    int scale, int x, int z, int w, int h);
+
+/**
  * Currently, in 1.18, we have to generate biomes one chunk at a time to get an
  * accurate mapping of the biomes in the level storage, as there is no longer a
  * unique mapping from noise points to biomes (MC-241546). Note that the results
@@ -311,6 +361,3 @@ Range getVoronoiSrcRange(Range r);
 #endif
 
 #endif /* BIOMENOISE_H_ */
-
-
-
