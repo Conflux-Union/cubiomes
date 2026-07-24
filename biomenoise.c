@@ -944,6 +944,16 @@ static void initNamedTerrainNoise(
         bn->terrainNoiseOct[index], amplitudes, firstOctave, length, -1);
 }
 
+static void initNamedAquiferNoise(
+    BiomeNoise *bn, int index, uint64_t xlo, uint64_t xhi,
+    uint64_t saltLo, uint64_t saltHi, int firstOctave)
+{
+    static const double one[] = { 1.0 };
+    Xoroshiro xr = { xlo ^ saltLo, xhi ^ saltHi };
+    xDoublePerlinInit(&bn->aquiferNoise[index], &xr,
+        bn->aquiferNoiseOct[index], one, firstOctave, 1, -1);
+}
+
 void setBiomeSeed(BiomeNoise *bn, uint64_t seed, int large)
 {
     Xoroshiro pxr;
@@ -1013,6 +1023,21 @@ void setBiomeSeed(BiomeNoise *bn, uint64_t seed, int large)
     initNamedTerrainNoise(bn, TN_CAVE_CHEESE, xlo, xhi,
         0xb159093bc7baaa50ULL, 0x53abc45424417c20ULL,
         caveCheese, -8, 9);
+
+    initNamedAquiferNoise(bn, AN_BARRIER, xlo, xhi,
+        0xe170fda6c51d093fULL, 0x134f3e4bc3f40b0cULL, -3);
+    initNamedAquiferNoise(bn, AN_FLOODEDNESS, xlo, xhi,
+        0x1b5d4f85fdc2d89eULL, 0x22c7e3e611bf67c6ULL, -7);
+    initNamedAquiferNoise(bn, AN_SPREAD, xlo, xhi,
+        0x08f136f47cd9aaa2ULL, 0x3666182f5fa0ac6fULL, -5);
+    initNamedAquiferNoise(bn, AN_LAVA, xlo, xhi,
+        0x0e5121277ab51b72ULL, 0x2724d8c56aa005baULL, -1);
+    Xoroshiro aquifer = {
+        xlo ^ 0x7bb15cc403c6ace6ULL,
+        xhi ^ 0x0bdd56bc9d232691ULL,
+    };
+    bn->aquiferSeedLo = xNextLong(&aquifer);
+    bn->aquiferSeedHi = xNextLong(&aquifer);
 
     if ((size_t)n > sizeof(bn->oct) / sizeof(*bn->oct))
     {
@@ -1435,7 +1460,7 @@ int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
 }
 
 static void sampleTerrainParameters(
-    const BiomeNoise *bn, int x, int z, float values[4])
+    const BiomeNoise *bn, double x, double z, float values[4])
 {
     double px = x;
     double pz = z;
@@ -1589,23 +1614,6 @@ static double sampleCaveEntrance(
     return entrance < tunnel ? entrance : tunnel;
 }
 
-static double sampleNoodle(
-    const BiomeNoise *bn, int x, int y, int z)
-{
-    if (y < -60 || y > 320)
-        return 64.0;
-    const double selector = sampleTerrainNoise(bn, TN_NOODLE, x, y, z);
-    if (selector < 0.0)
-        return 64.0;
-    const double thickness = mapNoiseRange(sampleTerrainNoise(
-        bn, TN_NOODLE_THICKNESS, x, y, z), -0.05, -0.1);
-    const double ridgeA = fabs(sampleTerrainNoise(
-        bn, TN_NOODLE_RIDGE_A, x * (8.0/3.0), y * (8.0/3.0), z * (8.0/3.0)));
-    const double ridgeB = fabs(sampleTerrainNoise(
-        bn, TN_NOODLE_RIDGE_B, x * (8.0/3.0), y * (8.0/3.0), z * (8.0/3.0)));
-    return thickness + 1.5 * (ridgeA > ridgeB ? ridgeA : ridgeB);
-}
-
 static double sampleSpaghettiRoughness(
     const BiomeNoise *bn, int x, int y, int z)
 {
@@ -1696,11 +1704,32 @@ static double sampleFinalTerrainDensity(
     return density;
 }
 
-static int findTerrainSurface(
-    const BiomeNoise *bn, int x4, int z4, const float values[4])
+enum {
+    MODERN_MIN_CELL_Y = -8,
+    MODERN_MAX_CELL_Y = 40,
+    MODERN_COLUMN_SIZE = MODERN_MAX_CELL_Y - MODERN_MIN_CELL_Y + 1,
+    MODERN_COLUMN_CACHE_LIMIT = 70000,
+};
+
+typedef struct {
+    double density[MODERN_COLUMN_SIZE];
+} ModernTerrainColumn;
+
+static double applyModernSurfaceSlides(double density, int blockY)
 {
-    const int blockX = x4 * 4;
-    const int blockZ = z4 * 4;
+    double alpha = (256.0 - blockY) / 16.0;
+    density = clampedLerp(alpha, -0.078125, density);
+    alpha = (blockY + 64.0) / 24.0;
+    return clampedLerp(alpha, 0.1171875, density);
+}
+
+static void sampleModernTerrainColumn(
+    ModernTerrainColumn *column, const BiomeNoise *bn, int cellX, int cellZ)
+{
+    const int blockX = cellX * 4;
+    const int blockZ = cellZ * 4;
+    float values[4];
+    sampleTerrainParameters(bn, cellX, cellZ, values);
     const double offset = -0.50375F + getSpline(bn->sp, values);
     const double factor = getSpline(bn->factorSp, values);
     const double jaggedness = getSpline(bn->jaggedSp, values);
@@ -1710,41 +1739,718 @@ static int findTerrainSurface(
         jagged *= 0.5;
     jagged *= jaggedness;
 
-    const double estimatedY = 128.0 * (1.0 + offset + jagged);
-    int upperCell = (int) ceil(estimatedY / 8.0) + 4;
-    if (upperCell < -8) upperCell = -8;
-    if (upperCell > 40) upperCell = 40;
-    double upperDensity = sampleFinalTerrainDensity(
-        bn, blockX, upperCell * 8, blockZ, offset, factor, jagged);
-    while (upperDensity > 0.0 && upperCell < 40)
+    int cellY;
+    for (cellY = MODERN_MIN_CELL_Y; cellY <= MODERN_MAX_CELL_Y; cellY++)
     {
-        upperCell++;
-        upperDensity = sampleFinalTerrainDensity(
-            bn, blockX, upperCell * 8, blockZ, offset, factor, jagged);
+        const int blockY = cellY * 8;
+        const double density = sampleFinalTerrainDensity(
+            bn, blockX, blockY, blockZ, offset, factor, jagged);
+        column->density[cellY - MODERN_MIN_CELL_Y] =
+            applyModernSurfaceSlides(density, blockY);
     }
-    if (upperDensity > 0.0)
-        return 319;
+}
 
-    int lowerCell;
-    for (lowerCell = upperCell - 1; lowerCell >= -8; lowerCell--)
+static void sampleNoodleCorner(
+    const BiomeNoise *bn, int blockX, int blockY, int blockZ,
+    double *selector, double *thickness, double *ridgeA, double *ridgeB)
+{
+    if (blockY < -60 || blockY >= 321)
     {
-        const double lowerDensity = sampleFinalTerrainDensity(
-            bn, blockX, lowerCell * 8, blockZ, offset, factor, jagged);
-        if (lowerDensity > 0.0)
+        *selector = -1.0;
+        *thickness = 0.0;
+        *ridgeA = 0.0;
+        *ridgeB = 0.0;
+        return;
+    }
+    *selector = sampleTerrainNoise(bn, TN_NOODLE,
+        blockX, blockY, blockZ);
+    *thickness = -0.075 - 0.025 * sampleTerrainNoise(
+        bn, TN_NOODLE_THICKNESS, blockX, blockY, blockZ);
+    *ridgeA = sampleTerrainNoise(bn, TN_NOODLE_RIDGE_A,
+        blockX * (8.0/3.0), blockY * (8.0/3.0), blockZ * (8.0/3.0));
+    *ridgeB = sampleTerrainNoise(bn, TN_NOODLE_RIDGE_B,
+        blockX * (8.0/3.0), blockY * (8.0/3.0), blockZ * (8.0/3.0));
+}
+
+static double sampleInterpolatedNoodle(
+    const BiomeNoise *bn, int cellX, int cellY, int cellZ,
+    double dx, double dy, double dz)
+{
+    double selector[8], thickness[8], ridgeA[8], ridgeB[8];
+    int ix, iy, iz;
+    for (iz = 0; iz < 2; iz++)
+    {
+        for (ix = 0; ix < 2; ix++)
         {
-            int blockY;
-            for (blockY = upperCell * 8 - 1; blockY >= lowerCell * 8; blockY--)
+            for (iy = 0; iy < 2; iy++)
             {
-                const double delta = (blockY - lowerCell * 8) / 8.0;
-                if (lerp(delta, lowerDensity, upperDensity) > 0.0
-                    && sampleNoodle(bn, blockX, blockY, blockZ) > 0.0)
-                    return blockY;
+                const int index = iz*4 + ix*2 + iy;
+                sampleNoodleCorner(bn,
+                    (cellX + ix) * 4,
+                    (cellY + iy) * 8,
+                    (cellZ + iz) * 4,
+                    selector + index, thickness + index,
+                    ridgeA + index, ridgeB + index);
             }
         }
-        upperCell = lowerCell;
-        upperDensity = lowerDensity;
+    }
+
+    const double selectorValue = lerp3(dy, dx, dz,
+        selector[0], selector[1], selector[2], selector[3],
+        selector[4], selector[5], selector[6], selector[7]);
+    if (selectorValue < 0.0)
+        return 64.0;
+    const double thicknessValue = lerp3(dy, dx, dz,
+        thickness[0], thickness[1], thickness[2], thickness[3],
+        thickness[4], thickness[5], thickness[6], thickness[7]);
+    const double ridgeAValue = fabs(lerp3(dy, dx, dz,
+        ridgeA[0], ridgeA[1], ridgeA[2], ridgeA[3],
+        ridgeA[4], ridgeA[5], ridgeA[6], ridgeA[7]));
+    const double ridgeBValue = fabs(lerp3(dy, dx, dz,
+        ridgeB[0], ridgeB[1], ridgeB[2], ridgeB[3],
+        ridgeB[4], ridgeB[5], ridgeB[6], ridgeB[7]));
+    return thicknessValue + 1.5 *
+        (ridgeAValue > ridgeBValue ? ridgeAValue : ridgeBValue);
+}
+
+static double sampleModernBaseDensity(
+    const ModernTerrainColumn *column00,
+    const ModernTerrainColumn *column01,
+    const ModernTerrainColumn *column10,
+    const ModernTerrainColumn *column11,
+    int cellY,
+    double dx, double dy, double dz)
+{
+    const int index = cellY - MODERN_MIN_CELL_Y;
+    double density = lerp3(dy, dx, dz,
+        column00->density[index], column00->density[index+1],
+        column10->density[index], column10->density[index+1],
+        column01->density[index], column01->density[index+1],
+        column11->density[index], column11->density[index+1]);
+    density = clampValue(density * 0.64, -1.0, 1.0);
+    return density/2.0 - density*density*density/24.0;
+}
+
+static double sampleModernFinalDensity(
+    const BiomeNoise *bn,
+    const ModernTerrainColumn *column00,
+    const ModernTerrainColumn *column01,
+    const ModernTerrainColumn *column10,
+    const ModernTerrainColumn *column11,
+    int cellX, int cellY, int cellZ,
+    double dx, double dy, double dz)
+{
+    const double density = sampleModernBaseDensity(
+        column00, column01, column10, column11,
+        cellY, dx, dy, dz);
+    const double noodle = sampleInterpolatedNoodle(
+        bn, cellX, cellY, cellZ, dx, dy, dz);
+    return density < noodle ? density : noodle;
+}
+
+enum {
+    AQUIFER_AIR,
+    AQUIFER_WATER,
+    AQUIFER_LAVA,
+    AQUIFER_NO_FLUID_Y = -32512,
+    AQUIFER_CACHE_LIMIT = 1000000,
+};
+
+typedef struct {
+    int y;
+    int state;
+} AquiferFluidLevel;
+
+typedef struct {
+    int blockX;
+    int blockY;
+    int blockZ;
+    AquiferFluidLevel fluid;
+    unsigned char positionReady;
+    unsigned char fluidReady;
+} AquiferCenter;
+
+typedef struct {
+    const BiomeNoise *bn;
+    int minCellX;
+    int minCellY;
+    int minCellZ;
+    int sizeX;
+    int sizeY;
+    int sizeZ;
+    AquiferCenter *centers;
+} AquiferCache;
+
+static int aquiferFluidStateAt(const AquiferFluidLevel *level, int blockY)
+{
+    return blockY < level->y ? level->state : AQUIFER_AIR;
+}
+
+static AquiferFluidLevel aquiferGlobalFluid(int blockY)
+{
+    AquiferFluidLevel level;
+    if (blockY < -54)
+    {
+        level.y = -54;
+        level.state = AQUIFER_LAVA;
+    }
+    else
+    {
+        level.y = 63;
+        level.state = AQUIFER_WATER;
+    }
+    return level;
+}
+
+static double sampleAquiferNoise(
+    const BiomeNoise *bn, int type, int blockX, int blockY, int blockZ)
+{
+    double x = blockX;
+    double y = blockY;
+    double z = blockZ;
+    if (type == AN_BARRIER)
+    {
+        x *= 0.5;
+        y *= 0.5;
+        z *= 0.5;
+    }
+    else if (type == AN_FLOODEDNESS)
+    {
+        y *= 0.67;
+    }
+    else if (type == AN_SPREAD)
+    {
+        y *= 0.7142857142857143;
+    }
+    return sampleDoublePerlin(&bn->aquiferNoise[type], x, y, z);
+}
+
+static int estimateModernSurfaceHeight(
+    const BiomeNoise *bn, int blockX, int blockZ)
+{
+    const int cellX = floordiv(blockX, 4);
+    const int cellZ = floordiv(blockZ, 4);
+    float values[4];
+    sampleTerrainParameters(bn, cellX, cellZ, values);
+    const double offset = -0.50375F + getSpline(bn->sp, values);
+    const double factor = getSpline(bn->factorSp, values);
+    int blockY;
+    for (blockY = 320; blockY >= -64; blockY -= 8)
+    {
+        const double depth = 1.0 - blockY/128.0 + offset;
+        const double scaledDepth = depth * factor;
+        double density = scaledDepth < 0.0 ? scaledDepth : 4.0*scaledDepth;
+        density = clampValue(density - 0.703125, -64.0, 64.0);
+        density = applyModernSurfaceSlides(density, blockY);
+        if (density > 0.390625)
+            return blockY;
+    }
+    return INT32_MAX;
+}
+
+static int aquiferDeepDark(
+    const BiomeNoise *bn, int blockX, int blockY, int blockZ)
+{
+    float values[4];
+    sampleTerrainParameters(bn, blockX/4.0, blockZ/4.0, values);
+    const double erosion = values[SP_EROSION];
+    const double offset = -0.50375F + getSpline(bn->sp, values);
+    const double depth = 1.0 - blockY/128.0 + offset;
+    return erosion < -0.22499999403953552
+        && depth > 0.8999999761581421;
+}
+
+static int aquiferNoiseBasedFluidY(
+    const BiomeNoise *bn,
+    int blockX, int blockY, int blockZ, int surfaceHeight)
+{
+    const int cellX = floordiv(blockX, 16);
+    const int cellY = floordiv(blockY, 40);
+    const int cellZ = floordiv(blockZ, 16);
+    const int centerY = cellY*40 + 20;
+    const double spread = sampleAquiferNoise(
+        bn, AN_SPREAD, cellX, cellY, cellZ) * 10.0;
+    const int offset = (int)floor(spread/3.0) * 3;
+    const int fluidY = centerY + offset;
+    return surfaceHeight < fluidY ? surfaceHeight : fluidY;
+}
+
+static AquiferFluidLevel calculateAquiferFluidLevel(
+    const BiomeNoise *bn, int blockX, int blockY, int blockZ)
+{
+    static const int chunkOffsets[13][2] = {
+        {0, 0}, {-2, -1}, {-1, -1}, {0, -1}, {1, -1},
+        {-3, 0}, {-2, 0}, {-1, 0}, {1, 0},
+        {-2, 1}, {-1, 1}, {0, 1}, {1, 1},
+    };
+    const AquiferFluidLevel defaultLevel = aquiferGlobalFluid(blockY);
+    int minimumSurface = INT32_MAX;
+    const int upperY = blockY + 12;
+    const int lowerY = blockY - 12;
+    int foundSurfaceFluid = 0;
+    int index;
+    for (index = 0; index < 13; index++)
+    {
+        const int sampleX = blockX + chunkOffsets[index][0]*16;
+        const int sampleZ = blockZ + chunkOffsets[index][1]*16;
+        const int surface = estimateModernSurfaceHeight(bn, sampleX, sampleZ);
+        const int surfaceWithMargin = (int32_t)((uint32_t)surface + 8U);
+        const int center = index == 0;
+        if (center && lowerY > surfaceWithMargin)
+            return defaultLevel;
+        const int aboveSurface = upperY > surfaceWithMargin;
+        if (aboveSurface || center)
+        {
+            const AquiferFluidLevel surfaceLevel = aquiferGlobalFluid(
+                surfaceWithMargin);
+            if (aquiferFluidStateAt(&surfaceLevel, surfaceWithMargin)
+                != AQUIFER_AIR)
+            {
+                if (center)
+                    foundSurfaceFluid = 1;
+                if (aboveSurface)
+                    return surfaceLevel;
+            }
+        }
+        if (surface < minimumSurface)
+            minimumSurface = surface;
+    }
+
+    int fluidY;
+    if (aquiferDeepDark(bn, blockX, blockY, blockZ))
+    {
+        fluidY = AQUIFER_NO_FLUID_Y;
+    }
+    else
+    {
+        const int distance = (int32_t)(
+            (uint32_t)minimumSurface + 8U - (uint32_t)blockY);
+        double surfacePressure = 0.0;
+        if (foundSurfaceFluid)
+        {
+            surfacePressure = 1.0 - clampValue(distance/64.0, 0.0, 1.0);
+        }
+        const double floodedness = clampValue(sampleAquiferNoise(
+            bn, AN_FLOODEDNESS, blockX, blockY, blockZ), -1.0, 1.0);
+        const double upperThreshold = 0.8 - 1.1*surfacePressure;
+        const double lowerThreshold = 0.4 - 1.2*surfacePressure;
+        if (floodedness - upperThreshold > 0.0)
+        {
+            fluidY = defaultLevel.y;
+        }
+        else if (floodedness - lowerThreshold > 0.0)
+        {
+            fluidY = aquiferNoiseBasedFluidY(
+                bn, blockX, blockY, blockZ, minimumSurface);
+        }
+        else
+        {
+            fluidY = AQUIFER_NO_FLUID_Y;
+        }
+    }
+    int state = defaultLevel.state;
+    if (fluidY <= -10 && fluidY != AQUIFER_NO_FLUID_Y
+        && defaultLevel.state != AQUIFER_LAVA)
+    {
+        const int cellX = floordiv(blockX, 64);
+        const int cellY = floordiv(blockY, 40);
+        const int cellZ = floordiv(blockZ, 64);
+        const double lava = sampleAquiferNoise(
+            bn, AN_LAVA, cellX, cellY, cellZ);
+        if (fabs(lava) > 0.3)
+            state = AQUIFER_LAVA;
+    }
+    AquiferFluidLevel level = { fluidY, state };
+    return level;
+}
+
+static uint64_t aquiferPositionHash(int x, int y, int z)
+{
+    const int32_t mixedX = (int32_t)((uint32_t)x * 3129871U);
+    uint64_t hash = (uint64_t)(int64_t)mixedX
+        ^ (uint64_t)(int64_t)z * 116129781ULL
+        ^ (uint64_t)(int64_t)y;
+    hash = hash*hash*42317861ULL + hash*11ULL;
+    uint64_t shifted = hash >> 16;
+    if (hash & (1ULL << 63))
+        shifted |= 0xffff000000000000ULL;
+    return shifted;
+}
+
+static AquiferCenter *loadAquiferCenter(
+    AquiferCache *cache, int cellX, int cellY, int cellZ,
+    AquiferCenter *scratch)
+{
+    AquiferCenter *center = scratch;
+    if (cache->centers
+        && cellX >= cache->minCellX && cellX < cache->minCellX + cache->sizeX
+        && cellY >= cache->minCellY && cellY < cache->minCellY + cache->sizeY
+        && cellZ >= cache->minCellZ && cellZ < cache->minCellZ + cache->sizeZ)
+    {
+        const int x = cellX - cache->minCellX;
+        const int y = cellY - cache->minCellY;
+        const int z = cellZ - cache->minCellZ;
+        center = cache->centers + ((size_t)y*cache->sizeZ + z)*cache->sizeX + x;
+    }
+    if (!center->positionReady)
+    {
+        Xoroshiro random = {
+            aquiferPositionHash(cellX, cellY, cellZ)
+                ^ cache->bn->aquiferSeedLo,
+            cache->bn->aquiferSeedHi,
+        };
+        center->blockX = cellX*16 + xNextInt(&random, 10);
+        center->blockY = cellY*12 + xNextInt(&random, 9);
+        center->blockZ = cellZ*16 + xNextInt(&random, 10);
+        center->positionReady = 1;
+    }
+    if (!center->fluidReady)
+    {
+        center->fluid = calculateAquiferFluidLevel(cache->bn,
+            center->blockX, center->blockY, center->blockZ);
+        center->fluidReady = 1;
+    }
+    return center;
+}
+
+static double aquiferDistanceSimilarity(int first, int second)
+{
+    return 1.0 - fabs((double)second - first) / 25.0;
+}
+
+static double calculateAquiferBarrierDensity(
+    const BiomeNoise *bn, int blockX, int blockY, int blockZ,
+    const AquiferFluidLevel *first, const AquiferFluidLevel *second,
+    double *barrier)
+{
+    const int firstState = aquiferFluidStateAt(first, blockY);
+    const int secondState = aquiferFluidStateAt(second, blockY);
+    if ((firstState == AQUIFER_LAVA && secondState == AQUIFER_WATER)
+        || (firstState == AQUIFER_WATER && secondState == AQUIFER_LAVA))
+        return 2.0;
+    const int levelDistance = abs(first->y - second->y);
+    if (levelDistance == 0)
+        return 0.0;
+    const double midpoint = 0.5 * (first->y + second->y);
+    const double relativeY = blockY + 0.5 - midpoint;
+    const double halfDistance = levelDistance / 2.0;
+    const double remaining = halfDistance - fabs(relativeY);
+    double pressure;
+    if (relativeY > 0.0)
+    {
+        const double value = remaining;
+        pressure = value > 0.0 ? value/1.5 : value/2.5;
+    }
+    else
+    {
+        const double value = 3.0 + remaining;
+        pressure = value > 0.0 ? value/3.0 : value/10.0;
+    }
+    double barrierValue = 0.0;
+    if (pressure >= -2.0 && pressure <= 2.0)
+    {
+        if (isnan(*barrier))
+            *barrier = sampleAquiferNoise(
+                bn, AN_BARRIER, blockX, blockY, blockZ);
+        barrierValue = *barrier;
+    }
+    return 2.0 * (barrierValue + pressure);
+}
+
+static int sampleAquiferFluidState(
+    AquiferCache *cache, int blockX, int blockY, int blockZ, double density)
+{
+    const AquiferFluidLevel globalFluid = aquiferGlobalFluid(blockY);
+    if (aquiferFluidStateAt(&globalFluid, blockY) == AQUIFER_LAVA)
+        return AQUIFER_LAVA;
+    const int baseCellX = floordiv(blockX - 5, 16);
+    const int baseCellY = floordiv(blockY + 1, 12);
+    const int baseCellZ = floordiv(blockZ - 5, 16);
+    int nearestDistance = INT32_MAX;
+    int secondDistance = INT32_MAX;
+    int thirdDistance = INT32_MAX;
+    AquiferCenter nearest = {0};
+    AquiferCenter second = {0};
+    AquiferCenter third = {0};
+    int x, y, z;
+    for (x = 0; x <= 1; x++)
+    {
+        for (y = -1; y <= 1; y++)
+        {
+            for (z = 0; z <= 1; z++)
+            {
+                AquiferCenter scratch = {0};
+                AquiferCenter *center = loadAquiferCenter(cache,
+                    baseCellX+x, baseCellY+y, baseCellZ+z, &scratch);
+                const int dx = center->blockX - blockX;
+                const int dy = center->blockY - blockY;
+                const int dz = center->blockZ - blockZ;
+                const int distance = dx*dx + dy*dy + dz*dz;
+                if (nearestDistance >= distance)
+                {
+                    third = second;
+                    second = nearest;
+                    nearest = *center;
+                    thirdDistance = secondDistance;
+                    secondDistance = nearestDistance;
+                    nearestDistance = distance;
+                }
+                else if (secondDistance >= distance)
+                {
+                    third = second;
+                    second = *center;
+                    thirdDistance = secondDistance;
+                    secondDistance = distance;
+                }
+                else if (thirdDistance >= distance)
+                {
+                    third = *center;
+                    thirdDistance = distance;
+                }
+            }
+        }
+    }
+
+    const double nearestSimilarity = aquiferDistanceSimilarity(
+        nearestDistance, secondDistance);
+    const int nearestState = aquiferFluidStateAt(&nearest.fluid, blockY);
+    if (nearestSimilarity <= 0.0)
+        return nearestState;
+    double barrier = NAN;
+    const double firstPressure = nearestSimilarity
+        * calculateAquiferBarrierDensity(cache->bn,
+            blockX, blockY, blockZ, &nearest.fluid, &second.fluid, &barrier);
+    if (density + firstPressure > 0.0)
+        return AQUIFER_AIR;
+    const double thirdSimilarity = aquiferDistanceSimilarity(
+        nearestDistance, thirdDistance);
+    if (thirdSimilarity > 0.0)
+    {
+        const double pressure = nearestSimilarity * thirdSimilarity
+            * calculateAquiferBarrierDensity(cache->bn,
+                blockX, blockY, blockZ, &nearest.fluid, &third.fluid, &barrier);
+        if (density + pressure > 0.0)
+            return AQUIFER_AIR;
+    }
+    const double secondThirdSimilarity = aquiferDistanceSimilarity(
+        secondDistance, thirdDistance);
+    if (secondThirdSimilarity > 0.0)
+    {
+        const double pressure = nearestSimilarity * secondThirdSimilarity
+            * calculateAquiferBarrierDensity(cache->bn,
+                blockX, blockY, blockZ, &second.fluid, &third.fluid, &barrier);
+        if (density + pressure > 0.0)
+            return AQUIFER_AIR;
+    }
+    return nearestState;
+}
+
+static void initAquiferCache(
+    AquiferCache *cache, const BiomeNoise *bn,
+    int blockX, int blockZ, int w, int h, int stride)
+{
+    memset(cache, 0, sizeof(*cache));
+    cache->bn = bn;
+    const int lastX = (int)((int64_t)blockX + (int64_t)(w-1)*stride);
+    const int lastZ = (int)((int64_t)blockZ + (int64_t)(h-1)*stride);
+    cache->minCellX = floordiv(blockX - 5, 16);
+    cache->minCellY = -7;
+    cache->minCellZ = floordiv(blockZ - 5, 16);
+    cache->sizeX = floordiv(lastX - 5, 16) + 2 - cache->minCellX;
+    cache->sizeY = 14;
+    cache->sizeZ = floordiv(lastZ - 5, 16) + 2 - cache->minCellZ;
+    const size_t count = (size_t)cache->sizeX * cache->sizeY * cache->sizeZ;
+    if (count <= AQUIFER_CACHE_LIMIT)
+        cache->centers = (AquiferCenter*) calloc(count, sizeof(AquiferCenter));
+}
+
+static int findModernTerrainSurface(
+    const BiomeNoise *bn,
+    const ModernTerrainColumn *column00,
+    const ModernTerrainColumn *column01,
+    const ModernTerrainColumn *column10,
+    const ModernTerrainColumn *column11,
+    int cellX, int cellZ, double dx, double dz)
+{
+    int cellY;
+    for (cellY = MODERN_MAX_CELL_Y - 1;
+         cellY >= MODERN_MIN_CELL_Y; cellY--)
+    {
+        int y;
+        for (y = 7; y >= 0; y--)
+        {
+            const double dy = y / 8.0;
+            const double density = sampleModernBaseDensity(
+                column00, column01, column10, column11,
+                cellY, dx, dy, dz);
+            if (density > 0.0 && sampleInterpolatedNoodle(
+                    bn, cellX, cellY, cellZ, dx, dy, dz) > 0.0)
+                return cellY * 8 + y;
+        }
     }
     return -64;
+}
+
+static int findModernTerrainSurfaceUncached(
+    const BiomeNoise *bn, int blockX, int blockZ)
+{
+    const int cellX = floordiv(blockX, 4);
+    const int cellZ = floordiv(blockZ, 4);
+    const double dx = (blockX - cellX*4) / 4.0;
+    const double dz = (blockZ - cellZ*4) / 4.0;
+    ModernTerrainColumn columns[4];
+    sampleModernTerrainColumn(columns + 0, bn, cellX, cellZ);
+    sampleModernTerrainColumn(columns + 1, bn, cellX, cellZ+1);
+    sampleModernTerrainColumn(columns + 2, bn, cellX+1, cellZ);
+    sampleModernTerrainColumn(columns + 3, bn, cellX+1, cellZ+1);
+    return findModernTerrainSurface(bn,
+        columns + 0, columns + 1, columns + 2, columns + 3,
+        cellX, cellZ, dx, dz);
+}
+
+static int resolveModernFluidSurface(
+    AquiferCache *aquifer,
+    const ModernTerrainColumn *column00,
+    const ModernTerrainColumn *column01,
+    const ModernTerrainColumn *column10,
+    const ModernTerrainColumn *column11,
+    int blockX, int blockZ, int solidY)
+{
+    const int cellX = floordiv(blockX, 4);
+    const int cellZ = floordiv(blockZ, 4);
+    const double dx = (blockX - cellX*4) / 4.0;
+    const double dz = (blockZ - cellZ*4) / 4.0;
+    int blockY;
+    for (blockY = 62; blockY > solidY; blockY--)
+    {
+        const int cellY = floordiv(blockY, 8);
+        const double dy = (blockY - cellY*8) / 8.0;
+        const double density = sampleModernFinalDensity(aquifer->bn,
+            column00, column01, column10, column11,
+            cellX, cellY, cellZ, dx, dy, dz);
+        const int state = sampleAquiferFluidState(
+            aquifer, blockX, blockY, blockZ, density);
+        if (state == AQUIFER_WATER)
+            return blockY;
+        if (state == AQUIFER_LAVA)
+            return INT32_MIN;
+    }
+    return INT32_MIN;
+}
+
+static int mapOverworldTerrainHeightBlocksImpl(
+    int *y, int *fluidY, const BiomeNoise *bn,
+    int blockX, int blockZ, int w, int h, int stride)
+{
+    if (!y || !bn || w <= 0 || h <= 0 || stride <= 0)
+        return 1;
+    const int lastX = (int)((int64_t)blockX + (int64_t)(w-1)*stride);
+    const int lastZ = (int)((int64_t)blockZ + (int64_t)(h-1)*stride);
+    const int minCellX = floordiv(blockX, 4);
+    const int minCellZ = floordiv(blockZ, 4);
+    const int maxCellX = floordiv(lastX, 4) + 1;
+    const int maxCellZ = floordiv(lastZ, 4) + 1;
+    const int cellW = maxCellX - minCellX + 1;
+    const int cellH = maxCellZ - minCellZ + 1;
+    const size_t cellCount = (size_t)cellW * cellH;
+    ModernTerrainColumn *columns = NULL;
+    if (cellCount <= MODERN_COLUMN_CACHE_LIMIT)
+        columns = (ModernTerrainColumn*) malloc(
+            sizeof(ModernTerrainColumn) * cellCount);
+
+    int i, j;
+    if (columns)
+    {
+        for (j = 0; j < cellH; j++)
+            for (i = 0; i < cellW; i++)
+                sampleModernTerrainColumn(columns + (size_t)j*cellW+i,
+                    bn, minCellX+i, minCellZ+j);
+    }
+    AquiferCache aquifer;
+    if (fluidY)
+        initAquiferCache(&aquifer, bn, blockX, blockZ, w, h, stride);
+
+    for (j = 0; j < h; j++)
+    {
+        const int sampleZ = (int)((int64_t)blockZ + (int64_t)j*stride);
+        const int cellZ = floordiv(sampleZ, 4);
+        const double dz = (sampleZ - cellZ*4) / 4.0;
+        for (i = 0; i < w; i++)
+        {
+            const int sampleX = (int)((int64_t)blockX + (int64_t)i*stride);
+            if (!columns)
+            {
+                y[j*w+i] = findModernTerrainSurfaceUncached(
+                    bn, sampleX, sampleZ);
+                if (fluidY)
+                {
+                    if (y[j*w+i] >= 62)
+                    {
+                        fluidY[j*w+i] = INT32_MIN;
+                    }
+                    else
+                    {
+                        ModernTerrainColumn local[4];
+                        const int localCellX = floordiv(sampleX, 4);
+                        sampleModernTerrainColumn(local + 0, bn, localCellX, cellZ);
+                        sampleModernTerrainColumn(local + 1, bn, localCellX, cellZ+1);
+                        sampleModernTerrainColumn(local + 2, bn, localCellX+1, cellZ);
+                        sampleModernTerrainColumn(local + 3, bn, localCellX+1, cellZ+1);
+                        fluidY[j*w+i] = resolveModernFluidSurface(
+                            &aquifer, local + 0, local + 1, local + 2, local + 3,
+                            sampleX, sampleZ, y[j*w+i]);
+                    }
+                }
+                continue;
+            }
+            const int cellX = floordiv(sampleX, 4);
+            const double dx = (sampleX - cellX*4) / 4.0;
+            const int offsetX = cellX - minCellX;
+            const int offsetZ = cellZ - minCellZ;
+            const ModernTerrainColumn *column00 = columns
+                + (size_t)offsetZ*cellW + offsetX;
+            const ModernTerrainColumn *column01 = column00 + cellW;
+            y[j*w+i] = findModernTerrainSurface(bn,
+                column00, column01, column00+1, column01+1,
+                cellX, cellZ, dx, dz);
+            if (fluidY)
+            {
+                fluidY[j*w+i] = y[j*w+i] >= 62
+                    ? INT32_MIN
+                    : resolveModernFluidSurface(&aquifer,
+                        column00, column01, column00+1, column01+1,
+                        sampleX, sampleZ, y[j*w+i]);
+            }
+        }
+    }
+    if (fluidY)
+        free(aquifer.centers);
+    free(columns);
+    return 0;
+}
+
+int mapOverworldTerrainHeightBlocks(
+    int *y, const BiomeNoise *bn,
+    int blockX, int blockZ, int w, int h, int stride)
+{
+    return mapOverworldTerrainHeightBlocksImpl(
+        y, NULL, bn, blockX, blockZ, w, h, stride);
+}
+
+int mapOverworldSurfaceHeightBlocks(
+    int *solidY, int *fluidY, const BiomeNoise *bn,
+    int blockX, int blockZ, int w, int h, int stride)
+{
+    if (!fluidY)
+        return 1;
+    return mapOverworldTerrainHeightBlocksImpl(
+        solidY, fluidY, bn, blockX, blockZ, w, h, stride);
+}
+
+int getOverworldTerrainHeight(
+    const BiomeNoise *bn, int blockX, int blockZ)
+{
+    return findModernTerrainSurfaceUncached(bn, blockX, blockZ);
 }
 
 int mapOverworldTerrainHeight(float *y, int *ids, const BiomeNoise *bn,
@@ -1757,9 +2463,8 @@ int mapOverworldTerrainHeight(float *y, int *ids, const BiomeNoise *bn,
         {
             const int px = x + i;
             const int pz = z + j;
-            float values[4];
-            sampleTerrainParameters(bn, px, pz, values);
-            const int surface = findTerrainSurface(bn, px, pz, values);
+            const int surface = findModernTerrainSurfaceUncached(
+                bn, px * 4, pz * 4);
             if (ids)
             {
                 ids[j*w+i] = sampleBiomeNoise(

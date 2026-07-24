@@ -150,6 +150,14 @@ enum
     TN_CAVE_CHEESE,
     TN_MAX,
 };
+enum
+{
+    AN_BARRIER,
+    AN_FLOODEDNESS,
+    AN_SPREAD,
+    AN_LAVA,
+    AN_MAX,
+};
 // Overworld biome generator for 1.18+
 STRUCT(BiomeNoise)
 {
@@ -159,6 +167,10 @@ STRUCT(BiomeNoise)
     PerlinNoise jaggedOct[2*16];
     DoublePerlinNoise terrainNoise[TN_MAX];
     PerlinNoise terrainNoiseOct[TN_MAX][18];
+    DoublePerlinNoise aquiferNoise[AN_MAX];
+    PerlinNoise aquiferNoiseOct[AN_MAX][2];
+    uint64_t aquiferSeedLo;
+    uint64_t aquiferSeedHi;
     SurfaceNoise terrain;
     Spline *sp;
     Spline *factorSp;
@@ -314,6 +326,15 @@ double sampleClimatePara(const BiomeNoise *bn, int64_t *np, double x, double z);
  */
 int mapOverworldTerrainHeight(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int h);
+
+/** Returns the highest solid terrain block at one block-scale Overworld column. */
+int getOverworldTerrainHeight(const BiomeNoise *bn, int blockX, int blockZ);
+int mapOverworldTerrainHeightBlocks(
+    int *y, const BiomeNoise *bn,
+    int blockX, int blockZ, int w, int h, int stride);
+int mapOverworldSurfaceHeightBlocks(
+    int *solidY, int *fluidY, const BiomeNoise *bn,
+    int blockX, int blockZ, int w, int h, int stride);
 
 /**
  * Generates a 2D biome map at the predicted surface instead of the cave-level

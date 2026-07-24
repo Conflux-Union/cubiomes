@@ -607,6 +607,79 @@ int genArea(const Layer *layer, int *out, int areaX, int areaZ, int areaWidth, i
 }
 
 
+typedef struct {
+    double depth;
+    double scale;
+    double densityOffset;
+} LegacyTerrainPoint;
+
+static int mapLegacyTerrainPoints(
+    LegacyTerrainPoint *points, int *ids,
+    const Generator *g, const SurfaceNoise *sn,
+    int x, int z, int w, int h)
+{
+    static const float biome_kernel[25] = {
+        3.302044127F, 4.104975761F, 4.545454545F, 4.104975761F, 3.302044127F,
+        4.104975761F, 6.194967155F, 8.333333333F, 6.194967155F, 4.104975761F,
+        4.545454545F, 8.333333333F, 50.00000000F, 8.333333333F, 4.545454545F,
+        4.104975761F, 6.194967155F, 8.333333333F, 6.194967155F, 4.104975761F,
+        3.302044127F, 4.104975761F, 4.545454545F, 4.104975761F, 3.302044127F,
+    };
+    Range r = {4, x-2, z-2, w+5, h+5, 0, 1};
+    int *cache = allocCache(g, r);
+    if (!cache || genBiomes(g, cache, r))
+    {
+        free(cache);
+        return 1;
+    }
+
+    int64_t i, j;
+    int ii, jj;
+    for (j = 0; j < h; j++)
+    {
+        for (i = 0; i < w; i++)
+        {
+            double d0, s0;
+            double wt = 0.0, ws = 0.0, wd = 0.0;
+            const int id0 = cache[(j+2)*r.sx + (i+2)];
+            getBiomeDepthAndScale(id0, &d0, &s0, 0);
+            for (jj = 0; jj < 5; jj++)
+            {
+                for (ii = 0; ii < 5; ii++)
+                {
+                    double d, s;
+                    const int id = cache[(j+jj)*r.sx + (i+ii)];
+                    getBiomeDepthAndScale(id, &d, &s, 0);
+                    float weight = biome_kernel[jj*5+ii] / (float)(d + 2.0);
+                    if (d > d0)
+                        weight *= 0.5F;
+                    ws += s * weight;
+                    wd += d * weight;
+                    wt += weight;
+                }
+            }
+            ws = ws / wt * 0.9 + 0.1;
+            wd = ((wd / wt) * 4.0 - 1.0) / 8.0;
+            points[j*w+i].depth = wd * (17.0/64.0);
+            points[j*w+i].scale = 96.0 / ws;
+            if (ids)
+                ids[j*w+i] = id0;
+
+            double off = sampleOctaveAmp(
+                &sn->octdepth, (x+i)*200, 10, (z+j)*200, 1, 0, 1);
+            off *= 65535.0/8000.0;
+            if (off < 0.0) off = -0.3 * off;
+            off = off * 3.0 - 2.0;
+            if (off > 1.0) off = 1.0;
+            off *= 17.0/64.0;
+            points[j*w+i].densityOffset =
+                off < 0.0 ? off / 28.0 : off / 40.0;
+        }
+    }
+    free(cache);
+    return 0;
+}
+
 int mapApproxHeight(float *y, int *ids, const Generator *g, const SurfaceNoise *sn,
     int x, int z, int w, int h)
 {
@@ -644,74 +717,23 @@ int mapApproxHeight(float *y, int *ids, const Generator *g, const SurfaceNoise *
         return 0;
     }
 
-    const float biome_kernel[25] = { // with 10 / (sqrt(i**2 + j**2) + 0.2)
-        3.302044127, 4.104975761, 4.545454545, 4.104975761, 3.302044127,
-        4.104975761, 6.194967155, 8.333333333, 6.194967155, 4.104975761,
-        4.545454545, 8.333333333, 50.00000000, 8.333333333, 4.545454545,
-        4.104975761, 6.194967155, 8.333333333, 6.194967155, 4.104975761,
-        3.302044127, 4.104975761, 4.545454545, 4.104975761, 3.302044127,
-    };
-
-    double *depth = (double*) malloc(sizeof(double) * 2 * w * h);
-    double *scale = depth + w * h;
-    int64_t i, j;
-    int ii, jj;
-
-    Range r = {4, x-2, z-2, w+5, h+5, 0, 1};
-    int *cache = allocCache(g, r);
-    genBiomes(g, cache, r);
-
-    for (j = 0; j < h; j++)
+    LegacyTerrainPoint *points = (LegacyTerrainPoint*) malloc(
+        sizeof(LegacyTerrainPoint) * (size_t)w * h);
+    if (!points)
+        return 1;
+    if (mapLegacyTerrainPoints(points, ids, g, sn, x, z, w, h))
     {
-        for (i = 0; i < w; i++)
-        {
-            double d0, s0;
-            double wt = 0, ws = 0, wd = 0;
-            int id0 = cache[(j+2)*r.sx + (i+2)];
-            getBiomeDepthAndScale(id0, &d0, &s0, 0);
-
-            for (jj = 0; jj < 5; jj++)
-            {
-                for (ii = 0; ii < 5; ii++)
-                {
-                    double d, s;
-                    int id = cache[(j+jj)*r.sx + (i+ii)];
-                    getBiomeDepthAndScale(id, &d, &s, 0);
-                    float weight = biome_kernel[jj*5+ii] / (d + 2);
-                    if (d > d0)
-                        weight *= 0.5;
-                    ws += s * weight;
-                    wd += d * weight;
-                    wt += weight;
-                }
-            }
-            ws /= wt;
-            wd /= wt;
-            ws = ws * 0.9 + 0.1;
-            wd = (wd * 4.0 - 1) / 8;
-            ws = 96 / ws;
-            wd = wd * 17./64;
-            depth[j*w+i] = wd;
-            scale[j*w+i] = ws;
-            if (ids)
-                ids[j*w+i] = id0;
-        }
+        free(points);
+        return 1;
     }
-    free(cache);
+    int64_t i, j;
 
     for (j = 0; j < h; j++)
     {
         for (i = 0; i < w; i++)
         {
             int px = x+i, pz = z+j;
-            double off = sampleOctaveAmp(&sn->octdepth, px*200, 10, pz*200, 1, 0, 1);
-            off *= 65535./8000;
-            if (off < 0) off = -0.3 * off;
-            off = off * 3 - 2;
-            if (off > 1) off = 1;
-            off *= 17./64;
-            if (off < 0) off *= 1./28;
-            else off *= 1./40;
+            const LegacyTerrainPoint *point = points + j*w+i;
 
             double vmin = 0, vmax = 0;
             int ytest = 8, ymin = 0, ymax = 32;
@@ -723,8 +745,9 @@ int mapApproxHeight(float *y, int *ids, const Generator *g, const SurfaceNoise *
                 {
                     int py = ytest + k;
                     double n0 = sampleSurfaceNoise(sn, px, py, pz);
-                    double fall = 1 - 2 * py / 32.0 + off - 0.46875;
-                    fall = scale[j*w+i] * (fall + depth[j*w+i]);
+                    double fall = 1 - 2 * py / 32.0
+                        + point->densityOffset - 0.46875;
+                    fall = point->scale * (fall + point->depth);
                     n0 += (fall > 0 ? 4*fall : fall);
                     v[k] = n0;
                     if (n0 >= 0 && py > ymin)
@@ -749,11 +772,207 @@ int mapApproxHeight(float *y, int *ids, const Generator *g, const SurfaceNoise *
             y[j*w+i] = 8 * (vmin / (double)(vmin - vmax) + ymin);
         }
     }
-    free(depth);
+    free(points);
     return 0;
 }
 
+static void resolveSurfaceColumn(int solid, int *fluid, int *surface, int *flags)
+{
+    // Vanilla's default Overworld sea level is 63; the top fluid block is Y=62.
+    if (solid < 62)
+    {
+        *fluid = 62;
+        *surface = 62;
+        *flags = SURFACE_COLUMN_FLUID;
+    }
+    else
+    {
+        *fluid = INT32_MIN;
+        *surface = solid;
+        *flags = 0;
+    }
+}
 
+enum {
+    LEGACY_MIN_CELL_Y = 0,
+    LEGACY_MAX_CELL_Y = 32,
+    LEGACY_COLUMN_SIZE = LEGACY_MAX_CELL_Y - LEGACY_MIN_CELL_Y + 1,
+    LEGACY_COLUMN_CACHE_LIMIT = 70000,
+};
 
+typedef struct {
+    double density[LEGACY_COLUMN_SIZE];
+} LegacyTerrainColumn;
 
+static void sampleLegacyTerrainColumn(
+    LegacyTerrainColumn *column, const SurfaceNoise *sn,
+    int cellX, int cellZ, const LegacyTerrainPoint *point)
+{
+    int cellY;
+    for (cellY = LEGACY_MIN_CELL_Y; cellY <= LEGACY_MAX_CELL_Y; cellY++)
+    {
+        double density = sampleSurfaceNoise(sn, cellX, cellY, cellZ);
+        double fall = 1.0 - 2.0 * cellY / 32.0
+            + point->densityOffset - 0.46875;
+        fall = point->scale * (fall + point->depth);
+        density += fall > 0.0 ? 4.0*fall : fall;
+        density = clampedLerp((32.0-cellY)/3.0, -10.0, density);
+        column->density[cellY] = clampedLerp(cellY/3.0, 15.0, density);
+    }
+}
 
+static int findLegacyTerrainSurface(
+    const LegacyTerrainColumn *column00,
+    const LegacyTerrainColumn *column01,
+    const LegacyTerrainColumn *column10,
+    const LegacyTerrainColumn *column11,
+    double dx, double dz)
+{
+    int cellY;
+    for (cellY = LEGACY_MAX_CELL_Y - 1;
+         cellY >= LEGACY_MIN_CELL_Y; cellY--)
+    {
+        int y;
+        for (y = 7; y >= 0; y--)
+        {
+            const double dy = y / 8.0;
+            const double density = lerp3(dy, dx, dz,
+                column00->density[cellY], column00->density[cellY+1],
+                column10->density[cellY], column10->density[cellY+1],
+                column01->density[cellY], column01->density[cellY+1],
+                column11->density[cellY], column11->density[cellY+1]);
+            if (density > 0.0)
+                return cellY*8 + y;
+        }
+    }
+    return 0;
+}
+
+static int mapLegacyTerrainHeightBlocks(
+    int *y, const Generator *g, const SurfaceNoise *sn,
+    int blockX, int blockZ, int w, int h, int stride)
+{
+    const int lastX = (int)((int64_t)blockX + (int64_t)(w-1)*stride);
+    const int lastZ = (int)((int64_t)blockZ + (int64_t)(h-1)*stride);
+    const int minCellX = floordiv(blockX, 4);
+    const int minCellZ = floordiv(blockZ, 4);
+    const int maxCellX = floordiv(lastX, 4) + 1;
+    const int maxCellZ = floordiv(lastZ, 4) + 1;
+    const int cellW = maxCellX - minCellX + 1;
+    const int cellH = maxCellZ - minCellZ + 1;
+    const size_t cellCount = (size_t)cellW * cellH;
+    LegacyTerrainPoint *points = (LegacyTerrainPoint*) malloc(
+        sizeof(LegacyTerrainPoint) * cellCount);
+    if (!points || mapLegacyTerrainPoints(
+            points, NULL, g, sn, minCellX, minCellZ, cellW, cellH))
+    {
+        free(points);
+        return 1;
+    }
+
+    LegacyTerrainColumn *columns = NULL;
+    if (cellCount <= LEGACY_COLUMN_CACHE_LIMIT)
+        columns = (LegacyTerrainColumn*) malloc(
+            sizeof(LegacyTerrainColumn) * cellCount);
+    int i, j;
+    if (columns)
+    {
+        for (j = 0; j < cellH; j++)
+            for (i = 0; i < cellW; i++)
+                sampleLegacyTerrainColumn(columns + (size_t)j*cellW+i,
+                    sn, minCellX+i, minCellZ+j,
+                    points + (size_t)j*cellW+i);
+    }
+
+    for (j = 0; j < h; j++)
+    {
+        const int sampleZ = (int)((int64_t)blockZ + (int64_t)j*stride);
+        const int cellZ = floordiv(sampleZ, 4);
+        const double dz = (sampleZ - cellZ*4) / 4.0;
+        for (i = 0; i < w; i++)
+        {
+            const int sampleX = (int)((int64_t)blockX + (int64_t)i*stride);
+            const int cellX = floordiv(sampleX, 4);
+            const double dx = (sampleX - cellX*4) / 4.0;
+            const int offsetX = cellX - minCellX;
+            const int offsetZ = cellZ - minCellZ;
+            const size_t index00 = (size_t)offsetZ*cellW + offsetX;
+            if (columns)
+            {
+                y[j*w+i] = findLegacyTerrainSurface(
+                    columns + index00, columns + index00 + cellW,
+                    columns + index00 + 1, columns + index00 + cellW + 1,
+                    dx, dz);
+            }
+            else
+            {
+                LegacyTerrainColumn local[4];
+                sampleLegacyTerrainColumn(local + 0, sn,
+                    cellX, cellZ, points + index00);
+                sampleLegacyTerrainColumn(local + 1, sn,
+                    cellX, cellZ+1, points + index00 + cellW);
+                sampleLegacyTerrainColumn(local + 2, sn,
+                    cellX+1, cellZ, points + index00 + 1);
+                sampleLegacyTerrainColumn(local + 3, sn,
+                    cellX+1, cellZ+1, points + index00 + cellW + 1);
+                y[j*w+i] = findLegacyTerrainSurface(
+                    local + 0, local + 1, local + 2, local + 3,
+                    dx, dz);
+            }
+        }
+    }
+    free(columns);
+    free(points);
+    return 0;
+}
+
+int mapOverworldSurfaceColumns(int *solidY, int *fluidY, int *surfaceY,
+    int *flags, const Generator *g, const SurfaceNoise *sn,
+    int blockX, int blockZ, int w, int h, int stride)
+{
+    if (!solidY || !fluidY || !surfaceY || !flags || !g || !sn
+        || g->dim != DIM_OVERWORLD || w <= 0 || h <= 0 || stride <= 0)
+        return 1;
+
+    int i, j;
+    if (g->mc >= MC_1_18)
+    {
+        if (mapOverworldSurfaceHeightBlocks(
+                solidY, fluidY, &g->bn, blockX, blockZ, w, h, stride))
+            return 1;
+        for (j = 0; j < h; j++)
+        {
+            for (i = 0; i < w; i++)
+            {
+                const int index = j*w + i;
+                if (fluidY[index] != INT32_MIN
+                    && fluidY[index] > solidY[index])
+                {
+                    surfaceY[index] = fluidY[index];
+                    flags[index] = SURFACE_COLUMN_FLUID;
+                }
+                else
+                {
+                    fluidY[index] = INT32_MIN;
+                    surfaceY[index] = solidY[index];
+                    flags[index] = 0;
+                }
+            }
+        }
+        return 0;
+    }
+
+    if (mapLegacyTerrainHeightBlocks(
+            solidY, g, sn, blockX, blockZ, w, h, stride))
+        return 1;
+    for (j = 0; j < h; j++)
+    {
+        for (i = 0; i < w; i++)
+        {
+            const int index = j*w + i;
+            resolveSurfaceColumn(solidY[index], fluidY + index,
+                surfaceY + index, flags + index);
+        }
+    }
+    return 0;
+}

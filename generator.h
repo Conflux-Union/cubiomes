@@ -12,6 +12,11 @@ enum
     FORCE_OCEAN_VARIANTS    = 0x4,
 };
 
+enum
+{
+    SURFACE_COLUMN_FLUID     = 0x1,
+};
+
 STRUCT(Generator)
 {
     int mc;
@@ -138,6 +143,16 @@ int genArea(const Layer *layer, int *out, int areaX, int areaZ, int areaWidth, i
  */
 int mapApproxHeight(float *y, int *ids, const Generator *g,
     const SurfaceNoise *sn, int x, int z, int w, int h);
+
+/**
+ * Resolves block-scale Overworld base columns. The outputs contain the highest
+ * solid block, highest default-fluid block (INT32_MIN when absent), final base
+ * surface, and SURFACE_COLUMN_* flags. Adjacent samples are 'stride' blocks
+ * apart in both horizontal axes.
+ */
+int mapOverworldSurfaceColumns(int *solidY, int *fluidY, int *surfaceY,
+    int *flags, const Generator *g, const SurfaceNoise *sn,
+    int blockX, int blockZ, int w, int h, int stride);
 
 
 #ifdef __cplusplus
