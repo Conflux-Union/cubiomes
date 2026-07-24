@@ -184,7 +184,7 @@ int main()
 }
 ```
 
-### Minecraft 1.17.1 Terrain Features
+### Versioned Terrain Features
 
 The `terrain_features.h` API adds chunk-scoped queries for a seed without
 loading or modifying a world save:
@@ -216,13 +216,17 @@ estimated data as final block state:
 | --- | --- |
 | Structure start and type | Exact for six supported 1.17.1 structure types; the query returns `FEATURE_PARTIAL` |
 | Structure bounds | Approximate starting-template bounds; not the full jigsaw structure |
-| First tree-like vegetation candidate | Exact decorator X/Z and type; approximate Y |
+| First 1.17.1 tree-like vegetation candidate | Exact decorator X/Z and type; approximate Y |
+| First accepted 1.21.1 candidate per placed feature | Exact decorator X/Z and type; surface Y comes from the caller |
 | Later tree-like vegetation candidates | Approximate because preceding feature generation consumes terrain-dependent random values |
 | Cave mask | Exact cave/canyon path RNG and geometry before terrain checks |
 
-Jungle bushes and huge mushrooms have distinct candidate types and can be
-filtered out when only trees are needed. Tree queries return `FEATURE_PARTIAL`
-for biomes whose vegetation pipeline is not implemented. The cave mask is a
+The 1.21.1 query follows the vegetation-step Xoroshiro stream, global placed-
+feature indexes, a 3x3 chunk surface-biome feature union, and per-candidate
+biome placement checks. Jungle bushes, huge mushrooms, mangroves, cherry trees, and
+bamboo have distinct candidate types and can be filtered when only ordinary
+trees are needed. Tree queries return `FEATURE_PARTIAL` for biomes whose
+vegetation pipeline is not implemented. The cave mask is a
 candidate mask, not a final `cave_air` block map. Vanilla
 can reject an entire carving region when it finds fluid, reject individual
 materials, place lava at Y=10 and below, and later overwrite blocks. Lakes,
@@ -349,6 +353,4 @@ int main()
     return 0;
 }
 ```
-
-
 

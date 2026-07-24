@@ -187,6 +187,28 @@ static void testUnsupportedVegetationPipeline(void)
     assert(count == 0);
 }
 
+static void testModernBambooJungleCandidates(void)
+{
+    Generator g;
+    NaturalTreeCandidate trees[256];
+    size_t count = 0;
+
+    setupGenerator(&g, MC_1_21_1, 0);
+    applySeed(&g, DIM_OVERWORLD, 0);
+    /* Vanilla rejects attempts 0 and 1 as river, then accepts this bamboo. */
+    assert(getChunkNaturalTreeCandidates(&g, 448, 481, trees, 256,
+        &count) == FEATURE_OK);
+    assert(count > 0 && count <= 256);
+    assert(trees[0].biome == bamboo_jungle);
+    assert(trees[0].pos.x == 7180);
+    assert(trees[0].pos.z == 7705);
+    assert(trees[0].type == TREE_BAMBOO);
+    assert(((trees[0].flags & FEATURE_CANDIDATE_HEIGHT_MASK) >>
+        FEATURE_CANDIDATE_HEIGHT_SHIFT) == 9);
+    assert((trees[0].flags & FEATURE_XZ_EXACT) != 0);
+    assert((trees[0].flags & FEATURE_TYPE_EXACT) != 0);
+}
+
 int main(void)
 {
     testUnsupportedGenerator();
@@ -197,5 +219,6 @@ int main(void)
     testJungleBushCandidate();
     testDarkForestCandidates();
     testUnsupportedVegetationPipeline();
+    testModernBambooJungleCandidates();
     return 0;
 }

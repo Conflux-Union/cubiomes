@@ -35,6 +35,9 @@ enum FeatureAccuracy
     FEATURE_SEQUENCE_APPROXIMATE = 1 << 8,
 };
 
+#define FEATURE_CANDIDATE_HEIGHT_SHIFT 16
+#define FEATURE_CANDIDATE_HEIGHT_MASK (0xffu << FEATURE_CANDIDATE_HEIGHT_SHIFT)
+
 enum NaturalTreeType
 {
     TREE_OAK,
@@ -46,6 +49,9 @@ enum NaturalTreeType
     TREE_JUNGLE_BUSH,
     TREE_HUGE_BROWN_MUSHROOM,
     TREE_HUGE_RED_MUSHROOM,
+    TREE_MANGROVE,
+    TREE_CHERRY,
+    TREE_BAMBOO,
 };
 
 STRUCT(FeatureBox)
@@ -71,7 +77,7 @@ STRUCT(NaturalStructure)
 };
 
 /**
- * A tree-like vegetation placement candidate produced by the 1.17.1 biome
+ * A tree-like vegetation placement candidate produced by a supported biome
  * decorator. Jungle bushes and huge mushrooms have distinct type values so
  * callers can exclude them when they only need trees.
  *
@@ -79,7 +85,9 @@ STRUCT(NaturalStructure)
  * available volume, fluids, and neighbouring features. The first candidate's
  * X/Z and type follow the vanilla random stream exactly. Later candidates are
  * estimates because generating the preceding feature consumes terrain-
- * dependent random values. Y always uses cubiomes' approximate height map.
+ * dependent random values. For 1.21.1, the first accepted candidate of each
+ * supported placed feature is exact. Y is approximate or omitted when the
+ * caller already owns the surface grid.
  */
 STRUCT(NaturalTreeCandidate)
 {
@@ -102,9 +110,9 @@ int getChunkNaturalStructures(Generator *g, int chunkX, int chunkZ,
 
 /**
  * Gets tree-like vegetation placement candidates whose origin is in
- * (chunkX,chunkZ). Passing out=NULL and capacity=0 performs a count-only query.
- * Biomes with unsupported decoration pipelines return FEATURE_PARTIAL and
- * zero records.
+ * (chunkX,chunkZ) for the 1.17.1 and 1.21.1 Overworld decorators. Passing
+ * out=NULL and capacity=0 performs a count-only query. Biomes with unsupported
+ * decoration pipelines return FEATURE_PARTIAL and zero records.
  */
 int getChunkNaturalTreeCandidates(const Generator *g, int chunkX, int chunkZ,
     NaturalTreeCandidate *out, size_t capacity, size_t *required);

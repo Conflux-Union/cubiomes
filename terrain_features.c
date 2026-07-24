@@ -24,6 +24,16 @@ enum TreeSelector
     SELECT_JUNGLE_EDGE,
     SELECT_DARK_FOREST_BROWN,
     SELECT_DARK_FOREST_RED,
+    SELECT_BAMBOO,
+    SELECT_WATER,
+    SELECT_BIRCH_TALL,
+    SELECT_TAIGA,
+    SELECT_OLD_GROWTH_PINE,
+    SELECT_OLD_GROWTH_SPRUCE,
+    SELECT_MEADOW,
+    SELECT_MANGROVE,
+    SELECT_PLAINS,
+    SELECT_CHERRY,
 };
 
 typedef struct TreeProfile
@@ -40,6 +50,17 @@ static int validateGenerator(const Generator *g)
     if (!g)
         return FEATURE_ERR_ARGUMENT;
     if (g->mc != MC_1_17_1)
+        return FEATURE_ERR_VERSION;
+    if (g->dim != DIM_OVERWORLD)
+        return FEATURE_ERR_DIMENSION;
+    return FEATURE_OK;
+}
+
+static int validateTreeGenerator(const Generator *g)
+{
+    if (!g)
+        return FEATURE_ERR_ARGUMENT;
+    if (g->mc != MC_1_17_1 && g->mc != MC_1_21_1)
         return FEATURE_ERR_VERSION;
     if (g->dim != DIM_OVERWORLD)
         return FEATURE_ERR_DIMENSION;
@@ -238,6 +259,109 @@ static int getTreeProfile(int biome, TreeProfile *profile)
     }
 }
 
+typedef struct ModernTreeProfile
+{
+    int count;
+    int extraCountBound;
+    /* Global placed-feature registry index in Vanilla 1.21.1. */
+    int decoratorIndex;
+    int selector;
+} ModernTreeProfile;
+
+#define MODERN_NEIGHBOR_BIOME_GRID_SIZE 12
+#define MODERN_SURFACE_BIOME_GRID_SIZE 4
+#define MODERN_TREE_PROFILE_CAPACITY 32
+
+static int getModernTreeProfile(int biome, ModernTreeProfile *profile)
+{
+    switch (biome)
+    {
+    case plains:
+    case sunflower_plains:
+        *profile = (ModernTreeProfile){0, 20, 30, SELECT_PLAINS};
+        return 1;
+    case forest:
+        *profile = (ModernTreeProfile){10, 10, 20, SELECT_FOREST};
+        return 1;
+    case flower_forest:
+        *profile = (ModernTreeProfile){6, 10, 15, SELECT_FOREST};
+        return 1;
+    case birch_forest:
+        *profile = (ModernTreeProfile){10, 10, 19, SELECT_BIRCH};
+        return 1;
+    case tall_birch_forest:
+        *profile = (ModernTreeProfile){10, 10, 18, SELECT_BIRCH_TALL};
+        return 1;
+    case taiga:
+    case snowy_taiga:
+        *profile = (ModernTreeProfile){10, 10, 41, SELECT_TAIGA};
+        return 1;
+    case giant_tree_taiga:
+        *profile = (ModernTreeProfile){10, 10, 39,
+            SELECT_OLD_GROWTH_PINE};
+        return 1;
+    case giant_spruce_taiga:
+        *profile = (ModernTreeProfile){10, 10, 40,
+            SELECT_OLD_GROWTH_SPRUCE};
+        return 1;
+    case mountains:
+    case gravelly_mountains:
+        *profile = (ModernTreeProfile){0, 10, 43, SELECT_MOUNTAIN};
+        return 1;
+    case wooded_mountains:
+        *profile = (ModernTreeProfile){3, 10, 37, SELECT_MOUNTAIN};
+        return 1;
+    case savanna:
+    case savanna_plateau:
+        *profile = (ModernTreeProfile){1, 10, 9, SELECT_SAVANNA};
+        return 1;
+    case shattered_savanna:
+        *profile = (ModernTreeProfile){2, 10, 1, SELECT_SAVANNA};
+        return 1;
+    case bamboo_jungle:
+        *profile = (ModernTreeProfile){30, 10, 3, SELECT_BAMBOO};
+        return 1;
+    case jungle:
+        *profile = (ModernTreeProfile){50, 10, 7, SELECT_JUNGLE};
+        return 1;
+    case jungle_edge:
+        *profile = (ModernTreeProfile){2, 10, 4, SELECT_JUNGLE_EDGE};
+        return 1;
+    case river:
+    case frozen_river:
+        *profile = (ModernTreeProfile){0, 10, 48, SELECT_WATER};
+        return 1;
+    case dark_forest:
+        *profile = (ModernTreeProfile){16, 0, 13,
+            SELECT_DARK_FOREST_BROWN};
+        return 1;
+    case swamp:
+        *profile = (ModernTreeProfile){2, 10, 46, SELECT_OAK};
+        return 1;
+    case snowy_tundra:
+    case ice_spikes:
+        *profile = (ModernTreeProfile){0, 10, 44, SELECT_SPRUCE};
+        return 1;
+    case wooded_badlands_plateau:
+        *profile = (ModernTreeProfile){5, 10, 5, SELECT_OAK};
+        return 1;
+    case meadow:
+        *profile = (ModernTreeProfile){1, -100, 36, SELECT_MEADOW};
+        return 1;
+    case grove:
+        *profile = (ModernTreeProfile){10, 10, 42, SELECT_TAIGA};
+        return 1;
+    case mangrove_swamp:
+        *profile = (ModernTreeProfile){25, 0, 45, SELECT_MANGROVE};
+        return 1;
+    case cherry_grove:
+        *profile = (ModernTreeProfile){10, 10, 34, SELECT_CHERRY};
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static int selectTreeType(uint64_t *rng, int selector)
 {
     switch (selector)
@@ -285,6 +409,126 @@ static int selectTreeType(uint64_t *rng, int selector)
     }
 }
 
+static int selectModernTreeType(Xoroshiro *rng, int selector, int *type)
+{
+    switch (selector)
+    {
+    case SELECT_BIRCH:
+        *type = TREE_BIRCH;
+        return 1;
+    case SELECT_SPRUCE:
+        *type = TREE_SPRUCE;
+        return 1;
+    case SELECT_FOREST:
+        if (xNextFloat(rng) < 0.2f)
+            *type = TREE_BIRCH;
+        else
+        {
+            xNextFloat(rng);
+            *type = TREE_OAK;
+        }
+        return 1;
+    case SELECT_MOUNTAIN:
+        if (xNextFloat(rng) < 0.666f)
+            *type = TREE_SPRUCE;
+        else
+        {
+            xNextFloat(rng);
+            *type = TREE_OAK;
+        }
+        return 1;
+    case SELECT_SAVANNA:
+        *type = xNextFloat(rng) < 0.8f ? TREE_ACACIA : TREE_OAK;
+        return 1;
+    case SELECT_BAMBOO:
+        if (xNextFloat(rng) < 0.05f)
+        {
+            *type = TREE_OAK;
+            return 1;
+        }
+        if (xNextFloat(rng) < 0.15f)
+        {
+            *type = TREE_JUNGLE_BUSH;
+            return 1;
+        }
+        if (xNextFloat(rng) < 0.7f)
+        {
+            *type = TREE_JUNGLE;
+            return 1;
+        }
+        return 0;
+    case SELECT_JUNGLE:
+        if (xNextFloat(rng) < 0.1f)
+            *type = TREE_OAK;
+        else if (xNextFloat(rng) < 0.5f)
+            *type = TREE_JUNGLE_BUSH;
+        else
+        {
+            xNextFloat(rng);
+            *type = TREE_JUNGLE;
+        }
+        return 1;
+    case SELECT_JUNGLE_EDGE:
+        if (xNextFloat(rng) < 0.1f)
+            *type = TREE_OAK;
+        else if (xNextFloat(rng) < 0.5f)
+            *type = TREE_JUNGLE_BUSH;
+        else
+            *type = TREE_JUNGLE;
+        return 1;
+    case SELECT_DARK_FOREST_BROWN:
+    case SELECT_DARK_FOREST_RED:
+        if (xNextFloat(rng) < 0.025f)
+            *type = TREE_HUGE_BROWN_MUSHROOM;
+        else if (xNextFloat(rng) < 0.05f)
+            *type = TREE_HUGE_RED_MUSHROOM;
+        else if (xNextFloat(rng) < 0.6666667f)
+            *type = TREE_DARK_OAK;
+        else if (xNextFloat(rng) < 0.2f)
+            *type = TREE_BIRCH;
+        else
+        {
+            xNextFloat(rng);
+            *type = TREE_OAK;
+        }
+        return 1;
+    case SELECT_WATER:
+    case SELECT_BIRCH_TALL:
+    case SELECT_TAIGA:
+    case SELECT_PLAINS:
+        xNextFloat(rng);
+        *type = selector == SELECT_BIRCH_TALL ? TREE_BIRCH
+            : selector == SELECT_TAIGA ? TREE_SPRUCE : TREE_OAK;
+        return 1;
+    case SELECT_OLD_GROWTH_PINE:
+        if (xNextFloat(rng) >= 0.025641026f &&
+            xNextFloat(rng) >= 0.30769232f)
+            xNextFloat(rng);
+        *type = TREE_SPRUCE;
+        return 1;
+    case SELECT_OLD_GROWTH_SPRUCE:
+        if (xNextFloat(rng) >= 0.33333334f)
+            xNextFloat(rng);
+        *type = TREE_SPRUCE;
+        return 1;
+    case SELECT_MEADOW:
+        *type = xNextFloat(rng) < 0.5f ? TREE_OAK : TREE_BIRCH;
+        return 1;
+    case SELECT_MANGROVE:
+        xNextFloat(rng);
+        *type = TREE_MANGROVE;
+        return 1;
+    case SELECT_CHERRY:
+        *type = TREE_CHERRY;
+        return 1;
+    case SELECT_OAK:
+        *type = TREE_OAK;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 static uint64_t getPopulationSeed117(uint64_t worldSeed, int chunkX, int chunkZ)
 {
     uint64_t rng;
@@ -297,14 +541,263 @@ static uint64_t getPopulationSeed117(uint64_t worldSeed, int chunkX, int chunkZ)
         (uint64_t)(int64_t)chunkZ * 16 * zMultiplier) ^ worldSeed;
 }
 
+static uint64_t getPopulationSeedModern(uint64_t worldSeed, int chunkX,
+    int chunkZ)
+{
+    Xoroshiro rng;
+    xSetSeed(&rng, worldSeed);
+    uint64_t xMultiplier = xNextLongJ(&rng) | 1;
+    uint64_t zMultiplier = xNextLongJ(&rng) | 1;
+    return ((uint64_t)(int64_t)chunkX * 16 * xMultiplier +
+        (uint64_t)(int64_t)chunkZ * 16 * zMultiplier) ^ worldSeed;
+}
+
+static int getModernBambooCount(int chunkX, int chunkZ)
+{
+    uint64_t seed;
+    PerlinNoise foliage;
+    setSeed(&seed, 2345);
+    perlinInit(&foliage, &seed);
+    double noise = sampleSimplex2D(&foliage,
+        chunkX * 16 / 80.0, chunkZ * 16 / 80.0);
+    int count = (int)ceil((noise + 0.3) * 160.0);
+    return count > 0 ? count : 0;
+}
+
+static int modernSurfaceBiomeAt(const int *surfaceBiomes,
+    int startQuartX, int startQuartZ, int blockX, int blockZ)
+{
+    int quartX = floordiv(blockX, 4) - startQuartX;
+    int quartZ = floordiv(blockZ, 4) - startQuartZ;
+    if (quartX < 0 || quartX >= MODERN_SURFACE_BIOME_GRID_SIZE ||
+        quartZ < 0 || quartZ >= MODERN_SURFACE_BIOME_GRID_SIZE)
+        return none;
+    return surfaceBiomes[quartZ * MODERN_SURFACE_BIOME_GRID_SIZE + quartX];
+}
+
+static int modernBiomeUsesProfile(int biome, int decoratorIndex)
+{
+    ModernTreeProfile profile;
+    return getModernTreeProfile(biome, &profile) &&
+        profile.decoratorIndex == decoratorIndex;
+}
+
+static int collectModernTreeProfiles(const int *surfaceBiomes,
+    ModernTreeProfile *profiles, int capacity, int *hasBamboo)
+{
+    int count = 0;
+    *hasBamboo = 0;
+    int i;
+    for (i = 0; i < MODERN_NEIGHBOR_BIOME_GRID_SIZE *
+        MODERN_NEIGHBOR_BIOME_GRID_SIZE; i++)
+    {
+        int biome = surfaceBiomes[i];
+        if (biome == bamboo_jungle)
+            *hasBamboo = 1;
+
+        ModernTreeProfile profile;
+        if (!getModernTreeProfile(biome, &profile))
+            continue;
+
+        int insertion = 0;
+        while (insertion < count &&
+            profiles[insertion].decoratorIndex < profile.decoratorIndex)
+            insertion++;
+        if (insertion < count &&
+            profiles[insertion].decoratorIndex == profile.decoratorIndex)
+            continue;
+        if (count >= capacity)
+            return FEATURE_ERR_CAPACITY;
+        memmove(profiles + insertion + 1, profiles + insertion,
+            sizeof(*profiles) * (size_t)(count - insertion));
+        profiles[insertion] = profile;
+        count++;
+    }
+    return count;
+}
+
+static size_t appendModernBambooCandidates(const Generator *g,
+    int chunkX, int chunkZ, const int *surfaceBiomes,
+    int startQuartX, int startQuartZ, NaturalTreeCandidate *out,
+    size_t capacity)
+{
+    int placements = getModernBambooCount(chunkX, chunkZ);
+    uint64_t populationSeed = getPopulationSeedModern(g->seed,
+        chunkX, chunkZ);
+    Xoroshiro rng;
+    xSetSeed(&rng, populationSeed + 2 + 90000);
+
+    size_t count = 0;
+    int exactSequence = 1;
+    int i;
+    for (i = 0; i < placements; i++)
+    {
+        int x = chunkX * 16 + xNextIntJ(&rng, 16);
+        int z = chunkZ * 16 + xNextIntJ(&rng, 16);
+        int biome = modernSurfaceBiomeAt(surfaceBiomes,
+            startQuartX, startQuartZ, x, z);
+        if (biome != bamboo_jungle)
+            continue;
+        int height = xNextIntJ(&rng, 12) + 5;
+        if (xNextFloat(&rng) < 0.2f)
+            xNextIntJ(&rng, 4);
+        if (out && count < capacity)
+        {
+            NaturalTreeCandidate *record = out + count;
+            record->pos.x = x;
+            record->pos.y = 0;
+            record->pos.z = z;
+            record->type = TREE_BAMBOO;
+            record->biome = biome;
+            record->flags = FEATURE_TREE_CANDIDATE |
+                ((uint32_t)height << FEATURE_CANDIDATE_HEIGHT_SHIFT);
+            if (exactSequence)
+                record->flags |= FEATURE_XZ_EXACT | FEATURE_TYPE_EXACT;
+            else
+                record->flags |= FEATURE_SEQUENCE_APPROXIMATE;
+        }
+        count++;
+        exactSequence = 0;
+    }
+    return count;
+}
+
+static size_t appendModernTreeCandidates(const Generator *g,
+    int chunkX, int chunkZ, const int *surfaceBiomes,
+    int startQuartX, int startQuartZ, const ModernTreeProfile *profile,
+    NaturalTreeCandidate *out, size_t capacity)
+{
+    uint64_t populationSeed = getPopulationSeedModern(g->seed,
+        chunkX, chunkZ);
+    Xoroshiro rng;
+    xSetSeed(&rng, populationSeed + profile->decoratorIndex + 90000);
+    int placements = profile->count;
+    if (profile->extraCountBound > 0 &&
+        xNextIntJ(&rng, profile->extraCountBound) ==
+            profile->extraCountBound - 1)
+        placements++;
+    else if (profile->extraCountBound < 0 &&
+        xNextFloat(&rng) >= 1.0f / -profile->extraCountBound)
+        placements = 0;
+
+    size_t count = 0;
+    int exactSequence = 1;
+    int i;
+    for (i = 0; i < placements; i++)
+    {
+        int x = chunkX * 16 + xNextIntJ(&rng, 16);
+        int z = chunkZ * 16 + xNextIntJ(&rng, 16);
+        int biome = modernSurfaceBiomeAt(surfaceBiomes,
+            startQuartX, startQuartZ, x, z);
+        if (!modernBiomeUsesProfile(biome, profile->decoratorIndex))
+            continue;
+
+        int type;
+        int tree = selectModernTreeType(&rng, profile->selector, &type);
+        if (tree)
+        {
+            if (out && count < capacity)
+            {
+                NaturalTreeCandidate *record = out + count;
+                record->pos.x = x;
+                record->pos.y = 0;
+                record->pos.z = z;
+                record->type = type;
+                record->biome = biome;
+                record->flags = FEATURE_TREE_CANDIDATE |
+                    FEATURE_Y_APPROXIMATE;
+                if (exactSequence)
+                    record->flags |= FEATURE_XZ_EXACT |
+                        FEATURE_TYPE_EXACT;
+                else
+                    record->flags |= FEATURE_SEQUENCE_APPROXIMATE;
+            }
+            count++;
+        }
+
+        /* The selected configured feature owns the same random stream. */
+        exactSequence = 0;
+    }
+    return count;
+}
+
 int getChunkNaturalTreeCandidates(const Generator *g, int chunkX, int chunkZ,
     NaturalTreeCandidate *out, size_t capacity, size_t *required)
 {
-    int status = validateGenerator(g);
+    int status = validateTreeGenerator(g);
     if (status != FEATURE_OK)
         return status;
     if (!required || (!out && capacity != 0))
         return FEATURE_ERR_ARGUMENT;
+
+    if (g->mc == MC_1_21_1)
+    {
+        int startQuartX = chunkX * 4;
+        int startQuartZ = chunkZ * 4;
+        int surfaceBiomes[MODERN_SURFACE_BIOME_GRID_SIZE *
+            MODERN_SURFACE_BIOME_GRID_SIZE];
+        if (mapOverworldSurfaceBiome(surfaceBiomes, &g->bn, g->sha, 4,
+                startQuartX, startQuartZ, MODERN_SURFACE_BIOME_GRID_SIZE,
+                MODERN_SURFACE_BIOME_GRID_SIZE) != 0)
+            return FEATURE_ERR_ARGUMENT;
+
+        int neighborStartQuartX = startQuartX - 4;
+        int neighborStartQuartZ = startQuartZ - 4;
+        int neighborBiomes[MODERN_NEIGHBOR_BIOME_GRID_SIZE *
+            MODERN_NEIGHBOR_BIOME_GRID_SIZE];
+        int x, z;
+        for (z = 0; z < MODERN_NEIGHBOR_BIOME_GRID_SIZE; z++)
+        {
+            for (x = 0; x < MODERN_NEIGHBOR_BIOME_GRID_SIZE; x++)
+            {
+                neighborBiomes[z * MODERN_NEIGHBOR_BIOME_GRID_SIZE + x] =
+                    sampleBiomeNoise(&g->bn, 0,
+                        neighborStartQuartX + x, 16,
+                        neighborStartQuartZ + z, 0, 0);
+            }
+        }
+        for (z = 0; z < MODERN_SURFACE_BIOME_GRID_SIZE; z++)
+        {
+            for (x = 0; x < MODERN_SURFACE_BIOME_GRID_SIZE; x++)
+            {
+                neighborBiomes[(z + 4) * MODERN_NEIGHBOR_BIOME_GRID_SIZE +
+                    x + 4] = surfaceBiomes[
+                        z * MODERN_SURFACE_BIOME_GRID_SIZE + x];
+            }
+        }
+
+        ModernTreeProfile profiles[MODERN_TREE_PROFILE_CAPACITY];
+        int hasBamboo;
+        int profileCount = collectModernTreeProfiles(neighborBiomes,
+            profiles, MODERN_TREE_PROFILE_CAPACITY, &hasBamboo);
+        if (profileCount < 0)
+            return profileCount;
+        if (profileCount == 0)
+        {
+            *required = 0;
+            return FEATURE_PARTIAL;
+        }
+
+        size_t count = hasBamboo
+            ? appendModernBambooCandidates(g, chunkX, chunkZ,
+                surfaceBiomes, startQuartX, startQuartZ, out, capacity)
+            : 0;
+        int i;
+        for (i = 0; i < profileCount; i++)
+        {
+            NaturalTreeCandidate *profileOut = out && count < capacity
+                ? out + count : NULL;
+            size_t profileCapacity = capacity > count
+                ? capacity - count : 0;
+            count += appendModernTreeCandidates(g, chunkX, chunkZ,
+                surfaceBiomes, startQuartX, startQuartZ, profiles + i,
+                profileOut, profileCapacity);
+        }
+        *required = count;
+        if (out && count > capacity)
+            return FEATURE_ERR_CAPACITY;
+        return FEATURE_OK;
+    }
 
     int biome = getBiomeAt(g, 4, chunkX * 4 + 2, 0, chunkZ * 4 + 2);
     TreeProfile profile;
