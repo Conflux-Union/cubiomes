@@ -1,5 +1,7 @@
 #include "finders.h"
 #include "biomes.h"
+#include "util.h"
+#include "features/stronghold.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -8,8 +10,20 @@
 #include <float.h>
 #include <math.h>
 
+#ifndef BITMASK
+// https://c-faq.com/misc/bitsets.html
+#define BITMASK(b) (1 << ((b) % CHAR_BIT))
+#define BITSLOT(b) ((b) / CHAR_BIT)
+#define BITSET(a, b) ((a)[BITSLOT(b)] |= BITMASK(b))
+#define BITCLEAR(a, b) ((a)[BITSLOT(b)] &= ~BITMASK(b))
+#define BITTEST(a, b) ((a)[BITSLOT(b)] & BITMASK(b))
+#define BITNSLOTS(nb) ((nb + CHAR_BIT - 1) / CHAR_BIT)
+#endif
 
 #define PI 3.14159265358979323846
+
+#define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 
 //==============================================================================
@@ -54,6 +68,38 @@ uint64_t getPopulationSeed(int mc, uint64_t ws, int x, int z)
     return (x * a + z * b) ^ ws;
 }
 
+void createPos3List(Pos3List* list, int initialCapacity)
+{
+    list->size = 0;
+    list->capacity = initialCapacity;
+    list->pos3s = malloc(list->capacity * sizeof(Pos3));
+    if (!list->pos3s) {
+        fprintf(stderr, "Memory allocation failed.\n");
+        exit(1);
+    }
+}
+
+void appendPos3List(Pos3List* list, Pos3 pos3)
+{
+    if (list->size == list->capacity) {
+        list->capacity *= 2;
+        Pos3* newPos3s = realloc(list->pos3s, list->capacity * sizeof(Pos3));
+        if (!newPos3s) {
+            fprintf(stderr, "Reallocation failed.\n");
+            exit(1);
+        }
+        list->pos3s = newPos3s;
+    }
+    list->pos3s[list->size++] = pos3;
+}
+
+void freePos3List(Pos3List* list)
+{
+    free(list->pos3s);
+    list->pos3s = NULL;
+    list->size = 0;
+    list->capacity = 0;
+}
 
 int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
 {
@@ -80,7 +126,7 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
     s_monument              = { 10387313, 32, 27, Monument,         0,0},
     s_mansion               = { 10387319, 80, 60, Mansion,          0,0},
     s_ruined_portal         = { 34222645, 40, 25, Ruined_Portal,    0,0},
-    s_ruined_portal_n       = { 34222645, 40, 25, Ruined_Portal,    DIM_NETHER,0},
+    s_ruined_portal_n       = { 34222645, 40, 25, Ruined_Portal_N,  DIM_NETHER,0},
     s_ruined_portal_n_117   = { 34222645, 25, 15, Ruined_Portal_N,  DIM_NETHER,0},
     s_ancient_city          = { 20083232, 24, 16, Ancient_City,     0,0},
     s_trail_ruins           = { 83469867, 34, 26, Trail_Ruins,      0,0},
@@ -199,6 +245,183 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
     }
 }
 
+int getStructureSaltConfig(int structureType, int mc, int biome, StructureSaltConfig *ssconf) {
+    static const StructureSaltConfig
+    ss_buried_treasure_113 =         {2,  2},
+    ss_buried_treasure_1161 =        {3,  1},
+    ss_buried_treasure_118 =         {3,  2},
+    ss_buried_treasure_1194 =        {3,  0},
+
+    ss_bastion_remnant_116 =         {4, 12},
+    ss_bastion_remnant_1192 =        {4, 13},
+    ss_bastion_remnant_1194 =        {4,  0},
+
+    ss_desert_pyramid_113 =          {3,  2},
+    ss_desert_pyramid_1161 =         {4,  3},
+    ss_desert_pyramid_1192 =         {4,  1},
+
+    ss_igloo_113 =                   {3,  4},
+    ss_igloo_1161 =                  {4,  4},
+    ss_igloo_1192 =                  {4,  3},
+
+    ss_jungle_pyramid_113 =          {3,  3},
+    ss_jungle_pyramid_1161 =         {4,  2},
+    ss_jungle_pyramid_1194 =         {4,  4},
+
+    ss_pillager_outpost_114 =        {3,  0},
+    ss_pillager_outpost_1161 =       {4,  0},
+    ss_pillager_outpost_1194 =       {4,  9},
+
+    ss_shipwreck_113 =               {3,  5},
+    ss_shipwreck_1161 =              {4,  6},
+    ss_shipwreck_118 =               {4,  5},
+    ss_shipwreck_1194 =              {4, 17},
+
+    ss_shipwreck_beached_118 =       {4,  6},
+    ss_shipwreck_beached_1194 =      {4, 18},
+
+    ss_ruined_portal_1161 =          {4,  5},
+    ss_ruined_portal_118 =           {4, 18},
+    ss_ruined_portal_1192 =          {4, 19},
+    ss_ruined_portal_1194 =          {4, 10},
+
+    ss_ruined_portal_desert_118 =    {4, 19},
+    ss_ruined_portal_desert_1192 =   {4, 20},
+    ss_ruined_portal_desert_1194 =   {4, 11},
+
+    ss_ruined_portal_jungle_118 =    {4, 20},
+    ss_ruined_portal_jungle_1192 =   {4, 21},
+    ss_ruined_portal_jungle_1194 =   {4, 12},
+
+    ss_ruined_portal_swamp_118 =     {4, 21},
+    ss_ruined_portal_swamp_1192 =    {4, 22},
+    ss_ruined_portal_swamp_1194 =    {4, 16},
+
+    ss_ruined_portal_mountain_118 =  {4, 22},
+    ss_ruined_portal_mountain_1192 = {4, 23},
+    ss_ruined_portal_mountain_1194 = {4, 13},
+
+    ss_ruined_portal_ocean_118 =     {4, 23},
+    ss_ruined_portal_ocean_1192 =    {4, 24},
+    ss_ruined_portal_ocean_1194 =    {4, 15},
+
+    ss_stronghold_113 =              {2,  1},
+    ss_stronghold_116 =              {5,  0},
+    ss_stronghold_1192 =             {4,  8},
+    ss_stronghold_1194 =             {4, 19},
+
+    ss_ruined_portal_nether_118 =    {4, 24},
+    ss_ruined_portal_nether_1192 =   {4, 25},
+    ss_ruined_portal_nether_1194 =   {4, 14},
+
+    ss_fortress_113 =                {5,  0},
+    ss_fortress_1161 =               {7,  0},
+    ss_fortress_1194 =               {7,  1},
+
+    ss_end_city_113 =                {3,  0},
+    ss_end_city_end_highlands_113 =  {3,  1},
+    ss_end_city_1161 =               {4, 10},
+    ss_end_city_118 =                {4, 11},
+    ss_end_city_1192 =               {4, 12},
+    ss_end_city_1194 =               {4,  2};
+
+    switch (structureType) {
+    case Treasure:
+        if (mc < MC_1_16_1) *ssconf = ss_buried_treasure_113;
+        else if (mc < MC_1_18) *ssconf = ss_buried_treasure_1161;
+        else if (mc < MC_1_19_4) *ssconf = ss_buried_treasure_118;
+        else *ssconf = ss_buried_treasure_1194;
+        return mc >= MC_1_13;
+    case Bastion:
+        if (mc < MC_1_19_2) *ssconf = ss_bastion_remnant_116;
+        else if (mc < MC_1_19_4) *ssconf = ss_bastion_remnant_1192;
+        else *ssconf = ss_bastion_remnant_1194;
+        return mc >= MC_1_16;
+    case Desert_Pyramid:
+        if (mc < MC_1_16_1) *ssconf = ss_desert_pyramid_113;
+        else if (mc < MC_1_19_2) *ssconf = ss_desert_pyramid_1161;
+        else *ssconf = ss_desert_pyramid_1192;
+        return mc >= MC_1_13;
+    case Igloo:
+        if (mc < MC_1_16_1) *ssconf = ss_igloo_113;
+        else if (mc < MC_1_19_2) *ssconf = ss_igloo_1161;
+        else *ssconf = ss_igloo_1192;
+        return mc >= MC_1_13;
+    case Jungle_Pyramid:
+        if (mc < MC_1_16_1) *ssconf = ss_jungle_pyramid_113;
+        else if (mc < MC_1_19_4) *ssconf = ss_jungle_pyramid_1161;
+        else *ssconf = ss_jungle_pyramid_1194;
+        return mc >= MC_1_13;
+    case Outpost:
+        if (mc < MC_1_16_1) *ssconf = ss_pillager_outpost_114;
+        else if (mc < MC_1_19_4) *ssconf = ss_pillager_outpost_1161;
+        else *ssconf = ss_pillager_outpost_1194;
+        return mc >= MC_1_14;
+    case Shipwreck:
+        if (mc < MC_1_16_1) *ssconf = ss_shipwreck_113;
+        else if (mc < MC_1_18) *ssconf = ss_shipwreck_1161;
+        else if (mc < MC_1_19_4) {
+            *ssconf = isOceanic(biome) ? ss_shipwreck_118 : ss_shipwreck_beached_118;
+        } else {
+            *ssconf = isOceanic(biome) ? ss_shipwreck_1194 : ss_shipwreck_beached_1194;
+        }
+        return mc >= MC_1_13;
+    case Ruined_Portal:
+        if (mc < MC_1_18) *ssconf = ss_ruined_portal_1161;
+        else if (mc < MC_1_19_2) {
+            if (biome == desert) *ssconf = ss_ruined_portal_desert_118;
+            else if (biome == jungle) *ssconf = ss_ruined_portal_jungle_118;
+            else if (biome == swamp) *ssconf = ss_ruined_portal_swamp_118;
+            else if (biome == mountains) *ssconf = ss_ruined_portal_mountain_118;
+            else if (biome == ocean) *ssconf = ss_ruined_portal_ocean_118;
+            else *ssconf = ss_ruined_portal_118;
+        }
+        else if (mc < MC_1_19_4) {
+            if (biome == desert) *ssconf = ss_ruined_portal_desert_1192;
+            else if (biome == jungle) *ssconf = ss_ruined_portal_jungle_1192;
+            else if (biome == swamp) *ssconf = ss_ruined_portal_swamp_1192;
+            else if (biome == mountains) *ssconf = ss_ruined_portal_mountain_1192;
+            else if (biome == ocean) *ssconf = ss_ruined_portal_ocean_1192;
+            else *ssconf = ss_ruined_portal_1192; // assuming biome != deep_dark
+        }
+        else {
+            if (biome == desert) *ssconf = ss_ruined_portal_desert_1194;
+            else if (biome == jungle) *ssconf = ss_ruined_portal_jungle_1194;
+            else if (biome == swamp) *ssconf = ss_ruined_portal_swamp_1194;
+            else if (biome == mountains) *ssconf = ss_ruined_portal_mountain_1194;
+            else if (biome == ocean) *ssconf = ss_ruined_portal_ocean_1194;
+            else *ssconf = ss_ruined_portal_1194; // assuming biome != deep_dark
+        }
+        return mc >= MC_1_16_1;
+    case Stronghold:
+        if (mc < MC_1_16_1) *ssconf = ss_stronghold_113;
+        else if (mc < MC_1_19_2) *ssconf = ss_stronghold_116;
+        else if (mc < MC_1_19_4) *ssconf = ss_stronghold_1192;
+        else *ssconf = ss_stronghold_1194;
+        return mc >= MC_1_13;
+    case Ruined_Portal_N:
+        if (mc < MC_1_19_2) *ssconf = ss_ruined_portal_nether_118;
+        else if (mc < MC_1_19_4) *ssconf = ss_ruined_portal_nether_1192;
+        else *ssconf = ss_ruined_portal_nether_1194;
+        return mc >= MC_1_18;
+    case Fortress:
+        if (mc < MC_1_16_1) *ssconf = ss_fortress_113;
+        else if (mc < MC_1_19_4) *ssconf = ss_fortress_1161;
+        else *ssconf = ss_fortress_1194;
+        return mc >= MC_1_13;
+    case End_City:
+        if (mc < MC_1_16_1) *ssconf = biome == end_highlands ? ss_end_city_end_highlands_113 : ss_end_city_113;
+        else if (mc < MC_1_18) *ssconf = ss_end_city_1161;
+        else if (mc < MC_1_19_2) *ssconf = ss_end_city_118;
+        else if (mc < MC_1_19_4) *ssconf = ss_end_city_1192;
+        else *ssconf = ss_end_city_1194;
+        return mc >= MC_1_13;
+    default:
+        fprintf(stderr, "ERR getStructureSaltConfig: unsupported structure type %d\n", structureType);
+        memset(ssconf, 0, sizeof(StructureSaltConfig));
+        return 0;
+    }
+}
 
 // like getFeaturePos(), but modifies the rng seed
 static inline
@@ -817,12 +1040,15 @@ int isStrongholdBiome(int mc, int id)
         return 0;
     case mushroom_field_shore:
         return mc >= MC_1_13;
-    case stone_shore:
+    case stone_shore: // stony_shore
         return mc <= MC_1_17;
     case bamboo_jungle:
     case bamboo_jungle_hills:
         // simulate MC-199298
         return mc <= MC_1_15 || mc >= MC_1_18;
+    case cherry_grove:
+        // see MC-278965
+        return mc >= MC_1_21_9;
     case mangrove_swamp:
     case deep_dark:
         return 0;
@@ -1172,7 +1398,1319 @@ Pos getSpawn(const Generator *g)
     return spawn;
 }
 
+//==============================================================================
+// Simulating ore generation
+//==============================================================================
 
+int getOreConfig(int oreType, int mc, int biomeID, OreConfig *oconf)
+{
+    static const uint32_t BASE_STONE_OVERWORLD_REPLACEABLES[] = {STONE, GRANITE, DIORITE, ANDESITE, DEEPSLATE, TUFF};
+    static const uint32_t BASE_STONE_NETHER_REPLACEABLES[] = {NETHERRACK, BASALT, BLACKSTONE};
+    static const uint32_t STONE_REPLACEABLES[] = {STONE};
+    static const uint32_t NETHERRACK_REPLACEABLES[] = {NETHERRACK};
+
+    // check the step in BiomeDefaultFeatures.java
+    // check the size and discardChanceOnAirExposure in OreFeatures.java
+    // check the repeatCount in OrePlacements.java
+
+    static const OreConfig
+    // overworld
+    o_andesite_113 =  {4, 4, 33, 10, providerRange,        0,  0, 80, AndesiteOre, ANDESITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_andesite_1161 = {4, 6, 33, 10, providerRange,        0,  0, 80, AndesiteOre, ANDESITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_andesite_117 =  {4, 6, 33, 10, providerUniformRange, 0, 79, -1, AndesiteOre, ANDESITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_buried_diamond_118 = {20, 6, 8, 4, providerTriangleRange, -64 + -80, -64 + 80, -1, BuriedDiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 1.0F},
+    o_buried_diamond_120 = {21, 6, 8, 4, providerTriangleRange, -64 + -80, -64 + 80, -1, BuriedDiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 1.0F},
+
+    o_buried_lapis_118 = {22, 6, 7, 4, providerUniformRange, -64, 64, -1, BuriedLapisOre, LAPIS_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 1.0F},
+    o_buried_lapis_120 = {23, 6, 7, 4, providerUniformRange, -64, 64, -1, BuriedLapisOre, LAPIS_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 1.0F},
+
+    o_clay_118 = {26, 6, 33, 46, providerUniformRange, 0, 256, -1, ClayOre, CLAY, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_clay_120 = {27, 6, 33, 46, providerUniformRange, 0, 256, -1, ClayOre, CLAY, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_coal_113 =  {5, 4, 17, 20, providerRange,        0,   0, 128, CoalOre, COAL_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_coal_1161 = {5, 6, 17, 20, providerRange,        0,   0, 128, CoalOre, COAL_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_coal_117 =  {7, 6, 17, 20, providerUniformRange, 0, 127,  -1, CoalOre, COAL_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_copper_117 = {13, 6, 10,  6, providerTriangleRange,   0,  96, -1, CopperOre, COPPER_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_copper_118 = {24, 6, 10, 16, providerTriangleRange, -16, 112, -1, CopperOre, COPPER_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_copper_120 = {25, 6, 10, 16, providerTriangleRange, -16, 112, -1, CopperOre, COPPER_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_deepslate_117 = {6, 6, 64, 2, providerUniformRange, 0, 16, -1, DeepslateOre, DEEPSLATE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_diamond_113 =  { 9, 4, 8, 1, providerRange, 0, 0, 16, DiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_diamond_1161 = { 9, 6, 8, 1, providerRange, 0, 0, 16, DiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    // maxOffset was 16 in 1.17, changed to 15 in 1.17.1
+    o_diamond_117 =  {11, 6, 8, 1, providerUniformRange,          0,       15, -1, DiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_diamond_118 =  {18, 6, 4, 7, providerTriangleRange, -64 + -80, -64 + 80, -1, DiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.5F},
+
+    o_diorite_113 =  {3, 4, 33, 10, providerRange,        0, 0,  80, DioriteOre, DIORITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_diorite_1161 = {3, 6, 33, 10, providerRange,        0, 0,  80, DioriteOre, DIORITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_diorite_117 =  {3, 6, 33, 10, providerUniformRange, 0, 79, -1, DioriteOre, DIORITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_dirt_113 =  {0, 4, 33, 10, providerRange,        0, 0,  256, DirtOre, DIRT, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_dirt_1161 = {0, 6, 33, 10, providerRange,        0, 0,  256, DirtOre, DIRT, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_dirt_117 =  {0, 6, 33, 10, providerUniformRange, 0, 255, -1, DirtOre, DIRT, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_dirt_118 =  {0, 6, 33,  7, providerUniformRange, 0, 160, -1, DirtOre, DIRT, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_emerald_113 =  {14, 4, 1,   1, providerEmeraldOre,     -1,  -1, -1, EmeraldOre, EMERALD_ORE, DIM_OVERWORLD, 1, STONE_REPLACEABLES, 0.0F},
+    o_emerald_1161 = {14, 6, 1,   1, providerEmeraldOre,     -1,  -1, -1, EmeraldOre, EMERALD_ORE, DIM_OVERWORLD, 1, STONE_REPLACEABLES, 0.0F},
+    o_emerald_117 =  {17, 6, 1,   1, providerUniformRange,    4,  31, -1, EmeraldOre, EMERALD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_emerald_118 =  {31, 6, 3, 100, providerTriangleRange, -16, 480, -1, EmeraldOre, EMERALD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_emerald_119 =  {32, 6, 3, 100, providerTriangleRange, -16, 480, -1, EmeraldOre, EMERALD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_emerald_120 =  {33, 6, 3, 100, providerTriangleRange, -16, 480, -1, EmeraldOre, EMERALD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_extra_gold_113 =  {11, 4, 9, 20, providerRange,        32,  32, 80, ExtraGoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_extra_gold_1161 = {11, 6, 9, 20, providerRange,        32,  32, 80, ExtraGoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_extra_gold_117 =  {14, 6, 9, 20, providerUniformRange, 32,  79, -1, ExtraGoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_extra_gold_118 =  {27, 6, 9, 50, providerUniformRange, 32, 256, -1, ExtraGoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.5F},
+    o_extra_gold_120 =  {28, 6, 9, 50, providerUniformRange, 32, 256, -1, ExtraGoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.5F},
+
+    o_gold_113 =  { 7, 4, 9, 2, providerRange,           0,  0, 32, GoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_gold_1161 = { 7, 6, 9, 2, providerRange,           0,  0, 32, GoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_gold_117 =  { 9, 6, 9, 2, providerUniformRange,    0, 31, -1, GoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_gold_118 =  {14, 6, 9, 4, providerTriangleRange, -64, 32, -1, GoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.5F},
+
+    o_granite_113 =  {2, 4, 33, 10, providerRange,        0,  0, 80, GraniteOre, GRANITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_granite_1161 = {2, 6, 33, 10, providerRange,        0,  0, 80, GraniteOre, GRANITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_granite_117 =  {2, 6, 33, 10, providerUniformRange, 0, 79, -1, GraniteOre, GRANITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_gravel_113 =  {1, 4, 33, 8,  providerRange,          0,   0, 256, GravelOre, GRAVEL, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_gravel_1161 = {1, 6, 33, 8,  providerRange,          0,   0, 256, GravelOre, GRAVEL, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_gravel_117 =  {1, 6, 33, 8,  providerUniformRange,   0, 255,  -1, GravelOre, GRAVEL, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_gravel_118 =  {1, 6, 33, 14, providerUniformRange, -64, 319,  -1, GravelOre, GRAVEL, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_infested_113 =  {0, 5, 9,  7, providerRange,          0,  0, 64, InfestedOre, INFESTED_STONE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_infested_1161 = {2, 7, 9,  7, providerRange,          0,  0, 64, InfestedOre, INFESTED_STONE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_infested_117 =  {4, 7, 9,  7, providerUniformRange,   0, 63, -1, InfestedOre, INFESTED_STONE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_infested_118 =  {2, 7, 9, 14, providerUniformRange, -64, 63, -1, InfestedOre, INFESTED_STONE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_infested_1192 = {4, 7, 9, 14, providerUniformRange, -64, 63, -1, InfestedOre, INFESTED_STONE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_infested_262 =  {6, 7, 9, 14, providerUniformRange, -64, 63, -1, InfestedOre, INFESTED_STONE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_iron_113 =  {6, 4, 9, 20, providerRange,        0,  0, 64, IronOre, IRON_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_iron_1161 = {6, 6, 9, 20, providerRange,        0,  0, 64, IronOre, IRON_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_iron_117 =  {8, 6, 9, 20, providerUniformRange, 0, 63, -1, IronOre, IRON_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_lapis_113 =  {10, 4, 7, 1, providerDepthAverage,   16, 16, -1, LapisOre, LAPIS_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_lapis_1161 = {10, 6, 7, 1, providerDepthAverage,   16, 16, -1, LapisOre, LAPIS_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_lapis_117 =  {12, 6, 7, 1, providerTriangleRange,   0, 30, -1, LapisOre, LAPIS_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_lapis_118 =  {21, 6, 7, 2, providerTriangleRange, -32, 32, -1, LapisOre, LAPIS_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_lapis_120 =  {22, 6, 7, 2, providerTriangleRange, -32, 32, -1, LapisOre, LAPIS_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_large_copper_118 = {23, 6, 20, 16, providerTriangleRange, -16, 112, -1, LargeCopperOre, COPPER_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_large_copper_120 = {24, 6, 20, 16, providerTriangleRange, -16, 112, -1, LargeCopperOre, COPPER_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    // uses rareOrePlacement
+    o_large_diamond_118 = {19, 6, 12, 9, providerTriangleRange, -64 + -80, -64 + 80, -1, LargeDiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.7F},
+    o_large_diamond_120 = {20, 6, 12, 9, providerTriangleRange, -64 + -80, -64 + 80, -1, LargeDiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.7F},
+
+    o_lower_andesite_118 = {7, 6, 64, 2, providerUniformRange, 0, 60, -1, LowerAndesiteOre, ANDESITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_lower_coal_118 = {10, 6, 17, 20, providerTriangleRange, 0, 192, -1, LowerCoalOre, COAL_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.5F},
+
+    o_lower_diorite_118 = {5, 6, 64, 2, providerUniformRange, 0, 60, -1, LowerDioriteOre, DIORITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    // uses UniformInt.of(0, 1)
+    o_lower_gold_118 = {15, 6, 9, 1, providerUniformRange, -64, -48, -1, LowerGoldOre, GOLD_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.5F},
+
+    o_lower_granite_118 = {3, 6, 64, 2, providerUniformRange, 0, 60, -1, LowerGraniteOre, GRANITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_lower_redstone_118 = {17, 6, 8, 8, providerTriangleRange, -64 + -32, -64 + 32, -1, LowerRedstoneOre, REDSTONE_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_medium_diamond_120 = {19, 6, 8, 2, providerUniformRange, -64, -4, -1, MediumDiamondOre, DIAMOND_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.5F},
+
+    o_middle_iron_118 = {12, 6, 9, 10, providerTriangleRange, -24, 56, -1, MiddleIronOre, IRON_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_redstone_113 =  { 8, 4, 8, 8, providerRange,          0,  0, 16, RedstoneOre, REDSTONE_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_redstone_1161 = { 8, 6, 8, 8, providerRange,          0,  0, 16, RedstoneOre, REDSTONE_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_redstone_117 =  {10, 6, 8, 8, providerUniformRange,   0, 15, -1, RedstoneOre, REDSTONE_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_redstone_118 =  {16, 6, 8, 4, providerUniformRange, -64, 15, -1, RedstoneOre, REDSTONE_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_small_iron_118 = {13, 6, 4, 10, providerUniformRange, -64, 72, -1, SmallIronOre, IRON_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_tuff_117 = {5, 6, 33, 1, providerUniformRange,   0, 16, -1, TuffOre, TUFF, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+    o_tuff_118 = {8, 6, 64, 2, providerUniformRange, -64,  0, -1, TuffOre, TUFF, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    // uses rareOrePlacement
+    o_upper_andesite_118 = {6, 6, 64, 6, providerUniformRange, 64, 128, -1, UpperAndesiteOre, ANDESITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_upper_coal_118 = {9, 6, 17, 30, providerUniformRange, 136, 319, -1, UpperCoalOre, COAL_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    // uses rareOrePlacement
+    o_upper_diorite_118 = {4, 6, 64, 6, providerUniformRange, 64, 128, -1, UpperDioriteOre, DIORITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    // uses rareOrePlacement
+    o_upper_granite_118 = {2, 6, 64, 6, providerUniformRange, 64, 128, -1, UpperGraniteOre, GRANITE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    o_upper_iron_118 = {11, 6, 9, 90, providerTriangleRange, 80, 384, -1, UpperIronOre, IRON_ORE, DIM_OVERWORLD, 6, BASE_STONE_OVERWORLD_REPLACEABLES, 0.0F},
+
+    // nether
+    o_blackstone_1161 =                {12, 7, 33, 2, providerRange,        5, 10, 37, BlackstoneOre, BLACKSTONE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_blackstone_1161_crimson_forest = { 9, 7, 33, 2, providerRange,        5, 10, 37, BlackstoneOre, BLACKSTONE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_blackstone_1161_warped_forest =  {10, 7, 33, 2, providerRange,        5, 10, 37, BlackstoneOre, BLACKSTONE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_blackstone_117 =                 {12, 7, 33, 2, providerUniformRange, 5, 31, -1, BlackstoneOre, BLACKSTONE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_blackstone_118 =                 {18, 7, 33, 2, providerUniformRange, 5, 31, -1, BlackstoneOre, BLACKSTONE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+
+    o_deltas_gold_1161 = {13, 7, 10, 20, providerRange,            10,       20, 128, DeltasGoldOre, NETHER_GOLD_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_deltas_gold_117 =  {13, 7, 10, 20, providerUniformRange, 0 + 10, 127 - 10,  -1, DeltasGoldOre, NETHER_GOLD_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+
+    o_deltas_quartz_1161 = {14, 7, 14, 32, providerRange,            10,       20, 128, DeltasQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_deltas_quartz_117 =  {14, 7, 14, 32, providerUniformRange, 0 + 10, 127 - 10,  -1, DeltasQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+
+    // scatter ore, no count
+    o_large_debris_1161 =                {15, 7, 3, 1, providerDepthAverage, 16,  8, -1, LargeDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_large_debris_1161_crimson_forest = {12, 7, 3, 1, providerDepthAverage, 16,  8, -1, LargeDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_large_debris_1161_warped_forest =  {13, 7, 3, 1, providerDepthAverage, 16,  8, -1, LargeDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_large_debris_117 =                 {15, 7, 3, 1, providerTriangleRange, 8, 24, -1, LargeDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_large_debris_118 =                 {21, 7, 3, 1, providerTriangleRange, 8, 24, -1, LargeDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 1.0F},
+
+    o_magma_113 =                   { 8, 5, 33, 4, providerMagmaOre,     -1, -1, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_magma_1161 =                  { 9, 7, 33, 4, providerMagmaOre,     -1, -1, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_magma_1161_soul_sand_valley = { 8, 7, 33, 4, providerMagmaOre,     -1, -1, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_magma_1161_crimson_forest =   { 6, 7, 33, 4, providerMagmaOre,     -1, -1, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_magma_1161_warped_forest =    { 7, 7, 33, 4, providerMagmaOre,     -1, -1, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_magma_1161_basalt_deltas =    {11, 7, 33, 4, providerMagmaOre,     -1, -1, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_magma_117 =                   { 9, 7, 33, 4, providerUniformRange, 27, 36, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_magma_118 =                   {11, 7, 33, 4, providerUniformRange, 27, 36, -1, MagmaOre, MAGMA_BLOCK, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+
+    o_nether_gold_1161 =                {13, 7, 10, 10, providerRange,            10,       20, 128, NetherGoldOre, NETHER_GOLD_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gold_1161_crimson_forest = {10, 7, 10, 10, providerRange,            10,       20, 128, NetherGoldOre, NETHER_GOLD_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gold_1161_warped_forest =  {11, 7, 10, 10, providerRange,            10,       20, 128, NetherGoldOre, NETHER_GOLD_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gold_117 =                 {13, 7, 10, 10, providerUniformRange, 0 + 10, 127 - 10,  -1, NetherGoldOre, NETHER_GOLD_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gold_118 =                 {19, 7, 10, 10, providerUniformRange, 0 + 10, 127 - 10,  -1, NetherGoldOre, NETHER_GOLD_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+
+    o_nether_gravel_1161 =                {11, 7, 33, 2, providerRange,        5,  0, 37, NetherGravelOre, GRAVEL, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gravel_1161_crimson_forest = { 8, 7, 33, 2, providerRange,        5,  0, 37, NetherGravelOre, GRAVEL, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gravel_1161_warped_forest =  { 9, 7, 33, 2, providerRange,        5,  0, 37, NetherGravelOre, GRAVEL, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gravel_117 =                 {11, 7, 33, 2, providerUniformRange, 5, 41, -1, NetherGravelOre, GRAVEL, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_gravel_118 =                 {17, 7, 33, 2, providerUniformRange, 5, 41, -1, NetherGravelOre, GRAVEL, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+
+    o_nether_quartz_113 =                 { 7, 5, 14, 16, providerRange,            10,       20, 128, NetherQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_quartz_1161 =                {14, 7, 14, 16, providerRange,            10,       20, 128, NetherQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_quartz_1161_crimson_forest = {11, 7, 14, 16, providerRange,            10,       20, 128, NetherQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_quartz_1161_warped_forest =  {12, 7, 14, 16, providerRange,            10,       20, 128, NetherQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_quartz_117 =                 {14, 7, 14, 16, providerUniformRange, 0 + 10, 127 - 10,  -1, NetherQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_nether_quartz_118 =                 {20, 7, 14, 16, providerUniformRange, 0 + 10, 127 - 10,  -1, NetherQuartzOre, NETHER_QUARTZ_ORE, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+
+    // scatter ore, no count
+    o_small_debris_1161 =                {16, 7, 2, 1, providerRange,        8,      16, 128, SmallDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_small_debris_1161_crimson_forest = {13, 7, 2, 1, providerRange,        8,      16, 128, SmallDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_small_debris_1161_warped_forest =  {14, 7, 2, 1, providerRange,        8,      16, 128, SmallDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_small_debris_117 =                 {16, 7, 2, 1, providerUniformRange, 8, 127 - 8,  -1, SmallDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 0.0F},
+    o_small_debris_118 =                 {22, 7, 2, 1, providerUniformRange, 8, 127 - 8,  -1, SmallDebrisOre, ANCIENT_DEBRIS, DIM_NETHER, 3, BASE_STONE_NETHER_REPLACEABLES, 1.0F},
+
+    o_soul_sand_1161 = {10, 7, 12, 12, providerRange,        0,  0, 32, SoulSandOre, SOUL_SAND, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_soul_sand_117 =  {10, 7, 12, 12, providerUniformRange, 0, 31, -1, SoulSandOre, SOUL_SAND, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F},
+    o_soul_sand_118 =  {16, 7, 12, 12, providerUniformRange, 0, 31, -1, SoulSandOre, SOUL_SAND, DIM_NETHER, 1, NETHERRACK_REPLACEABLES, 0.0F}
+    ;
+
+    switch (oreType)
+    {
+    // overworld
+    case AndesiteOre:
+        if (mc < MC_1_16_1) *oconf = o_andesite_113;
+        else if (mc < MC_1_17) *oconf = o_andesite_1161;
+        else *oconf = o_andesite_117;
+        return mc > MC_1_12 && mc <= MC_1_17;
+    case BuriedDiamondOre:
+        if (mc < MC_1_20) *oconf = o_buried_diamond_118;
+        else *oconf = o_buried_diamond_120;
+        return mc > MC_1_17;
+    case BuriedLapisOre:
+        if (mc < MC_1_20) *oconf = o_buried_lapis_118;
+        else *oconf = o_buried_lapis_120;
+        return mc > MC_1_17;
+    case ClayOre:
+        if (mc < MC_1_20) *oconf = o_clay_118;
+        else *oconf = o_clay_120;
+        return mc > MC_1_17;
+    case CoalOre:
+        if (mc < MC_1_16_1) *oconf = o_coal_113;
+        else if (mc < MC_1_17) *oconf = o_coal_1161;
+        else *oconf = o_coal_117;
+        return mc > MC_1_12 && mc <= MC_1_17;
+    case CopperOre:
+        if (mc < MC_1_18) *oconf = o_copper_117;
+        else if (mc < MC_1_20) *oconf = o_copper_118;
+        else *oconf = o_copper_120;
+        return mc > MC_1_16;
+    case DeepslateOre:
+        *oconf = o_deepslate_117;
+        return mc > MC_1_16 && mc <= MC_1_17;
+    case DiamondOre:
+        if (mc < MC_1_16_1) *oconf = o_diamond_113;
+        else if (mc < MC_1_17) *oconf = o_diamond_1161;
+        else if (mc < MC_1_18) *oconf = o_diamond_117;
+        else *oconf = o_diamond_118;
+        return mc > MC_1_12;
+    case DioriteOre:
+        if (mc < MC_1_16_1) *oconf = o_diorite_113;
+        else if (mc < MC_1_17) *oconf = o_diorite_1161;
+        else *oconf = o_diorite_117;
+        return mc > MC_1_12 && mc <= MC_1_17;
+    case DirtOre:
+        if (mc < MC_1_16_1) *oconf = o_dirt_113;
+        else if (mc < MC_1_17) *oconf = o_dirt_1161;
+        else if (mc < MC_1_18) *oconf = o_dirt_117;
+        else *oconf = o_dirt_118;
+        return mc > MC_1_12;
+    case EmeraldOre:
+        if (mc < MC_1_16_1) *oconf = o_emerald_113;
+        else if (mc < MC_1_17) *oconf = o_emerald_1161;
+        else if (mc < MC_1_18) *oconf = o_emerald_117;
+        else if (mc < MC_1_19) *oconf = o_emerald_118;
+        else if (mc < MC_1_20) *oconf = o_emerald_119;
+        else *oconf = o_emerald_120;
+        return mc > MC_1_12;
+    case ExtraGoldOre:
+        if (mc < MC_1_16_1) *oconf = o_extra_gold_113;
+        else if (mc < MC_1_17) *oconf = o_extra_gold_1161;
+        else if (mc < MC_1_18) *oconf = o_extra_gold_117;
+        else if (mc < MC_1_20) *oconf = o_extra_gold_118;
+        else *oconf = o_extra_gold_120;
+        return mc > MC_1_12;
+    case GoldOre:
+        if (mc < MC_1_16_1) *oconf = o_gold_113;
+        else if (mc < MC_1_17) *oconf = o_gold_1161;
+        else if (mc < MC_1_18) *oconf = o_gold_117;
+        else *oconf = o_gold_118;
+        return mc > MC_1_12;
+    case GraniteOre:
+        if (mc < MC_1_16_1) *oconf = o_granite_113;
+        else if (mc < MC_1_17) *oconf = o_granite_1161;
+        else *oconf = o_granite_117;
+        return mc > MC_1_12 && mc <= MC_1_17;
+    case GravelOre:
+        if (mc < MC_1_16_1) *oconf = o_gravel_113;
+        else if (mc < MC_1_17) *oconf = o_gravel_1161;
+        else if (mc < MC_1_18) *oconf = o_gravel_117;
+        else *oconf = o_gravel_118;
+        return mc > MC_1_12;
+    case InfestedOre:
+        if (mc < MC_1_16_1) *oconf = o_infested_113;
+        else if (mc < MC_1_17) *oconf = o_infested_1161;
+        else if (mc < MC_1_18) *oconf = o_infested_117;
+        else if (mc < MC_1_19_2) *oconf = o_infested_118;
+        else if (mc < MC_26_2) *oconf = o_infested_1192;
+        else *oconf = o_infested_262;
+        return mc > MC_1_12;
+    case IronOre:
+        if (mc < MC_1_16_1) *oconf = o_iron_113;
+        else if (mc < MC_1_17) *oconf = o_iron_1161;
+        else *oconf = o_iron_117;
+        return mc > MC_1_12 && mc <= MC_1_17;
+    case LapisOre:
+        if (mc < MC_1_16_1) *oconf = o_lapis_113;
+        else if (mc < MC_1_17) *oconf = o_lapis_1161;
+        else if (mc < MC_1_18) *oconf = o_lapis_117;
+        else if (mc < MC_1_20) *oconf = o_lapis_118;
+        else *oconf = o_lapis_120;
+        return mc > MC_1_12;
+    case LargeCopperOre:
+        if (mc < MC_1_20) *oconf = o_large_copper_118;
+        else *oconf = o_large_copper_120;
+        return mc > MC_1_17;
+    case LargeDiamondOre:
+        if (mc < MC_1_20) *oconf = o_large_diamond_118;
+        else *oconf = o_large_diamond_120;
+        return mc > MC_1_17;
+    case LowerAndesiteOre:
+        *oconf = o_lower_andesite_118;
+        return mc > MC_1_17;
+    case LowerCoalOre:
+        *oconf = o_lower_coal_118;
+        return mc > MC_1_17;
+    case LowerDioriteOre:
+        *oconf = o_lower_diorite_118;
+        return mc > MC_1_17;
+    case LowerGoldOre:
+        *oconf = o_lower_gold_118;
+        return mc > MC_1_17;
+    case LowerGraniteOre:
+        *oconf = o_lower_granite_118;
+        return mc > MC_1_17;
+    case LowerRedstoneOre:
+        *oconf = o_lower_redstone_118;
+        return mc > MC_1_17;
+    case MediumDiamondOre:
+        *oconf = o_medium_diamond_120;
+        return mc > MC_1_19;
+    case MiddleIronOre:
+        *oconf = o_middle_iron_118;
+        return mc > MC_1_17;
+    case RedstoneOre:
+        if (mc < MC_1_16_1) *oconf = o_redstone_113;
+        else if (mc < MC_1_17) *oconf = o_redstone_1161;
+        else if (mc < MC_1_18) *oconf = o_redstone_117;
+        else *oconf = o_redstone_118;
+        return mc > MC_1_12;
+    case SmallIronOre:
+        *oconf = o_small_iron_118;
+        return mc > MC_1_17;
+    case TuffOre:
+        if (mc <= MC_1_17) *oconf = o_tuff_117;
+        else *oconf = o_tuff_118;
+        return mc > MC_1_16;
+    case UpperAndesiteOre:
+        *oconf = o_upper_andesite_118;
+        return mc > MC_1_17;
+    case UpperCoalOre:
+        *oconf = o_upper_coal_118;
+        return mc > MC_1_17;
+    case UpperDioriteOre:
+        *oconf = o_upper_diorite_118;
+        return mc > MC_1_17;
+    case UpperGraniteOre:
+        *oconf = o_upper_granite_118;
+        return mc > MC_1_17;
+    case UpperIronOre:
+        *oconf = o_upper_iron_118;
+        return mc > MC_1_17;
+    // nether
+    case BlackstoneOre:
+        if (mc < MC_1_17 && biomeID == crimson_forest) *oconf = o_blackstone_1161_crimson_forest;
+        else if (mc < MC_1_17 && biomeID == warped_forest) *oconf = o_blackstone_1161_warped_forest;
+        else if (mc < MC_1_17) *oconf = o_blackstone_1161;
+        else if (mc < MC_1_18) *oconf = o_blackstone_117;
+        else *oconf = o_blackstone_118;
+        return mc > MC_1_15;
+    case DeltasGoldOre:
+        if (mc < MC_1_17) *oconf = o_deltas_gold_1161;
+        else *oconf = o_deltas_gold_117;
+        return mc > MC_1_15;
+    case DeltasQuartzOre:
+        if (mc < MC_1_17) *oconf = o_deltas_quartz_1161;
+        else *oconf = o_deltas_quartz_117;
+        return mc > MC_1_15;
+    case LargeDebrisOre:
+        if (mc < MC_1_17 && biomeID == crimson_forest) *oconf = o_large_debris_1161_crimson_forest;
+        else if (mc < MC_1_17 && biomeID == warped_forest) *oconf = o_large_debris_1161_warped_forest;
+        else if (mc < MC_1_17) *oconf = o_large_debris_1161;
+        else if (mc < MC_1_18) *oconf = o_large_debris_117;
+        else *oconf = o_large_debris_118;
+        return mc > MC_1_15;
+    case MagmaOre:
+        if (mc < MC_1_16_1) *oconf = o_magma_113;
+        else if (mc < MC_1_17 && biomeID == soul_sand_valley) *oconf = o_magma_1161_soul_sand_valley;
+        else if (mc < MC_1_17 && biomeID == crimson_forest) *oconf = o_magma_1161_crimson_forest;
+        else if (mc < MC_1_17 && biomeID == warped_forest) *oconf = o_magma_1161_warped_forest;
+        else if (mc < MC_1_17 && biomeID == basalt_deltas) *oconf = o_magma_1161_basalt_deltas;
+        else if (mc < MC_1_17) *oconf = o_magma_1161;
+        else if (mc < MC_1_18) *oconf = o_magma_117;
+        else *oconf = o_magma_118;
+        return mc > MC_1_12;
+    case NetherGoldOre:
+        if (mc < MC_1_17 && biomeID == crimson_forest) *oconf = o_nether_gold_1161_crimson_forest;
+        else if (mc < MC_1_17 && biomeID == warped_forest) *oconf = o_nether_gold_1161_warped_forest;
+        else if (mc < MC_1_17) *oconf = o_nether_gold_1161;
+        else if (mc < MC_1_18) *oconf = o_nether_gold_117;
+        else *oconf = o_nether_gold_118;
+        return mc > MC_1_15;
+    case NetherGravelOre:
+        if (mc < MC_1_17 && biomeID == crimson_forest) *oconf = o_nether_gravel_1161_crimson_forest;
+        else if (mc < MC_1_17 && biomeID == warped_forest) *oconf = o_nether_gravel_1161_warped_forest;
+        else if (mc < MC_1_17) *oconf = o_nether_gravel_1161;
+        else if (mc < MC_1_18) *oconf = o_nether_gravel_117;
+        else *oconf = o_nether_gravel_118;
+        return mc > MC_1_15;
+    case NetherQuartzOre:
+        if (mc < MC_1_16_1) *oconf = o_nether_quartz_113;
+        else if (mc < MC_1_17 && biomeID == crimson_forest) *oconf = o_nether_quartz_1161_crimson_forest;
+        else if (mc < MC_1_17 && biomeID == warped_forest) *oconf = o_nether_quartz_1161_warped_forest;
+        else if (mc < MC_1_17) *oconf = o_nether_quartz_1161;
+        else if (mc < MC_1_18) *oconf = o_nether_quartz_117;
+        else *oconf = o_nether_quartz_118;
+        return mc > MC_1_12;
+    case SmallDebrisOre:
+        if (mc < MC_1_17 && biomeID == crimson_forest) *oconf = o_small_debris_1161_crimson_forest;
+        else if (mc < MC_1_17 && biomeID == warped_forest) *oconf = o_small_debris_1161_warped_forest;
+        else if (mc < MC_1_17) *oconf = o_small_debris_1161;
+        else if (mc < MC_1_18) *oconf = o_small_debris_117;
+        else *oconf = o_small_debris_118;
+        return mc > MC_1_15;
+    case SoulSandOre:
+        if (mc < MC_1_17) *oconf = o_soul_sand_1161;
+        else if (mc < MC_1_18) *oconf = o_soul_sand_117;
+        else *oconf = o_soul_sand_118;
+        return mc > MC_1_15;
+    default:
+        memset(oconf, 0, sizeof(OreConfig));
+        return 0;
+    }
+}
+
+int isViableOreBiome(int mc, int oreType, int biomeID)
+{
+    // check this in OverworldBiomes.java/NetherBiomes.java
+    switch (oreType)
+    {
+    // overworld
+    case AndesiteOre:
+    case BuriedDiamondOre:
+    case BuriedLapisOre:
+    case CoalOre:
+    case CopperOre:
+    case DeepslateOre:
+    case DiamondOre:
+    case DioriteOre:
+    case DirtOre:
+    case GoldOre:
+    case GraniteOre:
+    case GravelOre:
+    case IronOre:
+    case LapisOre:
+    case LargeDiamondOre:
+    case LowerAndesiteOre:
+    case LowerCoalOre:
+    case LowerDioriteOre:
+    case LowerGoldOre:
+    case LowerGraniteOre:
+    case LowerRedstoneOre:
+    case MediumDiamondOre:
+    case MiddleIronOre:
+    case RedstoneOre:
+    case SmallIronOre:
+    case TuffOre:
+    case UpperAndesiteOre:
+    case UpperCoalOre:
+    case UpperDioriteOre:
+    case UpperGraniteOre:
+    case UpperIronOre:
+        return isOverworld(mc, biomeID);
+    case EmeraldOre:
+    case InfestedOre:
+        switch (biomeID) {
+        case mountains: // == windswept_hills
+        case mountain_edge:
+        case wooded_mountains: // == windswept_forest
+        case gravelly_mountains: // == windswept_gravelly_hills
+        case modified_gravelly_mountains:
+        case meadow:
+        case grove:
+        case snowy_slopes:
+        case jagged_peaks:
+        case frozen_peaks:
+        case stony_peaks:
+        case cherry_grove:
+            return 1;
+        default: return 0;
+        }
+    case ExtraGoldOre:
+        switch (biomeID) {
+        case badlands:
+        case wooded_badlands_plateau: // == wooded_badlands
+        case badlands_plateau:
+        case eroded_badlands:
+        case modified_wooded_badlands_plateau:
+        case modified_badlands_plateau:
+            return 1;
+        default: return 0;
+        }
+    case LargeCopperOre:
+        return biomeID == dripstone_caves || (mc <= MC_1_19_2 && biomeID == deep_dark); // emulate MC-255133
+    case ClayOre:
+        return biomeID == lush_caves;
+    // nether
+    case LargeDebrisOre:
+    case MagmaOre:
+    case SmallDebrisOre:
+        return getDimension(biomeID) == DIM_NETHER;
+    case BlackstoneOre:
+    case NetherGoldOre:
+    case NetherQuartzOre:
+    case NetherGravelOre:
+        return (biomeID == nether_wastes || biomeID == soul_sand_valley ||
+                biomeID == crimson_forest || biomeID == warped_forest);
+    case DeltasGoldOre:
+    case DeltasQuartzOre:
+        return biomeID == basalt_deltas;
+    case SoulSandOre:
+        return biomeID == soul_sand_valley;
+    default:
+        fprintf(stderr, "isViableOreBiome: not implemented for ore type %d.\n", oreType);
+        exit(1);
+    }
+    return 0;
+}
+
+int getBiomeForOreGen(const Generator *g, int chunkX, int chunkZ, int y)
+{
+    if (g->mc <= MC_1_15) {
+        return getBiomeAt(g, 1, (chunkX << 4) + 8, 0, (chunkZ << 4) + 8);
+    }
+    if (g->mc <= MC_1_17) {
+        return getBiomeAt(g, 4, (chunkX << 2) + 2, 0, (chunkZ << 2) + 2);
+    }
+    return getBiomeAt(g, 4, (chunkX << 2) + 2, y >> 2, (chunkZ << 2) + 2);
+}
+
+Pos3List generateOres(const Generator *g, const SurfaceNoise *sn, OreConfig config, int chunkX, int chunkZ)
+{
+    uint64_t populationSeed = getPopulationSeed(g->mc, g->seed, chunkX << 4, chunkZ << 4);
+    CREATE_RANDOM_SOURCE(rnd, g->mc <= MC_1_17);
+    // set decorator seed
+    rnd.setSeed(rnd.state, populationSeed + config.index + 10000 * config.step);
+
+    int oreType = config.oreType;
+    int repeatCount;
+    // rareOrePlacement check
+    if (oreType == LargeDiamondOre || oreType == UpperAndesiteOre ||
+        oreType == UpperDioriteOre || oreType == UpperGraniteOre) {
+        repeatCount = rnd.nextFloat(rnd.state) < 1.0F / config.repeatCount;
+    } else {
+        repeatCount = config.repeatCount;
+    }
+
+    Pos3List pos3s;
+    // x^2/4 is an approx that works for sizes <= 64, but only works for ores that use this config
+    const int approxSize = repeatCount * ((config.size * config.size) >> 2);
+    createPos3List(&pos3s, MAX(8, approxSize));
+
+    for (int i = 0; i < repeatCount; i++) {
+        Pos3 basePos = generateBaseOrePosition(g->mc, config, chunkX, chunkZ, rnd);
+        int biome = getBiomeAt(g, 1, basePos.x, basePos.y, basePos.z);
+        if (isViableOreBiome(g->mc, oreType, biome)) {
+            generateOrePositions(g, sn, config, basePos, rnd, &pos3s);
+        }
+    }
+    return pos3s;
+}
+
+Pos3 generateBaseOrePosition(int mc, OreConfig config, int chunkX, int chunkZ, RandomSource rnd)
+{
+    if ((mc <= MC_1_17 && config.oreType == EmeraldOre) || (mc <= MC_NEWEST && config.oreType == LowerGoldOre)) {
+        return (Pos3) {chunkX << 4, 0, chunkZ << 4};
+    }
+    if (mc <= MC_1_14) {
+        int blockX = (chunkX << 4) + rnd.nextInt(rnd.state, 16);
+        int blockY = config.heightProvider(rnd, config.h1, config.h2, config.h3);
+        int blockZ = (chunkZ << 4) + rnd.nextInt(rnd.state, 16);
+        return (Pos3) {blockX, blockY, blockZ};
+    } else {
+        int blockX = (chunkX << 4) + rnd.nextInt(rnd.state, 16);
+        int blockZ = (chunkZ << 4) + rnd.nextInt(rnd.state, 16);
+        int blockY = config.heightProvider(rnd, config.h1, config.h2, config.h3);
+        return (Pos3) {blockX, blockY, blockZ};
+    }
+}
+
+void generateOrePositions(const Generator *g, const SurfaceNoise *sn, OreConfig config, Pos3 pos, RandomSource rnd, Pos3List* pos3s)
+{
+    int mc = g->mc;
+    if ((mc <= MC_1_17 && config.oreType == EmeraldOre) || (mc <= MC_NEWEST && config.oreType == LowerGoldOre)) {
+        int count;
+        if (config.oreType == EmeraldOre) {
+            if (mc <= MC_1_16) {
+                count = 3 + rnd.nextInt(rnd.state, 6);
+            } else {
+                // was 6, 24 in 1.17, changed to 3, 8 in 1.17.1
+                count = rnd.nextIntBetween(rnd.state, 3, 8);
+            }
+        } else {
+            count = rnd.nextIntBetween(rnd.state, 0, 1);
+        }
+        for (int i = 0; i < count; i++) {
+            if (mc <= MC_1_14) {
+                int x = pos.x + rnd.nextInt(rnd.state, 16);
+                int y = config.heightProvider(rnd, config.h1, config.h2, config.h3);
+                int z = pos.z + rnd.nextInt(rnd.state, 16);
+                appendPos3List(pos3s, (Pos3) {x, y, z});
+            } else {
+                int x = pos.x + rnd.nextInt(rnd.state, 16);
+                int z = pos.z + rnd.nextInt(rnd.state, 16);
+                int y = config.heightProvider(rnd, config.h1, config.h2, config.h3);
+                appendPos3List(pos3s, (Pos3) {x, y, z});
+            }
+        }
+        return;
+    }
+
+    // scatter
+    if (config.oreType == LargeDebrisOre || config.oreType == SmallDebrisOre) {
+        int count = rnd.nextInt(rnd.state, config.size + 1);
+        for (int i = 0; i < count; ++i) {
+            int size = MIN(i, 7);
+            float a, b;
+            a = rnd.nextFloat(rnd.state);
+            b = rnd.nextFloat(rnd.state);
+            int x = roundf((a - b) * (float)size);
+            a = rnd.nextFloat(rnd.state);
+            b = rnd.nextFloat(rnd.state);
+            int y = roundf((a - b) * (float)size);
+            a = rnd.nextFloat(rnd.state);
+            b = rnd.nextFloat(rnd.state);
+            int z = roundf((a - b) * (float)size);
+            Pos3 startPos = (Pos3) {pos.x + x, pos.y + y, pos.z + z};
+
+            // TODO: check if the block at startPos is contained in config.replaceBlocks
+            // TODO: and if the block at startPos is not air-exposed
+            if (1) {
+                appendPos3List(pos3s, startPos);
+            }
+        }
+
+        return;
+    }
+
+    // regular
+    float angle = rnd.nextFloat(rnd.state) * (float)PI;
+    float size = (float)config.size / 8.0F;
+    int amortizedSize = ceil(((float)config.size / 16.0F * 2.0F + 1.0F) / 2.0F);
+    double offsetXPos = (double)pos.x + sin(angle) * (double)size;
+    double offsetXNeg = (double)pos.x - sin(angle) * (double)size;
+    double offsetZPos = (double)pos.z + cos(angle) * (double)size;
+    double offsetZNeg = (double)pos.z - cos(angle) * (double)size;
+    double offsetYPos = pos.y + rnd.nextInt(rnd.state, 3) - 2;
+    double offsetYNeg = pos.y + rnd.nextInt(rnd.state, 3) - 2;
+    int startX = pos.x - ceil(size) - amortizedSize;
+    int startY = pos.y - 2 - amortizedSize;
+    int startZ = pos.z - ceil(size) - amortizedSize;
+    int oreSize = 2 * (ceil(size) + amortizedSize);
+    int radius = 2 * (2 + amortizedSize);
+
+    for (int x = startX; x <= startX + oreSize; ++x) {
+        for (int z = startZ; z <= startZ + oreSize; ++z) {
+            float y;
+            mapApproxHeight(&y, 0, g, sn, x >> 2, z >> 2, 1, 1);
+            if (startY <= (g->dim == DIM_OVERWORLD ? (int) floor(y) : 128)) {
+                generateVeinPart(mc, config, rnd, offsetXPos, offsetXNeg, offsetZPos, offsetZNeg, offsetYPos, offsetYNeg, startX, startY, startZ, oreSize, radius, pos3s);
+                return;
+            }
+        }
+    }
+}
+
+void generateVeinPart(int mc, OreConfig config, RandomSource rnd, double offsetXPos, double offsetXNeg, double offsetZPos, double offsetZNeg, double offsetYPos, double offsetYNeg, int startX, int startY, int startZ, int oreSize, int radius, Pos3List* pos3s)
+{
+    const int minBuildHeight = mc <= MC_1_17 ? 0 : -64;
+    const int maxBuildHeight = mc <= MC_1_17 ? 256 : 320;
+    int slots = BITNSLOTS(oreSize * radius * oreSize);
+    char bitSet[slots];
+    memset(bitSet, 0, slots);
+    int size = config.size;
+    double store[4 * size];
+
+    for (int i = 0; i < size; ++i) {
+        float percent = (float)i / (float)size;
+        double x = lerp(percent, offsetXPos, offsetXNeg);
+        double y = lerp(percent, offsetYPos, offsetYNeg);
+        double z = lerp(percent, offsetZPos, offsetZNeg);
+        double length = rnd.nextDouble(rnd.state) * (double)size / 16.0;
+        double offset = ((sin((float)PI * percent) + 1.0F) * length + 1.0) / 2.0;
+        store[i * 4] = x;
+        store[i * 4 + 1] = y;
+        store[i * 4 + 2] = z;
+        store[i * 4 + 3] = offset;
+    }
+
+    for (int i = 0; i < size - 1; ++i) {
+        if (store[i * 4 + 3] <= 0.0) continue;
+        for (int j = i + 1; j < size; ++j) {
+            if (store[j * 4 + 3] <= 0.0) continue;
+            double diffX = store[i * 4] - store[j * 4];
+            double diffY = store[i * 4 + 1] - store[j * 4 + 1];
+            double diffZ = store[i * 4 + 2] - store[j * 4 + 2];
+            double offset = store[i * 4 + 3] - store[j * 4 + 3];
+            if (offset * offset <= diffX * diffX + diffY * diffY + diffZ * diffZ) continue;
+            if (offset > 0.0) {
+                store[j * 4 + 3] = -1.0;
+            } else {
+                store[i * 4 + 3] = -1.0;
+            }
+        }
+    }
+
+    for (int i = 0; i < size; ++i) {
+        const double offset = store[i * 4 + 3];
+        if (offset < 0.0) continue;
+        const double x = store[i * 4];
+        const double y = store[i * 4 + 1];
+        const double z = store[i * 4 + 2];
+
+        const int floorMinX = floor(x - offset);
+        const int minX = MAX(floorMinX, startX);
+        const int floorMinY = floor(y - offset);
+        const int minY = MAX(floorMinY, startY);
+        const int floorMinZ = floor(z - offset);
+        const int minZ = MAX(floorMinZ, startZ);
+
+        const int floorMaxX = floor(x + offset);
+        const int maxX = MAX(floorMaxX, minX);
+        const int floorMaxY = floor(y + offset);
+        const int maxY = MAX(floorMaxY, minY);
+        const int floorMaxZ = floor(z + offset);
+        const int maxZ = MAX(floorMaxZ, minZ);
+
+        for (int X = minX; X <= maxX; ++X) {
+            double xSlide = ((double)X + 0.5 - x) / offset;
+            if (xSlide * xSlide >= 1.0) continue;
+            for (int Y = minY; Y <= maxY; ++Y) {
+                double ySlide = ((double)Y + 0.5 - y) / offset;
+                if (xSlide * xSlide + ySlide * ySlide >= 1.0) continue;
+                for (int Z = minZ; Z <= maxZ; ++Z) {
+                    double zSlide = ((double)Z + 0.5 - z) / offset;
+                    if (xSlide * xSlide + ySlide * ySlide + zSlide * zSlide >= 1.0) continue;
+                    if (Y < minBuildHeight || Y >= maxBuildHeight) continue;
+                    int area = X - startX + (Y - startY) * oreSize + (Z - startZ) * oreSize * radius;
+                    if (BITTEST(bitSet, area)) continue;
+                    BITSET(bitSet, area);
+                    Pos3 pos = {X, Y, Z};
+                    // TODO: check if the block at pos is contained in config.replaceBlocks
+                    if (1) {
+                        float chance = config.discardChanceOnAirExposure;
+                        int skipAirCheck;
+                        if (chance <= 0.0F) {
+                            skipAirCheck = 1;
+                        } else {
+                            skipAirCheck = chance >= 1.0F ? 0 : rnd.nextFloat(rnd.state) >= chance;
+                        }
+                        if (skipAirCheck) {
+                            appendPos3List(pos3s, pos);
+                        } else if (1) { // TODO: check if the block at pos is not air-exposed
+                            appendPos3List(pos3s, pos);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+//==============================================================================
+// Ore vein generation
+//==============================================================================
+
+int initOreVeinNoise(OreVeinParameters *params, uint64_t ws, int mc) {
+    static const uint64_t md5_ore[2] = {0x9b88124de600116d, 0x2ae68055aa4a7761}; // minecraft:ore
+    static const uint64_t md5_ore_veininess[2] = {0x6b86c7820a307171, 0xd87fb0fefd9c1624}; // minecraft:ore_veininess
+    static const uint64_t md5_ore_vein_a[2] = {0x4cd8d69b9a841649, 0xcdd63f17bfe8f5ed}; // minecraft:ore_vein_a
+    static const uint64_t md5_ore_vein_b[2] = {0x6b26220b31f7c6c9, 0xae077edebf6aaec1}; // minecraft:ore_vein_b
+    static const uint64_t md5_ore_gap[2] = {0x9c4cc6b2fb0be4bb, 0xbd5964705573bb5e}; // minecraft:ore_gap
+
+    if (mc <= MC_1_17) {
+        return 0;
+    }
+
+    Xoroshiro wsx;
+    xSetSeed(&wsx, ws);
+    const uint64_t lo = xNextLong(&wsx);
+    const uint64_t hi = xNextLong(&wsx);
+
+    Xoroshiro ore_x = {lo ^ md5_ore[0], hi ^ md5_ore[1]};
+    const uint64_t a = xNextLong(&ore_x);
+    const uint64_t b = xNextLong(&ore_x);
+    ore_x = (Xoroshiro) {a, b};
+    params->posRandom = ore_x;
+
+    int n = 0;
+    Xoroshiro ore_veininess_x = {lo ^ md5_ore_veininess[0], hi ^ md5_ore_veininess[1]};
+    static const double ore_veininess_amp = {1.0};
+    n += xDoublePerlinInit(&params->oreVeininess, &ore_veininess_x, params->oct + n, &ore_veininess_amp, -8, 1, -1);
+    Xoroshiro ore_vein_a_x = {lo ^ md5_ore_vein_a[0], hi ^ md5_ore_vein_a[1]};
+    static const double ore_vein_a_amp = {1.0};
+    n += xDoublePerlinInit(&params->oreVeinA, &ore_vein_a_x, params->oct + n, &ore_vein_a_amp, -7, 1, -1);
+    Xoroshiro ore_vein_b_x = {lo ^ md5_ore_vein_b[0], hi ^ md5_ore_vein_b[1]};
+    static const double ore_vein_b_amp = {1.0};
+    n += xDoublePerlinInit(&params->oreVeinB, &ore_vein_b_x, params->oct + n, &ore_vein_b_amp, -7, 1, -1);
+    Xoroshiro ore_gap_x = {lo ^ md5_ore_gap[0], hi ^ md5_ore_gap[1]};
+    static const double ore_gap_amp = {1.0};
+    n += xDoublePerlinInit(&params->oreGap, &ore_gap_x, params->oct + n, &ore_gap_amp, -5, 1, -1);
+
+    if ((size_t)n > sizeof(params->oct) / sizeof(*params->oct)) {
+        fprintf(stderr, "initOreVeinNoise(): OreVeinParameters is malformed, buffer too small\n");
+        exit(1);
+    }
+
+    return 1;
+}
+
+int32_t getOreVeinBlockAt(int x, int y, int z, OreVeinParameters* params)
+{
+    static const OreVeinConfig
+    ov_copper = {COPPER_ORE, RAW_COPPER_BLOCK, GRANITE, 0, 50},
+    ov_iron = {IRON_ORE, RAW_IRON_BLOCK, TUFF, -60, -8};
+    static const int min_y = MIN(0 /*ov_copper.minY*/, -60 /*ov_iron.minY*/);
+    static const int max_y = MAX(50 /*ov_copper.maxY*/, -8 /*ov_iron.maxY*/);
+
+    if (y < min_y || y > max_y) {
+        return -1;
+    }
+    const double oreVeinASample = fabs(sampleDoublePerlin(&params->oreVeinA, 4 * x, 4 * y, 4 * z));
+    const double oreVeinBSample = fabs(sampleDoublePerlin(&params->oreVeinB, 4 * x, 4 * y, 4 * z));
+    double veinRidgedSample = fmax(oreVeinASample, oreVeinBSample);
+    if (veinRidgedSample >= 0.08F) {
+        return -1;
+    }
+    double veinToggleSample = sampleDoublePerlin(&params->oreVeininess, x * 1.5, y * 1.5, z * 1.5);
+    OreVeinConfig ovconf = veinToggleSample > 0.0 ? ov_copper : ov_iron;
+    double abs = fabs(veinToggleSample);
+    int belowTop = ovconf.maxY - y;
+    int aboveBottom = y - ovconf.minY;
+    if (aboveBottom < 0 || belowTop < 0) {
+        return -1;
+    }
+    int offset = MIN(belowTop, aboveBottom);
+    if (abs + clampedMap(offset, 0.0, 20.0, -0.2, 0.0) < 0.4F) {
+        return -1;
+    }
+    Xoroshiro xr = xAtPos(&params->posRandom, x, y, z);
+    if (xNextFloat(&xr) > 0.7F) {
+        return -1;
+    }
+    double veinGapSample = sampleDoublePerlin(&params->oreGap, x, y, z);
+    if (xNextFloat(&xr) < clampedMap(abs, 0.4F, 0.6F, 0.1F, 0.3F) && veinGapSample > -0.3F) {
+        return xNextFloat(&xr) < 0.02F ? ovconf.rawOreBlock : ovconf.oreBlock;
+    }
+    return ovconf.fillerBlock;
+}
+
+//==============================================================================
+// Carver caves/canyons
+//==============================================================================
+
+int getCanyonCarverConfig(int canyonCarverType, int mc, CanyonCarverConfig* cconf) {
+    static const CanyonCarverConfig
+    c_canyon_carver_113 = {DIM_OVERWORLD, 0.02F, 1, 4, providerBiasedToBottom, 20, 67, 8, 3.0F, providerUniformFloatBetween, -0.125F, 0.125F, NULL, -1.0F, -1.0F, providerTrapezoidFloatBetween, 0.0F, 6.0F, 2.0F, 3, providerUniformFloatBetween, 0.75F, 1.0F, 1.0F, 0.0F},
+    c_canyon_carver_117 = {DIM_OVERWORLD, 0.02F, 1, 4, providerBiasedToBottom, 20, 67, 8, 3.0F, providerUniformFloatBetween, -0.125F, 0.125F, providerUniformFloatBetween, 0.75F, 1.0F, providerTrapezoidFloatBetween, 0.0F, 6.0F, 2.0F, 3, providerUniformFloatBetween, 0.75F, 1.0F, 1.0F, 0.0F},
+    c_canyon_carver_118 = {DIM_OVERWORLD, 0.01F, 2, 4, providerUniformIntBetween, 10, 67, -1, 3.0F, providerUniformFloatBetween, -0.125F, 0.125F, providerUniformFloatBetween, 0.75F, 1.0F, providerTrapezoidFloatBetween, 0.0F, 6.0F, 2.0F, 3, providerUniformFloatBetween, 0.75F, 1.0F, 1.0F, 0.0F},
+
+    c_underwater_canyon_carver_113 = {DIM_OVERWORLD, 0.02F, 0, 4, providerBiasedToBottom, 20, 67, 8, 3.0F, providerUniformFloatBetween, -0.125F, 0.125F, providerUniformFloatBetween, 0.75F, 1.0F, providerTrapezoidFloatBetween, 0.0F, 6.0F, 2.0F, 3, providerUniformFloatBetween, 0.75F, 1.0F, 1.0F, 0.0F}
+    ;
+
+    switch (canyonCarverType) {
+    case CANYON_CARVER:
+        if (mc <= MC_1_16_5) *cconf = c_canyon_carver_113;
+        else if (mc <= MC_1_17_1) *cconf = c_canyon_carver_117;
+        else *cconf = c_canyon_carver_118;
+        return mc > MC_1_12_2;
+    case UNDERWATER_CANYON_CARVER:
+        *cconf = c_underwater_canyon_carver_113;
+        return mc > MC_1_12 && mc <= MC_1_17_1;
+    default:
+        fprintf(stderr, "ERR initCanyonCarverConfig: unsupported canyon carver type %d\n", canyonCarverType);
+        memset(cconf, 0, sizeof(CanyonCarverConfig));
+        return 0;
+    }
+}
+
+int isViableCanyonBiome(int canyonCarverType, int biome) {
+    switch (canyonCarverType) {
+    case CANYON_CARVER:
+        return 1;
+    case UNDERWATER_CANYON_CARVER:
+        return isOceanic(biome);
+    default:
+        fprintf(stderr, "ERR isViableCanyonBiome: unsupported canyon carver type %d\n", canyonCarverType);
+        return 0;
+    }
+}
+
+static inline float getCaveThickness(uint64_t* rnd) {
+    float a = nextFloat(rnd);
+    float b = nextFloat(rnd);
+    float f = a * 2.0F + b;
+    if (nextInt(rnd, 10) == 0) {
+        float c = nextFloat(rnd);
+        float d = nextFloat(rnd);
+        f *= c * d * 3.0F + 1.0F;
+    }
+    return f;
+}
+
+static inline float getNetherCaveThickness(uint64_t* rnd) {
+    float a = nextFloat(rnd);
+    float b = nextFloat(rnd);
+    return (a * 2.0F + b) * 2.0F;
+}
+
+int getCaveCarverConfig(int caveCarverType, int mc, int biome, CaveCarverConfig* cconf) {
+    static const CaveCarverConfig
+    c_cave_113 = {DIM_OVERWORLD, 1.0F / 7, 0, 4, 15, getCaveThickness, 1.0, providerBiasedToBottom, 0, 127, 8, providerConstantFloat, 0.5F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, -0.7F, -1},
+    c_cave_deep_ocean_113 = {DIM_OVERWORLD, 1.0F / 15, 0, 4, 15, getCaveThickness, 1.0, providerBiasedToBottom, 0, 127, 8, providerConstantFloat, 0.5F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, -0.7F, -1},
+    c_cave_118 = {DIM_OVERWORLD, 0.15F, 0, 4, 15, getCaveThickness, 1.0, providerUniformIntBetween, -64 + 8, 180, -1, providerUniformFloatBetween, 0.1F, 0.9F, providerUniformFloatBetween, 0.7F, 1.4F, providerUniformFloatBetween, 0.8F, 1.3F, providerUniformFloatBetween, -1.0F, -0.4F},
+
+    c_cave_extra_underground_118 = {DIM_OVERWORLD, 0.07F, 1, 4, 15, getCaveThickness, 1.0, providerUniformIntBetween, -64 + 8, 47, -1, providerUniformFloatBetween, 0.1F, 0.9F, providerUniformFloatBetween, 0.7F, 1.4F, providerUniformFloatBetween, 0.8F, 1.3F, providerUniformFloatBetween, -1.0F, -0.4F},
+
+    c_ocean_cave_1164 = {DIM_OVERWORLD, 1.0F / 15, 1, 4, 15, getCaveThickness, 1.0, providerBiasedToBottom, 0, 127, 8, providerConstantFloat, 0.5F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, -0.7F, -1},
+
+    c_underwater_cave_113 = {DIM_OVERWORLD, 1.0F / 15, 1, 4, 15, getCaveThickness, 1.0, providerBiasedToBottom, 0, 127, 8, providerConstantFloat, 0.5F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, -0.7F, -1},
+
+    c_nether_cave_113 = {DIM_NETHER, 0.2F, 0, 4, 10, getNetherCaveThickness, 5.0, providerUniformIntBetween, 0, 127 - 1, -1, providerConstantFloat, 0.5F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, 1.0F, -1, providerConstantFloat, -0.7F, -1}
+    ;
+
+    switch (caveCarverType) {
+    case CAVE_CARVER:
+        if (mc <= MC_1_17_1) {
+            if (isDeepOcean(biome) || biome == frozen_ocean) *cconf = c_cave_deep_ocean_113;
+            else *cconf = c_cave_113;
+        }
+        else *cconf = c_cave_118;
+        return mc > MC_1_12_2;
+    case CAVE_EXTRA_UNDERGROUND_CARVER:
+        *cconf = c_cave_extra_underground_118;
+        return mc > MC_1_17_1;
+    case OCEAN_CAVE_CARVER:
+        *cconf = c_ocean_cave_1164;
+        return mc > MC_1_16_1 && mc <= MC_1_17_1;
+    case UNDERWATER_CAVE_CARVER:
+        *cconf = c_underwater_cave_113;
+        return mc > MC_1_12_2 && mc <= MC_1_17_1;
+    case NETHER_CAVE_CARVER:
+        *cconf = c_nether_cave_113;
+        return mc > MC_1_12_2;
+    default:
+        fprintf(stderr, "ERR initCaveCarverConfig: unsupported cave carver type %d\n", caveCarverType);
+        memset(cconf, 0, sizeof(CaveCarverConfig));
+        return 0;
+    }
+}
+
+int isViableCaveBiome(int caveCarverType, int biome) {
+    switch (caveCarverType) {
+    case CAVE_CARVER:
+    case CAVE_EXTRA_UNDERGROUND_CARVER:
+    case NETHER_CAVE_CARVER:
+        return 1;
+    case OCEAN_CAVE_CARVER:
+        return isOceanic(biome);
+    case UNDERWATER_CAVE_CARVER:
+        return isDeepOcean(biome) || biome == frozen_ocean;
+    default:
+        fprintf(stderr, "ERR isViableCaveBiome: unsupported cave carver type %d\n", caveCarverType);
+        return 0;
+    }
+}
+
+static inline int getCarveMaskIndex(int x, int y, int z, int worldMinY) {
+    return (x & 15) | (z & 15) << 4 | (y - worldMinY) << 8;
+}
+
+static inline void setCarveMask(char carvingMask[], int x, int y, int z, int worldMinY) {
+    int maskIndex = getCarveMaskIndex(x, y, z, worldMinY);
+    BITSET(carvingMask, maskIndex);
+}
+
+static inline int getCarveMask(const char carvingMask[], int x, int y, int z, int worldMinY) {
+    int maskIndex = getCarveMaskIndex(x, y, z, worldMinY);
+    return BITTEST(carvingMask, maskIndex);
+}
+
+static int canReach(int chunkX, int chunkZ, double x, double z, int branchIndex, int branchCount, float width) {
+    double d = (chunkX << 4) + 8;
+    double e = (chunkZ << 4) + 8;
+    double f = x - d;
+    double g = z - e;
+    double h = branchCount - branchIndex;
+    double i = width + 2.0F + 16.0F;
+    return f * f + g * g - h * h <= i * i;
+}
+
+int checkCanyonStart(uint64_t seed, int chunkX, int chunkZ, CanyonCarverConfig ccc, uint64_t* rnd)
+{
+    *rnd = chunkGenerateRnd(seed + ccc.carverIndex, chunkX, chunkZ);
+    return nextFloat(rnd) <= ccc.probability;
+}
+
+int checkCaveStart(uint64_t seed, int chunkX, int chunkZ, CaveCarverConfig ccc, uint64_t* rnd)
+{
+    *rnd = chunkGenerateRnd(seed + ccc.carverIndex, chunkX, chunkZ);
+    return nextFloat(rnd) <= ccc.probability;
+}
+
+static inline int shouldSkipCanyonCarve(double relativeX, double relativeY, double relativeZ, int y, int worldMinY, /* float* */ void* widthFactors) {
+    int i = y - worldMinY;
+    return (relativeX * relativeX + relativeZ * relativeZ) * ((float*) widthFactors)[i - 1] + relativeY * relativeY / 6.0 >= 1.0;
+}
+
+static inline int shouldSkipCaveCarve(double relativeX, double relativeY, double relativeZ, int y, int worldMinY, /* double* */ void* minRelativeY) {
+    return relativeY <= *(double*) minRelativeY ? 1 : relativeX * relativeX + relativeY * relativeY + relativeZ * relativeZ >= 1.0;
+}
+
+static void carveEllipsoid(int chunkX, int chunkZ, double x, double y, double z, double horizontalRadius, double verticalRadius, int worldMinY, int worldHeight, char carvingMask[], int (*shouldSkip)(double, double, double, int, int, void*), void* arg, Pos3List* poses);
+
+static void carveCanyonInner(CanyonCarverConfig ccc, int mc, uint64_t *rnd, int sourceChunkX, int sourceChunkZ, int offsetChunkX, int offsetChunkZ, char carvingMask[], Pos3List* poses);
+
+void carveCanyon(uint64_t seed, int mc, int chunkX, int chunkZ, CanyonCarverConfig ccc, int canyonCarverType, int biomes[17][17], Pos3List* poses) {
+    const int worldHeight = mc > MC_1_17_1 ? 384 : 256;
+    int slots = BITNSLOTS(256 * worldHeight);
+    char carvingMask[slots];
+    memset(carvingMask, 0, slots);
+
+    for (int relChunkX = -8; relChunkX <= 8; ++relChunkX) {
+        for (int relChunkZ = -8; relChunkZ <= 8; ++relChunkZ) {
+            int offsetChunkX = chunkX + relChunkX;
+            int offsetChunkZ = chunkZ + relChunkZ;
+            int biome = biomes[relChunkZ + 8][relChunkX + 8];
+            if (!isViableCanyonBiome(canyonCarverType, biome)) {
+                continue;
+            }
+            uint64_t rnd;
+            if (!checkCanyonStart(seed, offsetChunkX, offsetChunkZ, ccc, &rnd)) {
+                continue;
+            }
+
+            carveCanyonInner(ccc, mc, &rnd, chunkX, chunkZ, offsetChunkX, offsetChunkZ, carvingMask, poses);
+        }
+    }
+}
+
+static void initWidthFactors(uint64_t* rnd, int worldHeight, float widthFactors[], CanyonCarverConfig ccc) {
+    float f = 1.0F;
+
+    // j == 0
+    {
+        float a = nextFloat(rnd);
+        float b = nextFloat(rnd);
+        f = 1.0F + a * b;
+        widthFactors[0] = f * f;
+    }
+    for (int j = 1; j < worldHeight; j++) {
+        if (nextInt(rnd, ccc.widthSmoothness) == 0) {
+            float a = nextFloat(rnd);
+            float b = nextFloat(rnd);
+            f = 1.0F + a * b;
+        }
+
+        widthFactors[j] = f * f;
+    }
+}
+
+static double updateVerticalRadius(CanyonCarverConfig ccc, uint64_t* rnd, double verticalRadius, float branchCount, float currentBranch) {
+    float f = 1.0F - fabs(0.5F - currentBranch / branchCount) * 2.0F;
+    float g = ccc.verticalRadiusDefaultFactor + ccc.verticalRadiusCenterFactor * f;
+    return g * verticalRadius * nextFloatBetween(rnd, 0.75F, 1.0F);
+}
+
+static void carveCanyonInner(CanyonCarverConfig ccc, int mc, uint64_t *rnd, int sourceChunkX, int sourceChunkZ, int offsetChunkX, int offsetChunkZ, char carvingMask[], Pos3List* poses) {
+    int range = (ccc.range * 2 - 1) * 16;
+    double x = (offsetChunkX << 4) + nextInt(rnd, 16);
+    double y = ccc.y(rnd, ccc.minY, ccc.maxY, ccc.innerY);
+    double z = (offsetChunkZ << 4) + nextInt(rnd, 16);
+    float yaw = nextFloat(rnd) * (float) (PI * 2);
+    float pitch = ccc.verticalRotation(rnd, ccc.minVerRot, ccc.maxVerRot);
+    double horizontalVerticalRatio = ccc.yScale;
+    float thickness = ccc.thickness(rnd, ccc.minThickness, ccc.maxThickness, ccc.plateauThickness);
+    int branchCount;
+    // one could reuse `distanceFactor` for this and interpret the float bits as int bits, decided against it
+    if (mc <= MC_1_16_5) {
+        branchCount = range - nextInt(rnd, range / 4);
+    } else {
+        branchCount = (int)(range * ccc.distanceFactor(rnd, ccc.minDistance, ccc.maxDistance));
+    }
+    uint64_t seed = nextLong(rnd);
+    setSeed(rnd, seed);
+    int worldMinY;
+    int worldHeight;
+    if (mc > MC_1_17_1) {
+        worldMinY = -64;
+        worldHeight = 384;
+    } else {
+        worldMinY = 0;
+        worldHeight = 256;
+    }
+    float widthFactors[worldHeight];
+    initWidthFactors(rnd, worldHeight, widthFactors, ccc);
+    float f = 0.0F;
+    float g = 0.0F;
+
+    for (int branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+        double horizontalRadius = 1.5 + sin(branchIndex * (float) PI / branchCount) * thickness;
+        double verticalRadius = horizontalRadius * horizontalVerticalRatio;
+        horizontalRadius *= ccc.horizontalRadiusFactor(rnd, ccc.minHorRadius, ccc.maxHorRadius);
+        verticalRadius = updateVerticalRadius(ccc, rnd, verticalRadius, branchCount, branchIndex);
+        float h = cos(pitch);
+        float j = sin(pitch);
+        x += cos(yaw) * h;
+        y += j;
+        z += sin(yaw) * h;
+        pitch *= 0.7F;
+        pitch += g * 0.05F;
+        yaw += f * 0.05F;
+        g *= 0.8F;
+        f *= 0.5F;
+        float f1 = nextFloat(rnd); float f2 = nextFloat(rnd); float f3 = nextFloat(rnd);
+        g += (f1 - f2) * f3 * 2.0F;
+        float f4 = nextFloat(rnd); float f5 = nextFloat(rnd); float f6 = nextFloat(rnd);
+        f += (f4 - f5) * f6 * 4.0F;
+        if (nextInt(rnd, 4) == 0) {
+            continue;
+        }
+        if (!canReach(sourceChunkX, sourceChunkZ, x, z, branchIndex, branchCount, thickness)) {
+            return;
+        }
+
+        carveEllipsoid(sourceChunkX, sourceChunkZ, x, y, z, horizontalRadius, verticalRadius, worldMinY, worldHeight, carvingMask, shouldSkipCanyonCarve, widthFactors, poses);
+    }
+}
+
+static void carveCaveInner(CaveCarverConfig ccc, uint64_t* rnd, int sourceChunkX, int sourceChunkZ, int chunkX, int chunkZ, int mc, char carvingMask[], Pos3List* poses);
+
+void carveCave(uint64_t seed, int mc, int chunkX, int chunkZ, CaveCarverConfig ccc, int caveCarverType, int biomes[17][17], Pos3List* poses) {
+    int worldHeight;
+    if (mc > MC_1_17_1) {
+        worldHeight = ccc.dim == DIM_OVERWORLD ? 384 : 128;
+    } else {
+        worldHeight = ccc.dim == DIM_OVERWORLD ? 256 : 128;
+    }
+    int slots = BITNSLOTS(256 * worldHeight);
+    char carvingMask[slots];
+    memset(carvingMask, 0, slots);
+
+    for (int relChunkX = -8; relChunkX <= 8; ++relChunkX) {
+        for (int relChunkZ = -8; relChunkZ <= 8; ++relChunkZ) {
+            int offsetChunkX = chunkX + relChunkX;
+            int offsetChunkZ = chunkZ + relChunkZ;
+            int biome = biomes[relChunkZ + 8][relChunkX + 8];
+            if (!isViableCaveBiome(caveCarverType, biome)) {
+                continue;
+            }
+            uint64_t rnd;
+            if (!checkCaveStart(seed, offsetChunkX, offsetChunkZ, ccc, &rnd)) {
+                continue;
+            }
+            carveCaveInner(ccc, &rnd, chunkX, chunkZ, offsetChunkX, offsetChunkZ, mc, carvingMask, poses);
+        }
+    }
+}
+
+static void createRoom(int sourceChunkX, int sourceChunkZ, double x, double y, double z, float radius, double horizontalVerticalRatio, int worldMinY, int worldHeight, char carvingMask[], double floorLevel, Pos3List* poses);
+
+static void createTunnel(CaveCarverConfig ccc, int sourceChunkX, int sourceChunkZ, uint64_t seed, double x, double y, double z, double horizontalRadiusMultiplier, double verticalRadiusMultiplier, float thickness, float yaw, float pitch, int branchIndex, int branchCount, double horizontalVerticalRatio, int worldMinY, int worldHeight, char carvingMask[], double floorLevel, Pos3List* poses);
+
+static void carveCaveInner(CaveCarverConfig ccc, uint64_t* rnd, int sourceChunkX, int sourceChunkZ, int chunkX, int chunkZ, int mc, char carvingMask[], Pos3List* poses) {
+    int worldMinY;
+    int worldHeight;
+    if (mc > MC_1_17_1) {
+        worldMinY = ccc.dim == DIM_OVERWORLD ? -64 : 0;
+        worldHeight = ccc.dim == DIM_OVERWORLD ? 384 : 128;
+    } else {
+        worldMinY = 0;
+        worldHeight = ccc.dim == DIM_OVERWORLD ? 256 : 128;
+    }
+
+    int range = (ccc.range * 2 - 1) << 4;
+
+    int r1 = nextInt(rnd, ccc.caveBound);
+    int r2 = nextInt(rnd, r1 + 1);
+    int caveCount = nextInt(rnd, r2 + 1);
+
+    for (int k = 0; k < caveCount; k++) {
+        double x = (chunkX << 4) + nextInt(rnd, 16);
+        double y = ccc.y(rnd, ccc.minY, ccc.maxY, ccc.innerY);
+        double z = (chunkZ << 4) + nextInt(rnd, 16);
+        double horizontalRadius = ccc.horizontalRadiusMultiplier(rnd, ccc.minHorRadius, ccc.maxHorRadius);
+        double verticalRadius = ccc.verticalRadiusMultiplier(rnd, ccc.minVerRadius, ccc.maxVerRadius);
+        double floorLevel = ccc.floorLevel(rnd, ccc.minFloorLevel, ccc.maxFloorLevel);
+        int m = 1;
+        if (nextInt(rnd, 4) == 0) {
+            double yScale = ccc.yScale(rnd, ccc.minYScale, ccc.maxYScale);
+            float radius = 1.0F + nextFloat(rnd) * 6.0F;
+            if (mc <= MC_1_17_1) {
+                nextLong(rnd);
+            }
+            createRoom(sourceChunkX, sourceChunkZ, x, y, z, radius, yScale, worldMinY, worldHeight, carvingMask, floorLevel, poses);
+            m += nextInt(rnd, 4);
+        }
+
+        for (int p = 0; p < m; p++) {
+            float q = nextFloat(rnd) * (float) (PI * 2);
+            float o = (nextFloat(rnd) - 0.5F) / 4.0F;
+            float r = ccc.thickness(rnd);
+            int s = range - nextInt(rnd, range / 4);
+            createTunnel(ccc, sourceChunkX, sourceChunkZ, nextLong(rnd), x, y, z, horizontalRadius, verticalRadius, r, q, o, 0, s, ccc.tunnelYScale, worldMinY, worldHeight, carvingMask, floorLevel, poses);
+        }
+    }
+}
+
+static void createRoom(int sourceChunkX, int sourceChunkZ, double x, double y, double z, float radius, double horizontalVerticalRatio, int worldMinY, int worldHeight, char carvingMask[], double floorLevel, Pos3List* poses) {
+    double horizontalRadius = 1.5 + sin(PI / 2) * radius;
+    double verticalRadius = horizontalRadius * horizontalVerticalRatio;
+    carveEllipsoid(sourceChunkX, sourceChunkZ, x + 1.0, y, z, horizontalRadius, verticalRadius, worldMinY, worldHeight, carvingMask, shouldSkipCaveCarve, &floorLevel, poses);
+}
+
+static void createTunnel(CaveCarverConfig ccc, int sourceChunkX, int sourceChunkZ, uint64_t seed, double x, double y, double z, double horizontalRadiusMultiplier, double verticalRadiusMultiplier, float thickness, float yaw, float pitch, int branchIndex, int branchCount, double horizontalVerticalRatio, int worldMinY, int worldHeight, char carvingMask[], double floorLevel, Pos3List* poses) {
+    uint64_t rnd;
+    setSeed(&rnd, seed);
+    int i = nextInt(&rnd, branchCount / 2) + branchCount / 4;
+    int bl = nextInt(&rnd, 6) == 0;
+    float f = 0.0F;
+    float g = 0.0F;
+
+    for (int j = branchIndex; j < branchCount; j++) {
+        double d = 1.5 + sin((float) PI * j / branchCount) * thickness;
+        double e = d * horizontalVerticalRatio;
+        float h = cos(pitch);
+        x += cos(yaw) * h;
+        y += sin(pitch);
+        z += sin(yaw) * h;
+        pitch *= bl ? 0.92F : 0.7F;
+        pitch += g * 0.1F;
+        yaw += f * 0.1F;
+        g *= 0.9F;
+        f *= 0.75F;
+        float f1 = nextFloat(&rnd); float f2 = nextFloat(&rnd); float f3 = nextFloat(&rnd);
+        g += (f1 - f2) * f3 * 2.0F;
+        float f4 = nextFloat(&rnd); float f5 = nextFloat(&rnd); float f6 = nextFloat(&rnd);
+        f += (f4 - f5) * f6 * 4.0F;
+        if (j == i && thickness > 1.0F) {
+            uint64_t s1 = nextLong(&rnd); float t1 = nextFloat(&rnd);
+            createTunnel(ccc, sourceChunkX, sourceChunkZ, s1, x, y, z, horizontalRadiusMultiplier, verticalRadiusMultiplier, t1 * 0.5F + 0.5F, yaw - (float) (PI / 2), pitch / 3.0F, j, branchCount, 1.0, worldMinY, worldHeight, carvingMask, floorLevel, poses);
+            uint64_t s2 = nextLong(&rnd); float t2 = nextFloat(&rnd);
+            createTunnel(ccc, sourceChunkX, sourceChunkZ, s2, x, y, z, horizontalRadiusMultiplier, verticalRadiusMultiplier, t2 * 0.5F + 0.5F, yaw + (float) (PI / 2), pitch / 3.0F, j, branchCount, 1.0, worldMinY, worldHeight, carvingMask, floorLevel, poses);
+            return;
+        }
+
+        if (nextInt(&rnd, 4) == 0) continue;
+
+        if (!canReach(sourceChunkX, sourceChunkZ, x, z, j, branchCount, thickness)) {
+            return;
+        }
+
+        carveEllipsoid(sourceChunkX, sourceChunkZ, x, y, z, d * horizontalRadiusMultiplier, e * verticalRadiusMultiplier, worldMinY, worldHeight, carvingMask, shouldSkipCaveCarve, &floorLevel, poses);
+    }
+}
+
+static void carveEllipsoid(int chunkX, int chunkZ, double x, double y, double z, double horizontalRadius, double verticalRadius, int worldMinY, int worldHeight, char carvingMask[], int (*shouldSkip)(double, double, double, int, int, void*), void* arg, Pos3List* poses) {
+    const int startChunkX = chunkX << 4;
+    const int startChunkZ = chunkZ << 4;
+    const double midChunkX = startChunkX + 8;
+    const double midChunkZ = startChunkZ + 8;
+    double f = 16.0 + horizontalRadius * 2.0;
+    if (fabs(x - midChunkX) > f || fabs(z - midChunkZ) > f) {
+        return;
+    }
+    const double floorMinX = floor(x - horizontalRadius) - startChunkX - 1;
+    const int minX = MAX(floorMinX, 0);
+    const double floorMaxX = floor(x + horizontalRadius) - startChunkX;
+    const int maxX = MIN(floorMaxX, 15);
+    const double floorMinY = floor(y - verticalRadius) - 1;
+    const int minY = MAX(floorMinY, worldMinY + 1);
+    int n = 0;
+    const double floorMaxY = floor(y + verticalRadius) + 1;
+    const int maxY = MIN(floorMaxY, worldMinY + worldHeight - 1 - n);
+    const double floorMinZ = floor(z - horizontalRadius) - startChunkZ - 1;
+    const int minZ = MAX(floorMinZ, 0);
+    const double floorMaxZ = floor(z + horizontalRadius) - startChunkZ;
+    const int maxZ = MIN(floorMaxZ, 15);
+
+    for (int relX = minX; relX <= maxX; relX++) {
+        int absX = startChunkX + relX;
+        double relativeX = (absX + 0.5 - x) / horizontalRadius;
+
+        for (int relZ = minZ; relZ <= maxZ; relZ++) {
+            int absZ = startChunkZ + relZ;
+            double relativeZ = (absZ + 0.5 - z) / horizontalRadius;
+            if (relativeX * relativeX + relativeZ * relativeZ >= 1.0) continue;
+
+            for (int absY = maxY; absY > minY; absY--) {
+                double relativeY = (absY - 0.5 - y) / verticalRadius;
+                if (shouldSkip(relativeX, relativeY, relativeZ, absY, worldMinY, arg) || getCarveMask(carvingMask, relX, absY, relZ, worldMinY)) continue;
+                setCarveMask(carvingMask, relX, absY, relZ, worldMinY);
+                appendPos3List(poses, (Pos3) {absX, absY, absZ});
+            }
+        }
+    }
+}
 
 //==============================================================================
 // Validating Structure Positions
@@ -1195,7 +2733,8 @@ int isViableFeatureBiome(int mc, int structureType, int biomeID)
 
     case Igloo:
         if (mc <= MC_1_8) return 0;
-        return biomeID == snowy_tundra || biomeID == snowy_taiga || biomeID == snowy_slopes;
+        return (biomeID == snowy_tundra || biomeID == snowy_taiga
+             || biomeID == snowy_plains || biomeID == snowy_slopes);
 
     case Ocean_Ruin:
         if (mc <= MC_1_12) return 0;
@@ -1282,7 +2821,7 @@ int isViableFeatureBiome(int mc, int structureType, int biomeID)
 
     case Mansion:
         if (mc <= MC_1_10) return 0;
-        return biomeID == dark_forest || biomeID == dark_forest_hills;
+        return biomeID == dark_forest || biomeID == dark_forest_hills || (mc >= MC_1_21_5 && biomeID == pale_garden);
 
     case Fortress:
         return (biomeID == nether_wastes || biomeID == soul_sand_valley ||
@@ -1542,8 +3081,10 @@ L_feature:
         if (g->mc <= MC_1_15)
         {
             g->entry = &g->ls.layers[L_VORONOI_1];
-            sampleX = chunkX * 16 + 9;
-            sampleZ = chunkZ * 16 + 9;
+            // check is done at (8, 8) in 1.8.9 and below, after that at (9, 9)
+            int post189 = g->mc > MC_1_8_9;
+            sampleX = chunkX * 16 + 8 + post189;
+            sampleZ = chunkZ * 16 + 8 + post189;
         }
         else
         {
@@ -2221,7 +3762,59 @@ int getVariant(StructureVariant *r, int structType, int mc, uint64_t seed,
             r->start = 1 + nextInt(&rng, 10);
         }
         r->rotation = nextInt(&rng, 4);
-        r->mirror = nextFloat(&rng) < 0.5f;
+        r->mirror = nextFloat(&rng) >= 0.5f;
+
+        if (r->giant) {
+            switch (r->start) {
+            case 1: sx = 11, sy = 17, sz = 16; break;
+            case 2: sx = 11, sy = 16, sz = 16; break;
+            case 3: sx = 16, sy = 16, sz = 16; break;
+            default: UNREACHABLE();
+            }
+        } else {
+            switch (r->start) {
+            case 1: sx = 6, sy = 10, sz = 6; break;
+            case 2: sx = 9, sy = 12, sz = 9; break;
+            case 3: sx = 8, sy = 9, sz = 9; break;
+            case 4: sx = 8, sy = 9, sz = 9; break;
+            case 5: sx = 10, sy = 7, sz = 7; break;
+            case 6: sx = 5, sy = 7, sz = 7; break;
+            case 7: sx = 9, sy = 7, sz = 9; break;
+            case 8: sx = 14, sy = 9, sz = 9; break;
+            case 9: sx = 10, sy = 8, sz = 9; break;
+            case 10: sx = 12, sy = 8, sz = 10; break;
+            default: UNREACHABLE();
+            }
+        }
+
+        Pos rpPivotPos = {sx / 2, sz / 2};
+        Pos rpStartPos;
+        switch (r->rotation) { // 0:0, 1:cw90, 2:cw180, 3:cw270=ccw90
+        case 0: rpStartPos = (Pos) {0, 0}; break;
+        case 1: rpStartPos = (Pos) {rpPivotPos.x + rpPivotPos.z, rpPivotPos.z - rpPivotPos.x}; break;
+        case 2: rpStartPos = (Pos) {rpPivotPos.x + rpPivotPos.x, rpPivotPos.z + rpPivotPos.z}; break;
+        case 3: rpStartPos = (Pos) {rpPivotPos.x - rpPivotPos.z, rpPivotPos.x + rpPivotPos.z}; break;
+        default: UNREACHABLE();
+        }
+
+        Pos3 rpSize = {sx, sy, sz};
+        int rpMirX = rpSize.x;
+        if (r->mirror) {
+            rpMirX = -rpMirX;
+        }
+        Pos3 rpEndPos;
+        switch (r->rotation) { // 0:0, 1:cw90, 2:cw180, 3:cw270=ccw90
+        case 0: rpEndPos = (Pos3) {rpMirX, rpSize.y, rpSize.z}; break;
+        case 1: rpEndPos = (Pos3) {rpStartPos.x - rpSize.z, rpSize.y, rpStartPos.z + rpMirX}; break;
+        case 2: rpEndPos = (Pos3) {rpStartPos.x - rpMirX, rpSize.y, rpStartPos.z - rpSize.z}; break;
+        case 3: rpEndPos = (Pos3) {rpStartPos.x + rpSize.z, rpSize.y, rpStartPos.z - rpMirX}; break;
+        default: UNREACHABLE();
+        }
+
+        r->x = rpStartPos.x;
+        r->z = rpStartPos.z;
+        r->sx = rpEndPos.x - rpStartPos.x;
+        r->sz = rpEndPos.z - rpStartPos.z;
         return 1;
 
     case Monument:
@@ -2247,7 +3840,30 @@ int getVariant(StructureVariant *r, int structType, int mc, uint64_t seed,
         case 3: r->rotation = 1; r->mirror = 1; r->sx = sz; r->sz = sx; break;
         }
         return 1;
-
+    case Shipwreck:
+        r->biome = biomeID; // to determine isBeached
+        r->rotation = nextInt(&rng, 4); // NONE, CLOCKWISE_90, CLOCKWISE_180, COUNTERCLOCKWISE_90
+        int isBeached = !isOceanic(r->biome);
+        if (isBeached) {
+            r->start = nextInt(&rng, 11);
+        } else {
+            r->start = nextInt(&rng, 20);
+        }
+        Pos swPivotPos = {4, 15};
+        Pos swStartPos;
+        switch (r->rotation) { // 0:0, 1:cw90, 2:cw180, 3:cw270=ccw90
+        case 0: swStartPos = (Pos) {0, 0}; break;
+        case 1: swStartPos = (Pos) {swPivotPos.x + swPivotPos.z, swPivotPos.z - swPivotPos.x}; break;
+        case 2: swStartPos = (Pos) {swPivotPos.x + swPivotPos.x, swPivotPos.z + swPivotPos.z}; break;
+        case 3: swStartPos = (Pos) {swPivotPos.x - swPivotPos.z, swPivotPos.x + swPivotPos.z}; break;
+        default: UNREACHABLE();
+        }
+        r->x = swStartPos.x;
+        r->z = swStartPos.z;
+        return 1;
+    case Outpost:
+        r->rotation = nextInt(&rng, 4); // NONE, CLOCKWISE_90, CLOCKWISE_180, COUNTERCLOCKWISE_90
+        return 1;
     case Desert_Pyramid:
         sx = 21; sy = 15; sz = 21;
         goto L_rotate_temple;
@@ -2330,6 +3946,661 @@ int getVariant(StructureVariant *r, int structType, int mc, uint64_t seed,
     default:
         return 0;
     }
+}
+
+int getLootTableCountForStructure(int structure, int mc) {
+    switch (structure) {
+    case Desert_Pyramid: return 1;
+    case Jungle_Temple: return 2;
+    case Swamp_Hut: return 0;
+    case Igloo: return 1;
+    case Village: return mc <= MC_1_13 ? 1 : 16;
+    case Ocean_Ruin: return 2;
+    case Shipwreck: return 3;
+    case Monument: return 0;
+    case Mansion: return 1;
+    case Outpost: return 1;
+    case Ruined_Portal:
+    case Ruined_Portal_N: return 1;
+    case Ancient_City: return 2;
+    case Treasure: return 1;
+    case Mineshaft: return 1;
+    case Desert_Well: return 0;
+    case Geode: return 0;
+    case Fortress: return 1;
+    case Bastion: return 4;
+    case End_City: return 1;
+    case End_Gateway: return 0;
+    case End_Island: return 0;
+    case Trail_Ruins: return 0;
+    case Trial_Chambers: return 13;
+    case Stronghold: return 3;
+    default:
+        fprintf(stderr, "getLootTableCountForStructure: not implemented for structure %s.\n", struct2str(structure));
+        exit(1);
+    }
+}
+
+int getStructurePieces(Piece *list, int n, int stype, StructureSaltConfig ssconf, StructureVariant *sv, int mc, uint64_t seed, int posX, int posZ) {
+    int minBlockX = posX & ~15;
+    int minBlockZ = posZ & ~15;
+    const int legacy = mc <= MC_1_17;
+    switch (stype) {
+    case Desert_Pyramid: {
+        Piece* p = list;
+        p->name = "TeDP";
+        p->pos = (Pos3) {minBlockX, 64, minBlockZ};
+        p->chestCount = 4;
+        p->chestPoses[0] = (Pos) {minBlockX + 8, minBlockZ + 10};
+        p->chestPoses[1] = (Pos) {minBlockX + 10, minBlockZ + 8};
+        p->chestPoses[2] = (Pos) {minBlockX + 10, minBlockZ + 12};
+        p->chestPoses[3] = (Pos) {minBlockX + 12, minBlockZ + 10};
+        // chests generate in the same chunk as structure
+        uint64_t populationSeed = getPopulationSeed(mc, seed, minBlockX, minBlockZ);
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+        if (mc > MC_1_17_1) {
+            rnd.nextInt(rnd.state, 3); // updateHeightPositionToLowestGroundHeight call in >=1.18
+        }
+        for (int i = 0; i < p->chestCount; ++i) {
+            p->lootTables[i] = "desert_pyramid";
+            p->lootSeeds[i] = rnd.nextLong(rnd.state);
+        }
+        return 1;
+    }
+    case Igloo: {
+        if (!sv->basement) {
+            Piece* p = list;
+            p->name = "igloo/top";
+            p->pos = (Pos3) {minBlockX, 90, minBlockZ};
+            p->chestCount = 0;
+            return 1;
+        }
+        Piece* topPiece = &list[0];
+        topPiece->name = "igloo/top";
+        topPiece->pos = (Pos3) {minBlockX, 90, minBlockZ};
+        topPiece->chestCount = 0;
+        for (int i = 1; i < sv->size + 1; ++i) {
+            Piece* middlePiece = &list[i];
+            middlePiece->name = "igloo/middle";
+            middlePiece->pos = (Pos3) {minBlockX + 2, 90 - i * 3, minBlockZ + 4};
+            middlePiece->chestCount = 0;
+        }
+        Piece* bottomPiece = &list[sv->size + 1];
+        bottomPiece->name = "igloo/bottom";
+        bottomPiece->pos = (Pos3) {minBlockX, 90 - 3 - sv->size * 3, minBlockZ - 2};
+        bottomPiece->chestCount = 1;
+        bottomPiece->lootTables[0] = "igloo_chest";
+        int chestPosX, chestPosZ;
+        switch ((sv->rotation << 1) | sv->mirror) {
+        case 0b00: chestPosX = minBlockX + 8 - 7; chestPosZ = minBlockZ + 8 - 4; break; //
+        case 0b01: chestPosX = minBlockX + 8 - 3; chestPosZ = minBlockZ + 8 - 2; break; // mirrored
+        case 0b10: chestPosX = minBlockX + 8 - 4; chestPosZ = minBlockZ + 8 - 5; break; // 90 cw
+        case 0b11: chestPosX = minBlockX + 8 - 6; chestPosZ = minBlockZ + 8 - 1; break; // 90 cw + mirrored
+        default: UNREACHABLE();
+        }
+        bottomPiece->chestPoses[0] = (Pos) {chestPosX, chestPosZ};
+        // chest generates in the same chunk as structure
+        uint64_t populationSeed = getPopulationSeed(mc, seed, minBlockX, minBlockZ);
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+        rnd.nextLong(rnd.state); // LootTableSeed from placeInWorld is not used
+        bottomPiece->lootSeeds[0] = rnd.nextLong(rnd.state);
+        return sv->size + 2;
+    }
+    case Jungle_Pyramid: {
+        Piece* p = list;
+        p->name = "TeJP";
+        p->pos = (Pos3) {minBlockX, 64, minBlockZ};
+        p->chestCount = 4;
+        p->lootTables[0] = "jungle_temple_dispenser";
+        p->lootTables[1] = "jungle_temple_dispenser";
+        p->chestPoses[0] = (Pos) {minBlockX + 1 + 3, minBlockZ + 1 + 1};
+        p->chestPoses[1] = (Pos) {minBlockX + 1 + 9, minBlockZ + 1 + 3};
+        p->lootTables[2] = "jungle_temple";
+        p->lootTables[3] = "jungle_temple";
+        p->chestPoses[2] = (Pos) {minBlockX + 1 + 8, minBlockZ + 1 + 3};
+        p->chestPoses[3] = (Pos) {minBlockX + 1 + 7, minBlockZ + 1 + 10};
+        // chests generate in the same chunk as structure
+        uint64_t populationSeed = getPopulationSeed(mc, seed, minBlockX, minBlockZ);
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+        rnd.skipN(rnd.state, 1511);
+        p->lootSeeds[0] = rnd.nextLong(rnd.state);
+        rnd.skipN(rnd.state, 1513 - 1511 - 1 - 1);
+        p->lootSeeds[1] = rnd.nextLong(rnd.state);
+        rnd.skipN(rnd.state, 1515 - 1513 - 1 - 1);
+        p->lootSeeds[2] = rnd.nextLong(rnd.state);
+        rnd.skipN(rnd.state, 1528 - 1515 - 1 - 1);
+        p->lootSeeds[3] = rnd.nextLong(rnd.state);
+        return 1;
+    }
+    case Outpost: {
+        // TODO: simulate all pieces
+        Piece* p = list;
+        p->name = "pillager_outpost/watchtower";
+        p->pos = (Pos3) {minBlockX, 64, minBlockZ};
+        p->chestCount = 1;
+        p->lootTables[0] = "pillager_outpost";
+        int chestPosX, chestPosZ;
+        switch (sv->rotation) {
+        case 0: chestPosX = p->pos.x + 10; chestPosZ = p->pos.z + 10; break; // 0
+        case 1: chestPosX = p->pos.x - 10; chestPosZ = p->pos.z + 10; break; // 90
+        case 2: chestPosX = p->pos.x - 10; chestPosZ = p->pos.z - 10; break; // 180
+        case 3: chestPosX = p->pos.x + 10; chestPosZ = p->pos.z - 10; break; // 270
+        default: UNREACHABLE();
+        }
+        p->chestPoses[0] = (Pos) {chestPosX, chestPosZ};
+        uint64_t populationSeed = getPopulationSeed(mc, seed, chestPosX & ~15, chestPosZ & ~15);
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+        p->lootSeeds[0] = rnd.nextLong(rnd.state);
+        return 1;
+    }
+    case Shipwreck: {
+        static const struct { const char *name; const int sx, sy, sz; const int chestCount; const char *lootTables[3]; const Pos chestPoses[3]; } sw_info[] = {
+        {"shipwreck/with_mast", 9, 21, 28, 3, {"shipwreck_supply", "shipwreck_map", "shipwreck_treasure"}, {(Pos) {4, 9}, (Pos) {5, 18}, (Pos) {6, 24}}},
+        {"shipwreck/upsidedown_full", 9, 9, 28, 3, {"shipwreck_treasure", "shipwreck_map", "shipwreck_supply"}, {(Pos) {2, 24}, (Pos) {3, 17}, (Pos) {4, 8}}},
+        {"shipwreck/upsidedown_fronthalf", 9, 9, 22, 2, {"shipwreck_map", "shipwreck_supply"}, {(Pos) {3, 17}, (Pos) {4, 8}}},
+        {"shipwreck/upsidedown_backhalf", 9, 9, 16, 2, {"shipwreck_treasure", "shipwreck_map"}, {(Pos) {2, 12}, (Pos) {3, 5}}},
+        {"shipwreck/sideways_full", 9, 9, 28, 3, {"shipwreck_treasure", "shipwreck_supply", "shipwreck_map"}, {(Pos) {3, 24}, (Pos) {5, 8}, (Pos) {6, 19}}},
+        {"shipwreck/sideways_fronthalf", 9, 9, 24, 1, {"shipwreck_supply"}, {(Pos) {5, 8}}},
+        {"shipwreck/sideways_backhalf", 9, 9, 17, 2, {"shipwreck_treasure", "shipwreck_map"}, {(Pos) {3, 13}, (Pos) {6, 8}}},
+        {"shipwreck/rightsideup_full", 9, 9, 28, 3, {"shipwreck_supply", "shipwreck_map", "shipwreck_treasure"}, {(Pos) {4, 8}, (Pos) {5, 18}, (Pos) {6, 24}}},
+        {"shipwreck/rightsideup_fronthalf", 9, 9, 24, 1, {"shipwreck_supply"}, {(Pos) {4, 8}}},
+        {"shipwreck/rightsideup_backhalf", 9, 9, 16, 2, {"shipwreck_map", "shipwreck_treasure"}, {(Pos) {5, 6}, (Pos) {6, 12}}},
+        {"shipwreck/with_mast_degraded", 9, 21, 28, 3, {"shipwreck_supply", "shipwreck_map", "shipwreck_treasure"}, {(Pos) {4, 9}, (Pos) {5, 18}, (Pos) {6, 24}}},
+        {"shipwreck/upsidedown_full_degraded", 9, 9, 28, 3, {"shipwreck_treasure", "shipwreck_map", "shipwreck_supply"}, {(Pos) {2, 24}, (Pos) {3, 17}, (Pos) {4, 8}}},
+        {"shipwreck/upsidedown_fronthalf_degraded", 9, 9, 22, 2, {"shipwreck_map", "shipwreck_supply"}, {(Pos) {3, 17}, (Pos) {4, 8}}},
+        {"shipwreck/upsidedown_backhalf_degraded", 9, 9, 16, 2, {"shipwreck_treasure", "shipwreck_map"}, {(Pos) {2, 12}, (Pos) {3, 5}}},
+        {"shipwreck/sideways_full_degraded", 9, 9, 28, 3, {"shipwreck_treasure", "shipwreck_supply", "shipwreck_map"}, {(Pos) {3, 24}, (Pos) {5, 8}, (Pos) {6, 19}}},
+        {"shipwreck/sideways_fronthalf_degraded", 9, 9, 24, 1, {"shipwreck_supply"}, {(Pos) {5, 8}}},
+        {"shipwreck/sideways_backhalf_degraded", 9, 9, 17, 2, {"shipwreck_treasure", "shipwreck_map"}, {(Pos) {3, 13}, (Pos) {6, 8}}},
+        {"shipwreck/rightsideup_full_degraded", 9, 9, 28, 3, {"shipwreck_supply", "shipwreck_map", "shipwreck_treasure"}, {(Pos) {4, 8}, (Pos) {5, 18}, (Pos) {6, 24}}},
+        {"shipwreck/rightsideup_fronthalf_degraded", 9, 9, 24, 1, {"shipwreck_supply"}, {(Pos) {4, 8}}},
+        {"shipwreck/rightsideup_backhalf_degraded", 9, 9, 16, 2, {"shipwreck_map", "shipwreck_treasure"}, {(Pos) {5, 6}, (Pos) {6, 12}}}
+        };
+
+        Piece* p = list;
+        int sw_typ;
+        int biome = sv->biome;
+        int isBeached = !isOceanic(biome);
+        if (isBeached) {
+            switch (sv->start) {
+            case 0: sw_typ = 0; break;
+            case 1: sw_typ = 4; break;
+            case 2: sw_typ = 5; break;
+            case 3: sw_typ = 6; break;
+            case 4: sw_typ = 7; break;
+            case 5: sw_typ = 8; break;
+            case 6: sw_typ = 9; break;
+            case 7: sw_typ = 10; break;
+            case 8: sw_typ = 17; break;
+            case 9: sw_typ = 18; break;
+            case 10: sw_typ = 19; break;
+            default: UNREACHABLE();
+            }
+        } else {
+            sw_typ = sv->start;
+        }
+
+        p->name = sw_info[sw_typ].name;
+        p->pos = (Pos3) {minBlockX + sv->x, 64, minBlockZ + sv->z};
+        p->bb1.y += sw_info[sw_typ].sy;
+        switch (sv->rotation)
+        {
+        case 0: p->bb1.x += sw_info[sw_typ].sx; p->bb1.z += sw_info[sw_typ].sz; break; // 0
+        case 1: p->bb0.x -= sw_info[sw_typ].sz; p->bb1.z += sw_info[sw_typ].sx; break; // 90
+        case 2: p->bb0.x -= sw_info[sw_typ].sx; p->bb0.z -= sw_info[sw_typ].sz; break; // 180
+        case 3: p->bb1.x += sw_info[sw_typ].sz; p->bb0.z -= sw_info[sw_typ].sx; break; // 270
+        default: UNREACHABLE();
+        }
+        p->chestCount = sw_info[sw_typ].chestCount;
+        for (int i = 0; i < p->chestCount; ++i) {
+            p->lootTables[i] = sw_info[sw_typ].lootTables[i];
+            switch (sv->rotation) {
+            case 0: p->chestPoses[i] = (Pos) {p->pos.x + sw_info[sw_typ].chestPoses[i].x, p->pos.z + sw_info[sw_typ].chestPoses[i].z}; break; // 0
+            case 1: p->chestPoses[i] = (Pos) {p->pos.x - sw_info[sw_typ].chestPoses[i].z, p->pos.z + sw_info[sw_typ].chestPoses[i].x}; break; // 90
+            case 2: p->chestPoses[i] = (Pos) {p->pos.x - sw_info[sw_typ].chestPoses[i].x, p->pos.z - sw_info[sw_typ].chestPoses[i].z}; break; // 180
+            case 3: p->chestPoses[i] = (Pos) {p->pos.x + sw_info[sw_typ].chestPoses[i].z, p->pos.z - sw_info[sw_typ].chestPoses[i].x}; break; // 270
+            default: UNREACHABLE();
+            }
+        }
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        // sorry...
+        switch (p->chestCount) {
+        case 1: {
+            uint64_t populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+            rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+            if (isBeached) {
+                rnd.nextInt(rnd.state, 3);
+            }
+            p->lootSeeds[0] = rnd.nextLong(rnd.state);
+            break;
+        }
+        case 2: {
+            if (p->chestPoses[0].x >> 4 == p->chestPoses[1].x >> 4 && p->chestPoses[0].z >> 4 == p->chestPoses[1].z >> 4) {
+                uint64_t populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[0] = rnd.nextLong(rnd.state);
+                p->lootSeeds[1] = rnd.nextLong(rnd.state);
+            } else {
+                uint64_t populationSeed;
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[0] = rnd.nextLong(rnd.state);
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[1].x & ~15, p->chestPoses[1].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[1] = rnd.nextLong(rnd.state);
+            }
+            break;
+        } case 3: {
+            if (p->chestPoses[0].x >> 4 == p->chestPoses[1].x >> 4 && p->chestPoses[1].x >> 4 == p->chestPoses[2].x >> 4 && p->chestPoses[0].z >> 4 == p->chestPoses[1].z >> 4 && p->chestPoses[1].z >> 4 == p->chestPoses[2].z >> 4) {
+                uint64_t populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                rnd.nextLong(rnd.state);
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[0] = rnd.nextLong(rnd.state);
+                p->lootSeeds[1] = rnd.nextLong(rnd.state);
+                p->lootSeeds[2] = rnd.nextLong(rnd.state);
+            } else if (p->chestPoses[0].x >> 4 == p->chestPoses[1].x >> 4 && p->chestPoses[0].z >> 4 == p->chestPoses[1].z >> 4) {
+                uint64_t populationSeed;
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[0] = rnd.nextLong(rnd.state);
+                p->lootSeeds[1] = rnd.nextLong(rnd.state);
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[2].x & ~15, p->chestPoses[2].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[2] = rnd.nextLong(rnd.state);
+            } else if (p->chestPoses[1].x >> 4 == p->chestPoses[2].x >> 4 && p->chestPoses[1].z >> 4 == p->chestPoses[2].z >> 4) {
+                uint64_t populationSeed;
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[0] = rnd.nextLong(rnd.state);
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[1].x & ~15, p->chestPoses[1].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[1] = rnd.nextLong(rnd.state);
+                p->lootSeeds[2] = rnd.nextLong(rnd.state);
+            } else if (p->chestPoses[0].x >> 4 == p->chestPoses[2].x >> 4 && p->chestPoses[0].z >> 4 == p->chestPoses[2].z >> 4) {
+                uint64_t populationSeed;
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[0] = rnd.nextLong(rnd.state);
+                p->lootSeeds[2] = rnd.nextLong(rnd.state);
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[1].x & ~15, p->chestPoses[1].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[1] = rnd.nextLong(rnd.state);
+            } else {
+                uint64_t populationSeed;
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[0].x & ~15, p->chestPoses[0].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[0] = rnd.nextLong(rnd.state);
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[1].x & ~15, p->chestPoses[1].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[1] = rnd.nextLong(rnd.state);
+                populationSeed = getPopulationSeed(mc, seed, p->chestPoses[2].x & ~15, p->chestPoses[2].z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                if (isBeached) {
+                    rnd.nextInt(rnd.state, 3);
+                }
+                rnd.nextLong(rnd.state);
+                p->lootSeeds[2] = rnd.nextLong(rnd.state);
+            }
+            break;
+        }
+        default: UNREACHABLE();
+        }
+        return 1;
+    }
+    case Swamp_Hut: {
+        Piece* p = list;
+        p->name = "TeSH";
+        p->pos = (Pos3) {minBlockX, 64, minBlockZ};
+        p->chestCount = 0;
+        return 1;
+    }
+    case Fortress: {
+        int count = getFortressPieces(list, n, mc, seed, posX >> 4, posZ >> 4);
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        for (int i = 0; i < count; ++i) {
+            Piece* piece = &list[i];
+            int chestPosX, chestPosZ;
+            switch (piece->type) {
+            case CORRIDOR_TURN_LEFT: {
+                if (!piece->chestCount) {
+                    continue;
+                }
+                piece->lootTables[0] = "nether_bridge";
+                switch (piece->rot) {
+                case 0: chestPosX = piece->pos.x - 1 + 3; chestPosZ = piece->pos.z - 1 + 3; break; // 0
+                case 1: chestPosX = piece->pos.x - 1 - 3; chestPosZ = piece->pos.z - 1 + 3; break; // 90
+                case 2: chestPosX = piece->pos.x - 1 - 3; chestPosZ = piece->pos.z - 1 - 3; break; // 180
+                case 3: chestPosX = piece->pos.x - 1 + 3; chestPosZ = piece->pos.z - 1 - 3; break; // 270
+                default: UNREACHABLE();
+                }
+                break;
+            }
+            case CORRIDOR_TURN_RIGHT:
+                if (!piece->chestCount) {
+                    continue;
+                }
+                piece->lootTables[0] = "nether_bridge";
+                switch (piece->rot) {
+                case 0: chestPosX = piece->pos.x - 1 + 1; chestPosZ = piece->pos.z - 1 + 3; break; // 0
+                case 1: chestPosX = piece->pos.x - 1 - 3; chestPosZ = piece->pos.z - 1 + 1; break; // 90
+                case 2: chestPosX = piece->pos.x - 1 - 1; chestPosZ = piece->pos.z - 1 - 3; break; // 180
+                case 3: chestPosX = piece->pos.x - 1 + 3; chestPosZ = piece->pos.z - 1 - 1; break; // 270
+                default: UNREACHABLE();
+                }
+                break;
+            default:
+                piece->chestCount = 0;
+                continue;
+            }
+            piece->chestPoses[0] = (Pos) {chestPosX, chestPosZ};
+            // it is assumed that no two pieces have a chest in the same chunk
+            uint64_t populationSeed = getPopulationSeed(mc, seed, chestPosX & ~15, chestPosZ & ~15);
+            rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+            piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+        }
+        return count;
+    }
+    case Bastion: {
+        // TODO: simulate all pieces
+        // this only simulates bastion pieces that always generate and have a chest
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        switch (sv->start) {
+        case 0 /* units/air_base */: {
+            Piece* piece = list;
+            piece->name = "bastion/units/walls/wall_base";
+            piece->chestCount = 2;
+            piece->lootTables[0] = "bastion_other";
+            piece->lootTables[1] = "bastion_other";
+            int chestPos1X, chestPos1Z;
+            switch (sv->rotation) {
+            case 0: chestPos1X = minBlockX - 6; chestPos1Z = minBlockZ + 20; break;
+            case 1: chestPos1X = minBlockX - 20; chestPos1Z = minBlockZ - 6; break;
+            case 2: chestPos1X = minBlockX + 6; chestPos1Z = minBlockZ - 20; break;
+            case 3: chestPos1X = minBlockX + 20; chestPos1Z = minBlockZ + 6; break;
+            default: UNREACHABLE();
+            }
+            int chestPos2X, chestPos2Z;
+            switch (sv->rotation) {
+            case 0: chestPos2X = minBlockX - 6; chestPos2Z = minBlockZ + 21; break;
+            case 1: chestPos2X = minBlockX - 21; chestPos2Z = minBlockZ - 6; break;
+            case 2: chestPos2X = minBlockX + 6; chestPos2Z = minBlockZ - 21; break;
+            case 3: chestPos2X = minBlockX + 21; chestPos2Z = minBlockZ + 6; break;
+            default: UNREACHABLE();
+            }
+            piece->chestPoses[0] = (Pos) {chestPos1X, chestPos1Z};
+            piece->chestPoses[1] = (Pos) {chestPos2X, chestPos2Z};
+            // the chests always generate in the same chunk
+            uint64_t populationSeed = getPopulationSeed(mc, seed, chestPos1X & ~15, chestPos1Z & ~15);
+            rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+            piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+            piece->lootSeeds[1] = rnd.nextLong(rnd.state);
+            break;
+        }
+        case 1 /* hoglin_stable/air_base */: {
+            Piece* piece = list;
+            piece->name = "bastion/hoglin_stable/ramparts/ramparts_3";
+            piece->chestCount = 1;
+            piece->lootTables[0] = "bastion_other";
+            int chestPosX, chestPosZ;
+            switch (sv->rotation) {
+            case 0: chestPosX = minBlockX - 4; chestPosZ = minBlockZ + 29; break;
+            case 1: chestPosX = minBlockX - 29; chestPosZ = minBlockZ - 4; break;
+            case 2: chestPosX = minBlockX + 4; chestPosZ = minBlockZ - 29; break;
+            case 3: chestPosX = minBlockX + 29; chestPosZ = minBlockZ + 4; break;
+            default: UNREACHABLE();
+            }
+            piece->chestPoses[0] = (Pos) {chestPosX, chestPosZ};
+            uint64_t populationSeed = getPopulationSeed(mc, seed, chestPosX & ~15, chestPosZ & ~15);
+            rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+            piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+            break;
+        }
+        case 2 /* treasure/big_air_full */: {
+            Piece* piece = list;
+            piece->name = "bastion/treasure/ramparts/mid_wall_main";
+            piece->chestCount = 2;
+            piece->lootTables[0] = "bastion_other";
+            piece->lootTables[1] = "bastion_other";
+            int chestPos1X, chestPos1Z;
+            switch (sv->rotation) {
+            case 0: chestPos1X = minBlockX + 17; chestPos1Z = minBlockZ - 23; break;
+            case 1: chestPos1X = minBlockX + 23; chestPos1Z = minBlockZ + 17; break;
+            case 2: chestPos1X = minBlockX - 17; chestPos1Z = minBlockZ + 23; break;
+            case 3: chestPos1X = minBlockX - 23; chestPos1Z = minBlockZ - 17; break;
+            default: UNREACHABLE();
+            }
+            int chestPos2X, chestPos2Z;
+            switch (sv->rotation) {
+            case 0: chestPos2X = minBlockX + 19; chestPos2Z = minBlockZ - 25; break;
+            case 1: chestPos2X = minBlockX + 25; chestPos2Z = minBlockZ + 19; break;
+            case 2: chestPos2X = minBlockX - 19; chestPos2Z = minBlockZ + 25; break;
+            case 3: chestPos2X = minBlockX - 25; chestPos2Z = minBlockZ - 19; break;
+            default: UNREACHABLE();
+            }
+            piece->chestPoses[0] = (Pos) {chestPos1X, chestPos1Z};
+            piece->chestPoses[1] = (Pos) {chestPos2X, chestPos2Z};
+            // the chests always generate in the same chunk
+            uint64_t populationSeed = getPopulationSeed(mc, seed, chestPos1X & ~15, chestPos1Z & ~15);
+            rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+            piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+            piece->lootSeeds[1] = rnd.nextLong(rnd.state);
+            break;
+        }
+        case 3 /* bridge/starting_pieces/entrance_base */: {
+            Piece* piece = list;
+            piece->name = "bastion/bridge/starting_pieces/entrance";
+            piece->chestCount = 1;
+            piece->lootTables[0] = "bastion_bridge";
+            int chestPosX, chestPosZ;
+            switch (sv->rotation) {
+            case 0: chestPosX = minBlockX + 9; chestPosZ = minBlockZ + 4; break;
+            case 1: chestPosX = minBlockX - 4; chestPosZ = minBlockZ + 9; break;
+            case 2: chestPosX = minBlockX - 9; chestPosZ = minBlockZ - 4; break;
+            case 3: chestPosX = minBlockX + 4; chestPosZ = minBlockZ - 9; break;
+            default: UNREACHABLE();
+            }
+            piece->chestPoses[0] = (Pos) {chestPosX, chestPosZ};
+            uint64_t populationSeed = getPopulationSeed(mc, seed, chestPosX & ~15, chestPosZ & ~15);
+            rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+            piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+            break;
+        }
+        default: UNREACHABLE();
+        }
+        return 1;
+    }
+    case End_City: {
+        if (n < END_CITY_PIECES_MAX) {
+            return -1;
+        }
+        int count = getEndCityPieces(list, seed, posX >> 4, posZ >> 4);
+        CREATE_RANDOM_SOURCE(rnd, legacy);
+        for (int i = 0; i < count; ++i) {
+            Piece* piece = &list[i];
+            int chestPos1X, chestPos1Z, chestPos2X, chestPos2Z;
+            int oneChest;
+            switch (piece->type) {
+            case FAT_TOWER_TOP: {
+                piece->chestCount = 2;
+                piece->lootTables[0] = "end_city_treasure";
+                piece->lootTables[1] = "end_city_treasure";
+                oneChest = 0;
+                switch (piece->rot) {
+                case 0: chestPos1X = piece->pos.x - 1 + 3; chestPos1Z = piece->pos.z - 1 + 11; break; // 0
+                case 1: chestPos1X = piece->pos.x - 1 - 11; chestPos1Z = piece->pos.z - 1 + 3; break; // 90
+                case 2: chestPos1X = piece->pos.x - 1 - 3; chestPos1Z = piece->pos.z - 1 - 11; break; // 180
+                case 3: chestPos1X = piece->pos.x - 1 + 11; chestPos1Z = piece->pos.z - 1 - 3; break; // 270
+                default: UNREACHABLE();
+                }
+                switch (piece->rot) {
+                case 0: chestPos2X = piece->pos.x - 1 + 5; chestPos2Z = piece->pos.z - 1 + 13; break; // 0
+                case 1: chestPos2X = piece->pos.x - 1 - 13; chestPos2Z = piece->pos.z - 1 + 5; break; // 90
+                case 2: chestPos2X = piece->pos.x - 1 - 5; chestPos2Z = piece->pos.z - 1 - 13; break; // 180
+                case 3: chestPos2X = piece->pos.x - 1 + 13; chestPos2Z = piece->pos.z - 1 - 5; break; // 270
+                default: UNREACHABLE();
+                }
+                break;
+            }
+            case END_SHIP: {
+                piece->chestCount = 2;
+                piece->lootTables[0] = "end_city_treasure";
+                piece->lootTables[1] = "end_city_treasure";
+                oneChest = 0;
+                switch (piece->rot) {
+                case 0: chestPos1X = piece->pos.x - 1 + 5; chestPos1Z = piece->pos.z - 1 + 7; break; // 0
+                case 1: chestPos1X = piece->pos.x - 1 - 7; chestPos1Z = piece->pos.z - 1 + 5; break; // 90
+                case 2: chestPos1X = piece->pos.x - 1 - 5; chestPos1Z = piece->pos.z - 1 - 7; break; // 180
+                case 3: chestPos1X = piece->pos.x - 1 + 7; chestPos1Z = piece->pos.z - 1 - 5; break; // 270
+                default: UNREACHABLE();
+                }
+                switch (piece->rot) {
+                case 0: chestPos2X = piece->pos.x - 1 + 7; chestPos2Z = piece->pos.z - 1 + 7; break; // 0
+                case 1: chestPos2X = piece->pos.x - 1 - 7; chestPos2Z = piece->pos.z - 1 + 7; break; // 90
+                case 2: chestPos2X = piece->pos.x - 1 - 7; chestPos2Z = piece->pos.z - 1 - 7; break; // 180
+                case 3: chestPos2X = piece->pos.x - 1 + 7; chestPos2Z = piece->pos.z - 1 - 7; break; // 270
+                default: UNREACHABLE();
+                }
+                break;
+            }
+            case THIRD_FLOOR_2: {
+                piece->chestCount = 1;
+                piece->lootTables[0] = "end_city_treasure";
+                oneChest = 1;
+                switch (piece->rot) {
+                case 0: chestPos1X = piece->pos.x - 1 + 6; chestPos1Z = piece->pos.z - 1 + 2; break; // 0
+                case 1: chestPos1X = piece->pos.x - 1 - 2; chestPos1Z = piece->pos.z - 1 + 6; break; // 90
+                case 2: chestPos1X = piece->pos.x - 1 - 6; chestPos1Z = piece->pos.z - 1 - 2; break; // 180
+                case 3: chestPos1X = piece->pos.x - 1 + 2; chestPos1Z = piece->pos.z - 1 - 6; break; // 270
+                default: UNREACHABLE();
+                }
+                break;
+            }
+            default:
+                piece->chestCount = 0;
+                continue;
+            }
+            // it is assumed that no two pieces have a chest in the same chunk
+            if (oneChest) {
+                piece->chestPoses[0] = (Pos) {chestPos1X, chestPos1Z};
+                uint64_t populationSeed = getPopulationSeed(mc, seed, chestPos1X & ~15, chestPos1Z & ~15);
+                rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                rnd.nextLong(rnd.state); // LootTableSeed from placeInWorld is not used
+                piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+            } else {
+                piece->chestPoses[0] = (Pos) {chestPos1X, chestPos1Z};
+                piece->chestPoses[1] = (Pos) {chestPos2X, chestPos2Z};
+                if (chestPos1X >> 4 == chestPos2X >> 4 && chestPos1Z >> 4 == chestPos2Z >> 4) {
+                    uint64_t populationSeed = getPopulationSeed(mc, seed, chestPos1X & ~15, chestPos1Z & ~15);
+                    rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                    rnd.nextLong(rnd.state);
+                    rnd.nextLong(rnd.state);
+                    piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+                    piece->lootSeeds[1] = rnd.nextLong(rnd.state);
+                } else {
+                    uint64_t populationSeed;
+                    populationSeed = getPopulationSeed(mc, seed, chestPos1X & ~15, chestPos1Z & ~15);
+                    rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                    rnd.nextLong(rnd.state);
+                    piece->lootSeeds[0] = rnd.nextLong(rnd.state);
+                    populationSeed = getPopulationSeed(mc, seed, chestPos2X & ~15, chestPos2Z & ~15);
+                    rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+                    rnd.nextLong(rnd.state);
+                    piece->lootSeeds[1] = rnd.nextLong(rnd.state);
+                }
+            }
+        }
+        return count;
+    }
+    case Stronghold: return getStrongholdLoot(list, n, ssconf, mc, seed, posX >> 4, posZ >> 4);
+    // structures that have one piece and one chest
+    case Treasure: {
+        Piece* p = list;
+        p->name = "BTP";
+        p->pos = (Pos3) {minBlockX + 9, 90, minBlockZ + 9};
+        p->lootTables[0] = "buried_treasure";
+        p->chestPoses[0] = (Pos) {p->pos.x, p->pos.z};
+        break;
+    }
+    case Ruined_Portal:
+    case Ruined_Portal_N: {
+        // chest generates roughly in the same chunk as centre of the template
+        minBlockX = (posX + sv->x + sv->sx / 2) & ~15;
+        minBlockZ = (posZ + sv->z + sv->sz / 2) & ~15;
+        Piece* p = list;
+        p->name = "RUPO";
+        p->pos = (Pos3) {minBlockX, 0, minBlockZ};
+        p->lootTables[0] = "ruined_portal";
+        // rough estimate
+        p->chestPoses[0] = (Pos) {minBlockX, minBlockZ};
+        break;
+    }
+    default: // unsupported structures
+        return -1;
+    }
+    Piece* p = list;
+    p->chestCount = 1;
+    CREATE_RANDOM_SOURCE(rnd, legacy);
+    uint64_t populationSeed = getPopulationSeed(mc, seed, minBlockX, minBlockZ);
+    rnd.setSeed(rnd.state, populationSeed + ssconf.decoratorIndex + 10000 * ssconf.generationStep);
+    p->lootSeeds[0] = rnd.nextLong(rnd.state);
+    return 1;
 }
 
 static
@@ -2598,25 +4869,25 @@ int getEndCityPieces(Piece *list, uint64_t seed, int chunkX, int chunkZ)
 static const struct
 {
     Pos3 offset, size;
-    int skip, repeatable, weight, max;
+    int repeatable, weight, max;
     const char *name;
 }
 fortress_info[] = {
-    {{ 0, 0,0}, {18, 9,18}, 0, 0, 0, 0, "NeStart"}, // FORTRESS_START
-    {{-1,-3,0}, { 4, 9,18}, 0, 1,30, 0, "NeBS"},    // BRIDGE_STRAIGHT
-    {{-8,-3,0}, {18, 9,18}, 0, 0,10, 4, "NeBCr"},   // BRIDGE_CROSSING
-    {{-2, 0,0}, { 6, 8, 6}, 0, 0,10, 4, "NeRC"},    // BRIDGE_FORTIFIED_CROSSING
-    {{-2, 0,0}, { 6,10, 6}, 0, 0,10, 3, "NeSR"},    // BRIDGE_STAIRS
-    {{-2, 0,0}, { 6, 7, 8}, 0, 0, 5, 2, "NeMT"},    // BRIDGE_SPAWNER
-    {{-5,-3,0}, {12,13,12}, 0, 0, 5, 1, "NeCE"},    // BRIDGE_CORRIDOR_ENTRANCE
-    {{-1, 0,0}, { 4, 6, 4}, 0, 1,25, 0, "NeSC"},    // CORRIDOR_STRAIGHT
-    {{-1, 0,0}, { 4, 6, 4}, 0, 0,15, 5, "NeSCSC"},  // CORRIDOR_CROSSING
-    {{-1, 0,0}, { 4, 6, 4}, 1, 0, 5,10, "NeSCRT"},  // CORRIDOR_TURN_RIGHT
-    {{-1, 0,0}, { 4, 6, 4}, 1, 0, 5,10, "NeSCLT"},  // CORRIDOR_TURN_LEFT
-    {{-1,-7,0}, { 4,13, 9}, 0, 1,10, 3, "NeCCS"},   // CORRIDOR_STAIRS
-    {{-3, 0,0}, { 8, 6, 8}, 0, 0, 7, 2, "NeCTB"},   // CORRIDOR_T_CROSSING
-    {{-5,-3,0}, {12,13,12}, 0, 0, 5, 2, "NeCSR"},   // CORRIDOR_NETHER_WART
-    {{-1,-3,0}, { 4, 9, 7}, 1, 0, 0, 0, "NeBEF"},   // FORTRESS_END
+    {{ 0, 0,0}, {18, 9,18}, 0, 0, 0, "NeStart"}, // FORTRESS_START
+    {{-1,-3,0}, { 4, 9,18}, 1,30, 0, "NeBS"},    // BRIDGE_STRAIGHT
+    {{-8,-3,0}, {18, 9,18}, 0,10, 4, "NeBCr"},   // BRIDGE_CROSSING
+    {{-2, 0,0}, { 6, 8, 6}, 0,10, 4, "NeRC"},    // BRIDGE_FORTIFIED_CROSSING
+    {{-2, 0,0}, { 6,10, 6}, 0,10, 3, "NeSR"},    // BRIDGE_STAIRS
+    {{-2, 0,0}, { 6, 7, 8}, 0, 5, 2, "NeMT"},    // BRIDGE_SPAWNER
+    {{-5,-3,0}, {12,13,12}, 0, 5, 1, "NeCE"},    // BRIDGE_CORRIDOR_ENTRANCE
+    {{-1, 0,0}, { 4, 6, 4}, 1,25, 0, "NeSC"},    // CORRIDOR_STRAIGHT
+    {{-1, 0,0}, { 4, 6, 4}, 0,15, 5, "NeSCSC"},  // CORRIDOR_CROSSING
+    {{-1, 0,0}, { 4, 6, 4}, 0, 5,10, "NeSCRT"},  // CORRIDOR_TURN_RIGHT
+    {{-1, 0,0}, { 4, 6, 4}, 0, 5,10, "NeSCLT"},  // CORRIDOR_TURN_LEFT
+    {{-1,-7,0}, { 4,13, 9}, 1,10, 3, "NeCCS"},   // CORRIDOR_STAIRS
+    {{-3, 0,0}, { 8, 6, 8}, 0, 7, 2, "NeCTB"},   // CORRIDOR_T_CROSSING
+    {{-5,-3,0}, {12,13,12}, 0, 5, 2, "NeCSR"},   // CORRIDOR_NETHER_WART
+    {{-1,-3,0}, { 4, 9, 7}, 0, 0, 0, "NeBEF"},   // FORTRESS_END
 };
 
 static
@@ -2660,15 +4931,16 @@ Piece *addFortressPiece(PieceEnv *env, int typ, int x, int y, int z, int depth, 
     for (i = 0; i < n; i++)
     {
         Piece *q = env->list + i;
-        if (q->bb1.x >= p->bb0.x && q->bb0.x <= p->bb1.x &&
-            q->bb1.z >= p->bb0.z && q->bb0.z <= p->bb1.z &&
-            q->bb1.y >= p->bb0.y && q->bb0.y <= p->bb1.y)
-        {
+        if (hasIntersection(q->bb0, q->bb1, p->bb0, p->bb1)) {
             return NULL; // collision
         }
     }
+    if (typ == CORRIDOR_TURN_LEFT || typ == CORRIDOR_TURN_RIGHT) {
+        p->chestCount = nextInt(env->rng, 3) == 0;
+    } else if (typ == FORTRESS_END) {
+        skipNextN(env->rng, 1);
+    }
     // accept the piece and append it to the processing front
-    skipNextN(env->rng, fortress_info[typ].skip);
     //int queue = 0;
     if (pending)
     {
@@ -2826,7 +5098,17 @@ int getFortressPieces(Piece *list, int n, int mc, uint64_t seed, int chunkX, int
     p->bb1.x += fortress_info[0].size.x;
     p->bb1.y += fortress_info[0].size.y;
     p->bb1.z += fortress_info[0].size.z;
-    p->rot = nextInt(&rng, 4);
+    if (mc <= MC_1_7_10) {
+        switch(nextInt(&rng, 4)) {
+        case 0: p->rot = 2; break;
+        case 1: p->rot = 3; break;
+        case 2: p->rot = 0; break;
+        case 3: p->rot = 1; break;
+        default: UNREACHABLE();
+        }
+    } else {
+        p->rot = nextInt(&rng, 4);
+    }
     p->depth = 0;
     p->type = 0;
     p->next = NULL;
@@ -2848,7 +5130,6 @@ int getFortressPieces(Piece *list, int n, int mc, uint64_t seed, int chunkX, int
     }
     return count;
 }
-
 
 uint64_t getHouseList(int *out, uint64_t seed, int chunkX, int chunkZ)
 {
@@ -5474,6 +7755,10 @@ static const int g_biome_para_range_215_diff[][13] = {
 {pale_garden             , -1500, 2000,  3000, IMAX,   300, IMAX, -7799,  500,  IMIN, IMAX,  IMIN, IMAX},
 {-1,0,0,0,0,0,0,0,0,0,0,0,0}};
 
+static const int g_biome_para_range_262_diff[][13] = {
+{sulfur_caves            ,  IMIN, IMAX,  IMIN, IMAX,  IMIN, IMAX,  IMIN, IMAX,  2000, 9000,  IMIN,-9500},
+{-1,0,0,0,0,0,0,0,0,0,0,0,0}};
+
 /**
  * Gets the min/max parameter values within which a biome change can occur.
  */
@@ -5511,7 +7796,15 @@ const int *getBiomeParaLimits(int mc, int id)
     if (mc <= MC_1_17)
         return NULL;
     int i;
-    if (mc > MC_1_21_WD)
+    if (mc > MC_26_1)
+    {
+        for (i = 0; g_biome_para_range_262_diff[i][0] != -1; i++)
+        {
+            if (g_biome_para_range_262_diff[i][0] == id)
+                return &g_biome_para_range_262_diff[i][1];
+        }
+    }
+    if (mc > MC_1_21_4)
     {
         for (i = 0; g_biome_para_range_215_diff[i][0] != -1; i++)
         {

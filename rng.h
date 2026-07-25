@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <inttypes.h>
 
+#include "xrms.h"
+
 
 ///=============================================================================
 ///                      Compiler and Platform Features
@@ -56,6 +58,17 @@ static inline uint32_t BSWAP32(uint32_t x) {
 
 #endif
 
+// Use with care
+#define CREATE_RANDOM_SOURCE(name, legacy) \
+    RandomSource name;                     \
+    uint64_t _r;                           \
+    Xoroshiro _xr;                         \
+    if (legacy) {                          \
+        name = createJavaRandom(&_r);      \
+    } else {                               \
+        name = createXoroshiro(&_xr);      \
+    }
+
 /// imitate amd64/x64 rotate instructions
 
 static inline ATTR(const, always_inline, artificial)
@@ -77,6 +90,13 @@ int32_t floordiv(int32_t a, int32_t b)
     int32_t q = a / b;
     int32_t r = a % b;
     return q - ((a ^ b) < 0 && !!r);
+}
+
+/// integer floor modulo
+static inline ATTR(const, always_inline)
+int32_t floormod(int32_t a, int32_t b) {
+    int32_t r = a % b;
+    return r + ((a ^ b) < 0 && !!r) * b;
 }
 
 ///=============================================================================
@@ -172,6 +192,15 @@ static inline void skipNextN(uint64_t *seed, uint64_t n)
     *seed &= 0xffffffffffffULL;
 }
 
+static inline int nextIntBetween(uint64_t *seed, const int min, const int max)
+{
+    return nextInt(seed, max - min + 1) + min;
+}
+
+static inline float nextFloatBetween(uint64_t *seed, const float minInclusive, const float maxExclusive) {
+    return nextFloat(seed) * (maxExclusive - minInclusive) + minInclusive;
+}
+
 
 ///=============================================================================
 ///                               Xoroshiro 128
@@ -234,10 +263,38 @@ static inline float xNextFloat(Xoroshiro *xr)
     return (xNextLong(xr) >> (64-24)) * 5.9604645E-8F;
 }
 
-static inline void xSkipN(Xoroshiro *xr, int count)
+static inline void calcVecMul(const uint64_t m[128][2], Xoroshiro* xr) {
+    // see xradv.c for details
+    uint64_t v[2] = {xr->hi, xr->lo};
+    uint64_t rv[2] = {0};
+
+    for (int r = 0; r < 64; ++r) {
+        int bit = (__builtin_popcountll(m[r][0] & v[0]) & 1) ^ (__builtin_popcountll(m[r][1] & v[1]) & 1);
+        if (bit) {
+            rv[0] |= 1ULL << (64 - r - 1);
+        }
+    }
+    for (int r = 0; r < 64; ++r) {
+        const int bit = (__builtin_popcountll(m[r + 64][0] & v[0]) & 1) ^ (__builtin_popcountll(m[r + 64][1] & v[1]) & 1);
+        if (bit) {
+            rv[1] |= 1ULL << (64 - r - 1);
+        }
+    }
+
+    xr->hi = rv[0];
+    xr->lo = rv[1];
+}
+
+static inline void xSkipN(Xoroshiro *xr, uint64_t count)
 {
-    while (count --> 0)
-        xNextLong(xr);
+    int pow = 0;
+    while (count > 0) {
+        if (count & 1) {
+            calcVecMul(xrms[pow], xr);
+        }
+        count >>= 1;
+        ++pow;
+    }
 }
 
 static inline uint64_t xNextLongJ(Xoroshiro *xr)
@@ -265,6 +322,67 @@ static inline int xNextIntJ(Xoroshiro *xr, uint32_t n)
     return val;
 }
 
+static inline double xNextDoubleJ(Xoroshiro *xr)
+{
+    uint64_t a = xNextLong(xr);
+    uint64_t b = xNextLong(xr);
+    return ((a >> (64-26) << 27) + (b >> (64-27))) * 1.1102230246251565E-16;
+}
+
+static inline int xNextIntJBetween(Xoroshiro *xr, const int min, const int max)
+{
+    return xNextIntJ(xr, max - min + 1) + min;
+}
+
+static inline Xoroshiro xAtPos(Xoroshiro *xr, int x, int y, int z)
+{
+    int64_t l = (int64_t)(x * 3129871) ^ (int64_t)z * 116129781L ^ (int64_t)y;
+    l = l * l * 42317861L + l * 11L;
+    l >>= 16;
+
+    return (Xoroshiro) {(uint64_t)l ^ xr->lo, xr->hi};
+}
+
+// expand as necessary
+STRUCT(RandomSource)
+{
+    void *state;
+    void (*setSeed)(void *state, uint64_t seed);
+    uint64_t (*nextLong)(void *state);
+    int (*nextInt)(void *state, int n);
+    float (*nextFloat)(void *state);
+    double (*nextDouble)(void *state);
+    int (*nextIntBetween)(void *state, int min, int max);
+    void (*skipN)(void *state, uint64_t n);
+};
+
+static inline RandomSource createJavaRandom(uint64_t *seed)
+{
+    return (RandomSource) {
+        .state = seed,
+        .setSeed = (void (*)(void *, uint64_t)) setSeed,
+        .nextLong = (uint64_t (*)(void *)) nextLong,
+        .nextInt = (int (*)(void *, int)) nextInt,
+        .nextFloat = (float (*)(void *)) nextFloat,
+        .nextDouble = (double (*)(void *)) nextDouble,
+        .nextIntBetween = (int (*)(void *, int, int)) nextIntBetween,
+        .skipN = (void (*)(void *, uint64_t)) skipNextN,
+    };
+}
+
+static inline RandomSource createXoroshiro(Xoroshiro *xr)
+{
+    return (RandomSource) {
+        .state = xr,
+        .setSeed = (void (*)(void *, uint64_t)) xSetSeed,
+        .nextLong = (uint64_t (*)(void *)) xNextLongJ,
+        .nextInt = (int (*)(void *, int)) xNextIntJ,
+        .nextFloat = (float (*)(void *)) xNextFloat,
+        .nextDouble = (double (*)(void *)) xNextDoubleJ,
+        .nextIntBetween = (int (*)(void *, int, int)) xNextIntJBetween,
+        .skipN = (void (*)(void *, uint64_t)) xSkipN,
+    };
+}
 
 //==============================================================================
 //                              MC Seed Helpers
@@ -365,11 +483,30 @@ static inline double lerp3(
     return lerp(dz, v000, v001);
 }
 
+static inline double clamp(double value, double min, double max)
+{
+    const double t = value < min ? min : value;
+    return t > max ? max : t;
+}
+
+static inline double inverseLerp(double delta, double start, double end)
+{
+    return (delta - start) / (end - start);
+}
+
+static inline double map(double input, double inputMin, double inputMax, double outputMin, double outputMax) {
+    return lerp(inverseLerp(input, inputMin, inputMax), outputMin, outputMax);
+}
+
 static inline double clampedLerp(double part, double from, double to)
 {
     if (part <= 0) return from;
     if (part >= 1) return to;
     return lerp(part, from, to);
+}
+
+static inline double clampedMap(double input, double inputMin, double inputMax, double ouputMin, double outputMax) {
+    return clampedLerp(inverseLerp(input, inputMin, inputMax), ouputMin, outputMax);
 }
 
 /* Find the modular inverse: (1/x) | mod m.

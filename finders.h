@@ -39,6 +39,7 @@ enum StructureType
     End_Island,
     Trail_Ruins,
     Trial_Chambers,
+    Stronghold, // not like the other structures, but nice to have a constant for it
     FEATURE_NUM
 };
 
@@ -54,10 +55,61 @@ STRUCT(StructureConfig)
     float   rarity;
 };
 
+STRUCT(StructureSaltConfig) {
+    int32_t generationStep;
+    int32_t decoratorIndex;
+};
+
 
 STRUCT(Pos)  { int x, z; };
 STRUCT(Pos3) { int x, y, z; };
 
+static inline void orientBox(Pos3 pos, Pos3 offset, Pos3 size, int facing, Pos3 *b0, Pos3 *b1) {
+    *b0 = pos, *b1 = pos;
+    Pos3 d0 = offset, d1 = size;
+    b0->y += d0.y;
+    b1->y += d0.y+d1.y-1;
+
+    switch (facing) {
+    case 0: // 0, north
+        b0->x += d0.x;       b0->z += d0.z-d1.z+1;
+        b1->x += d0.x+d1.x-1;  b1->z += d0.z;
+        break;
+    case 1: // 90, east
+        b0->x += d0.z;       b0->z += d0.x;
+        b1->x += d0.z+d1.z-1;  b1->z += d0.x+d1.x-1;
+        break;
+    case 2: // 180, south
+        b0->x += d0.x;       b0->z += d0.z;
+        b1->x += d0.x+d1.x-1;  b1->z += d0.z+d1.z-1;
+        break;
+    case 3: // 270, west
+        b0->x += d0.z-d1.z+1;  b0->z += d0.x;
+        b1->x += d0.z;       b1->z += d0.x+d1.x-1;
+        break;
+    default: UNREACHABLE();
+    }
+}
+
+ATTR(always_inline)
+static inline int hasIntersection(Pos3 bmin0, Pos3 bmax0, Pos3 bmin1, Pos3 bmax1) {
+    return bmax0.x >= bmin1.x && bmin0.x <= bmax1.x &&
+           bmax0.z >= bmin1.z && bmin0.z <= bmax1.z &&
+           bmax0.y >= bmin1.y && bmin0.y <= bmax1.y;
+}
+
+STRUCT(Pos3List)
+{
+    Pos3* pos3s;
+    int capacity;
+    int size;
+};
+
+void createPos3List(Pos3List* list, int initialCapacity);
+
+void appendPos3List(Pos3List* list, Pos3 pos3);
+
+void freePos3List(Pos3List* list);
 
 STRUCT(StrongholdIter)
 {
@@ -76,12 +128,12 @@ STRUCT(StrongholdIter)
 
 STRUCT(StructureVariant)
 {
-    uint8_t abandoned   :1; // is zombie village
-    uint8_t giant       :1; // giant portal variant
-    uint8_t underground :1; // underground portal
-    uint8_t airpocket   :1; // portal with air pocket
-    uint8_t basement    :1; // igloo with basement
-    uint8_t cracked     :1; // geode with crack
+    uint8_t abandoned;      // is zombie village
+    uint8_t giant;          // giant portal variant
+    uint8_t underground;    // underground portal
+    uint8_t airpocket;      // portal with air pocket
+    uint8_t basement;       // igloo with basement
+    uint8_t cracked;        // geode with crack
     uint8_t size;           // geode size | igloo middel pieces
     uint8_t start;          // starting piece index
     short   biome;          // biome variant
@@ -93,11 +145,16 @@ STRUCT(StructureVariant)
 
 STRUCT(Piece)
 {
-    const char *name;   // structure piece name
-    Pos3 pos, bb0, bb1; // position and bounding box limits
-    uint8_t rot;        // rotation
+    const char *name;         // structure piece name
+    Pos3 pos, bb0, bb1;       // position and bounding box limits
+    uint8_t rot;              // rotation
     int8_t depth;
     int8_t type;
+    int chestCount;
+    Pos chestPoses[4];        // assume a maximum of four chests
+    uint64_t lootSeeds[4];
+    const char* lootTables[4];
+    int additionalData;
     Piece *next;
 };
 
@@ -144,7 +201,6 @@ STRUCT(BiomeFilter)
     uint64_t biomeToPick, biomeToPickM;
 };
 
-
 /***************************** Structure Positions *****************************
  *
  *  For most structure positions, Minecraft divides the world into a grid of
@@ -189,6 +245,19 @@ static inline uint64_t moveStructure(uint64_t baseSeed, int regX, int regZ)
  * failure (e.g. version does not support structure type).
  */
 int getStructureConfig(int structureType, int mc, StructureConfig *sconf);
+
+/**
+ * Get the structure salt config (step and index) for a given feature. Currently
+ * only supports those features for which loot is supported. Returns zero upon
+ * failure (version is below 1.13, or structure does not exist in that version).
+ *
+ * @param structureType the structure type to get the config for
+ * @param mc the Minecraft version
+ * @param biome the biome variant as returned by getVariant, or in <1.18 the biome itself
+ * @param ssconf the output config
+ * @return zero upon failure
+ */
+int getStructureSaltConfig(int structureType, int mc, int biome, StructureSaltConfig *ssconf);
 
 /* The library can be compiled to use a custom internal getter for structure
  * configurations. For this, the macro STRUCT_CONFIG_OVERRIDE should be defined
@@ -240,6 +309,8 @@ Pos getLargeStructureChunkInRegion(StructureConfig config, uint64_t seed, int re
  */
 int getMineshafts(int mc, uint64_t seed, int chunkX, int chunkZ,
         int chunkW, int chunkH, Pos *out, int nout);
+
+uint64_t getPopulationSeed(int mc, uint64_t ws, int x, int z);
 
 // not exacly a structure
 static inline ATTR(const)
@@ -315,6 +386,412 @@ Pos estimateSpawn(const Generator *g, uint64_t *rng);
  */
 Pos getSpawn(const Generator *g);
 
+
+enum Blocks {
+    ANCIENT_DEBRIS,
+    ANDESITE,
+    BASALT,
+    BLACKSTONE,
+    CLAY,
+    COAL_ORE,
+    COPPER_ORE,
+    DEEPSLATE,
+    DIAMOND_ORE,
+    DIORITE,
+    DIRT,
+    EMERALD_ORE,
+    GOLD_ORE,
+    GRANITE,
+    GRAVEL,
+    INFESTED_STONE,
+    IRON_ORE,
+    LAPIS_ORE,
+    MAGMA_BLOCK,
+    NETHERRACK,
+    NETHER_GOLD_ORE,
+    NETHER_QUARTZ_ORE,
+    RAW_COPPER_BLOCK,
+    RAW_IRON_BLOCK,
+    REDSTONE_ORE,
+    SOUL_SAND,
+    STONE,
+    TUFF,
+    BLOCK_NUM,
+};
+
+enum Ores {
+    AndesiteOre,
+    BlackstoneOre,
+    BuriedDiamondOre,
+    BuriedLapisOre,
+    ClayOre,
+    CoalOre,
+    CopperOre,
+    DeepslateOre,
+    DeltasGoldOre,
+    DeltasQuartzOre,
+    DiamondOre,
+    DioriteOre,
+    DirtOre,
+    EmeraldOre,
+    ExtraGoldOre,
+    GoldOre,
+    GraniteOre,
+    GravelOre,
+    InfestedOre,
+    IronOre,
+    LapisOre,
+    LargeCopperOre,
+    LargeDebrisOre,
+    LargeDiamondOre,
+    LowerAndesiteOre,
+    LowerCoalOre,
+    LowerDioriteOre,
+    LowerGoldOre,
+    LowerGraniteOre,
+    LowerRedstoneOre,
+    MagmaOre,
+    MediumDiamondOre,
+    MiddleIronOre,
+    NetherGoldOre,
+    NetherGravelOre,
+    NetherQuartzOre,
+    RedstoneOre,
+    SmallDebrisOre,
+    SmallIronOre,
+    SoulSandOre,
+    TuffOre,
+    UpperAndesiteOre,
+    UpperCoalOre,
+    UpperDioriteOre,
+    UpperGraniteOre,
+    UpperIronOre,
+    ORE_NUM,
+};
+
+
+// use getOreConfig() for the version specific ore configuration
+STRUCT(OreConfig)
+{
+    int32_t         index;
+    int32_t         step;
+    int32_t         size;
+    int32_t         repeatCount;
+    int           (*heightProvider)(RandomSource rnd, int, int, int);
+    int32_t         h1; // the parameters for the height provider
+    int32_t         h2; // since the provider takes 2 or 3 arguments,
+    int32_t         h3; // the third parameter is sometimes unused
+    uint32_t        oreType;
+    uint32_t        oreBlock;
+    int8_t          dim;
+    uint8_t         numReplaceBlocks;
+    const uint32_t* replaceBlocks;
+    float           discardChanceOnAirExposure;
+};
+
+//==============================================================================
+// Ore height providers
+//==============================================================================
+
+// <=1.16.5
+static inline int providerRange(RandomSource rnd, const int bottomOffset, const int topOffset, const int maximumY) {
+    return rnd.nextInt(rnd.state, maximumY - topOffset) + bottomOffset;
+}
+
+// <=1.16.5
+static inline int providerDepthAverage(RandomSource rnd, const int baseline, const int spread, const int h3) {
+    int a = rnd.nextInt(rnd.state, spread);
+    int b = rnd.nextInt(rnd.state, spread);
+    return a + b - spread + baseline;
+}
+
+// <=1.16.5
+static inline int providerEmeraldOre(RandomSource rnd, int h1, int h2, int h3) {
+    return rnd.nextInt(rnd.state, 28) + 4;
+}
+
+// <=1.16.5
+static inline int providerMagmaOre(RandomSource rnd, int h1, int h2, int h3) {
+    return 32 - 5 + rnd.nextInt(rnd.state, 10);
+}
+
+// >=1.17
+static inline int providerUniformRange(RandomSource rnd, const int minOffset, const int maxOffset, const int h3) {
+    if (minOffset > maxOffset) {
+        return minOffset;
+    }
+    return rnd.nextIntBetween(rnd.state, minOffset, maxOffset);
+}
+
+// >=1.17
+static inline int providerTriangleRange(RandomSource rnd, const int minOffset, const int maxOffset, const int h3) {
+    if (minOffset > maxOffset) {
+        return minOffset;
+    }
+    const int range = maxOffset - minOffset;
+    if (range <= 0) {
+        return rnd.nextIntBetween(rnd.state, minOffset, maxOffset);
+    }
+    const int midPoint = range / 2;
+    const int midPoint2 = range - midPoint;
+    int a = rnd.nextIntBetween(rnd.state, 0, midPoint2);
+    int b = rnd.nextIntBetween(rnd.state, 0, midPoint);
+    return minOffset + a + b;
+}
+
+
+/**
+ * Get the ore config for a given ore type.
+ *
+ * @param oreType the ore type as listed in Ores.
+ * @param mc the Minecraft version as listed in MCVersion
+ * @param biomeID the biome ID as listed in BiomeID, unused for >=1.18
+ * @param oconf the target config
+ * @return 0 on failure
+ */
+int getOreConfig(int oreType, int mc, int biomeID, OreConfig *oconf);
+
+/**
+ * Get the biome used for ore generation for a given chunk. After this, call
+ * `isViableOreBiome` to check whether the ore can generate in the chunk.
+ * @param g the generator
+ * @param chunkX the chunk X-coordinate
+ * @param chunkZ the chunk Z-coordinate
+ * @param y the Y-coordinate (in block coordinates) to check for, unused for <1.18
+ * @return the biome ID
+ */
+int getBiomeForOreGen(const Generator *g, int chunkX, int chunkZ, int y);
+
+/**
+ * Check whether the given ore type generates in this biome.
+ * @param mc the Minecraft version
+ * @param oreType the ore type
+ * @param biomeID the biome ID
+ * @return 0 if the ore does not generate in this biome
+ */
+int isViableOreBiome(int mc, int oreType, int biomeID);
+
+/**
+ * Generate the ores of the given type in the chunk.
+ * @param g the generator
+ * @param sn the surface noise
+ * @param config the ore config
+ * @param chunkX the chunk X-coordinate
+ * @param chunkZ the chunk Y-coordinate
+ * @return a sized array of ore positions
+ */
+Pos3List generateOres(const Generator *g, const SurfaceNoise *sn, OreConfig config, int chunkX, int chunkZ);
+
+Pos3 generateBaseOrePosition(int mc, OreConfig config, int chunkX, int chunkZ, RandomSource rnd);
+
+void generateOrePositions(const Generator *g, const SurfaceNoise *sn, OreConfig config, Pos3 pos, RandomSource rnd, Pos3List* pos3s);
+
+void generateVeinPart(int mc, OreConfig config, RandomSource rnd, double offsetXPos, double offsetXNeg, double offsetZPos, double offsetZNeg, double offsetYPos, double offsetYNeg, int startX, int startY, int startZ, int oreSize, int radius, Pos3List* pos3s);
+
+enum OreVeins {
+    CopperVein,
+    IronVein,
+};
+
+STRUCT(OreVeinConfig)
+{
+    uint32_t oreBlock;
+    uint32_t rawOreBlock;
+    uint32_t fillerBlock;
+    int32_t  minY;
+    int32_t  maxY;
+};
+
+STRUCT(OreVeinParameters)
+{
+    PerlinNoise oct[2*4];
+    DoublePerlinNoise oreVeininess;
+    DoublePerlinNoise oreVeinA;
+    DoublePerlinNoise oreVeinB;
+    DoublePerlinNoise oreGap;
+    Xoroshiro         posRandom;
+};
+
+int initOreVeinNoise(OreVeinParameters *params, uint64_t ws, int mc);
+
+int32_t getOreVeinBlockAt(int x, int y, int z, OreVeinParameters* params);
+
+enum CanyonCarvers {
+    CANYON_CARVER,
+    UNDERWATER_CANYON_CARVER,
+    CANYON_CARVER_NUM,
+};
+
+STRUCT(CanyonCarverConfig)
+{
+    int dim;
+    float probability;
+    int carverIndex;
+    int range;
+    int (*y)(uint64_t*, int, int, int); int minY, maxY, innerY;
+    float yScale;
+    float (*verticalRotation)(uint64_t*, float, float); float minVerRot, maxVerRot;
+    float (*distanceFactor)(uint64_t*, float, float); float minDistance, maxDistance;
+    float (*thickness)(uint64_t*, float, float, float); float minThickness, maxThickness, plateauThickness;
+    int widthSmoothness;
+    float (*horizontalRadiusFactor)(uint64_t*, float, float); float minHorRadius, maxHorRadius;
+    float verticalRadiusDefaultFactor;
+    float verticalRadiusCenterFactor;
+};
+
+enum CaveCarvers {
+    CAVE_CARVER,
+    CAVE_EXTRA_UNDERGROUND_CARVER,
+    OCEAN_CAVE_CARVER,
+    UNDERWATER_CAVE_CARVER,
+    NETHER_CAVE_CARVER,
+    CAVE_CARVER_NUM,
+};
+
+STRUCT(CaveCarverConfig)
+{
+    int dim;
+    float probability;
+    int carverIndex;
+    int range;
+    int caveBound;
+    float (*thickness)(uint64_t*);
+    double tunnelYScale;
+    int (*y)(uint64_t*, int, int, int); int minY, maxY, innerY;
+    float (*yScale)(uint64_t*, float, float); float minYScale, maxYScale;
+    float (*horizontalRadiusMultiplier)(uint64_t*, float, float); float minHorRadius, maxHorRadius;
+    float (*verticalRadiusMultiplier)(uint64_t*, float, float); float minVerRadius, maxVerRadius;
+    float (*floorLevel)(uint64_t*, float, float); float minFloorLevel, maxFloorLevel;
+};
+
+/**
+ * Get the canyon carver configuration for the canyon type.
+ * @param canyonCarverType the canyon carver type
+ * @param mc the Minecraft version
+ * @param cconf the config
+ * @return zero if failed
+ */
+int getCanyonCarverConfig(int canyonCarverType, int mc, CanyonCarverConfig* cconf);
+
+/**
+ * Check whether the canyon carver type exists in this biome. The biome is only used for
+ * UNDERWATER_CANYON_CARVER, which was removed in 1.18. So for >=1.18 this function is no
+ * longer needed.
+ * @param canyonCarverType the canyon carver type
+ * @param biome the biome in biome scale at (chunkX << 2, chunkZ << 2)
+ * @return 1 if the canyon carver type exists in this biome
+ */
+int isViableCanyonBiome(int canyonCarverType, int biome);
+
+/**
+ * Get the cave carver configuration for the cave type. The biome is only used for CAVE_CARVER for
+ * versions <1.18. For >=1.18 the biome can always be -1.
+ * @param caveCarverType the cave carver type
+ * @param mc the Minecraft version
+ * @param biome the biome in biome scale at (chunkX << 2, chunkZ << 2)
+ * @param cconf the config
+ * @return zero if failed
+ */
+int getCaveCarverConfig(int caveCarverType, int mc, int biome, CaveCarverConfig* cconf);
+
+/**
+ * Check whether the cave carver type exists in this biome. The biome is used for OCEAN_CAVE_CARVER
+ * and UNDERWATER_CAVE_CARVER, both only for versions <1.18. So for >=1.18 this function is no longer needed.
+ * @param caveCarverType the cave carver type
+ * @param biome the biome in biome scale at (chunkX << 2, chunkZ << 2)
+ * @return 1 if the cave carver type exists in this biome
+ */
+int isViableCaveBiome(int caveCarverType, int biome);
+
+/**
+ * Check whether the canyon type generates at the given chunk.
+ * @param seed the world seed (structure seed suffices)
+ * @param chunkX the chunk X-coordinate
+ * @param chunkZ the chunk Z-coordinate
+ * @param ccc the canyon carver config
+ * @param rnd an uninitialised random instance (used for carveCanyon)
+ * @return 1 if a canyon starts here
+ */
+int checkCanyonStart(uint64_t seed, int chunkX, int chunkZ, CanyonCarverConfig ccc, uint64_t* rnd);
+
+/**
+ * Check whether the cave type generates at the given chunk.
+ * @param seed the world seed (structure seed suffices)
+ * @param chunkX the chunk X-coordinate
+ * @param chunkZ the chunk Z-coordinate
+ * @param ccc the cave carver config
+ * @param rnd an uninitialised random instance (used for carveCave)
+ * @return 1 if a cave starts here
+ */
+int checkCaveStart(uint64_t seed, int chunkX, int chunkZ, CaveCarverConfig ccc, uint64_t* rnd);
+
+/**
+ * Carve out a canyon at the given chunk. An initial size of 1024 should be sufficient for the positions.
+ * Check the docs of isViableCanyonBiome to determine whether the biomes array must be populated. If so,
+ * note that the scheme is biomes[z][x]. The biomes array can be populated by calling genBiomes with
+ * allocCache(g, r), where Range r = {16, cx - 8, cz - 8, 17, 17, 0, 0};.
+ * @param seed the world seed (structure seed suffices)
+ * @param mc the Minecraft version
+ * @param chunkX the chunk X-coordinate
+ * @param chunkZ the chunk Z-coordinate
+ * @param ccc the canyon carver config
+ * @param canyonCarverType the canyon carver type
+ * @param biomes a grid of biomes[z][x] in biome scale around the central chunk with offset -8 to 8
+ * @param poses list to which positions will be written
+ */
+void carveCanyon(uint64_t seed, int mc, int chunkX, int chunkZ, CanyonCarverConfig ccc, int canyonCarverType, int biomes[17][17], Pos3List* poses);
+
+/**
+ * Carve out a cave at the given chunk. An initial size of 1024 should be sufficient for the positions.
+ * Check the docs of isViableCaveBiome to determine whether the biomes array must be populated. If so,
+ * note that the scheme is biomes[z][x]. The biomes array can be populated by calling genBiomes with
+ * allocCache(g, r), where Range r = {16, cx - 8, cz - 8, 17, 17, 0, 0};.
+ * @param seed the world seed (structure seed suffices)
+ * @param mc the Minecraft version
+ * @param chunkX the chunk X-coordinate
+ * @param chunkZ the chunk Z-coordinate
+ * @param ccc the cave carver config
+ * @param caveCarverType the cave carver type
+ * @param biomes a grid of biomes[z][x] in biome scale around the central chunk with offset -8 to 8
+ * @param poses list to which positions will be written
+ */
+void carveCave(uint64_t seed, int mc, int chunkX, int chunkZ, CaveCarverConfig ccc, int caveCarverType, int biomes[17][17], Pos3List* poses);
+
+//==============================================================================
+// Random providers
+//==============================================================================
+
+static inline int providerUniformIntBetween(uint64_t* rnd, int minInclusive, int maxInclusive, int a3) {
+    if (minInclusive > maxInclusive) {
+        return minInclusive;
+    }
+    return nextInt(rnd, maxInclusive - minInclusive + 1) + minInclusive;
+}
+
+static inline int providerBiasedToBottom(uint64_t* rnd, int minInclusive, int maxInclusive, int inner) {
+    if (maxInclusive - minInclusive - inner + 1 <= 0) {
+        return minInclusive;
+    }
+    int k = nextInt(rnd, maxInclusive - minInclusive - inner + 1);
+    return nextInt(rnd, k + inner) + minInclusive;
+}
+
+static inline float providerConstantFloat(uint64_t* rnd, float value, float a2) {
+    return value;
+}
+
+static inline float providerUniformFloatBetween(uint64_t* rnd, float minInclusive, float maxExclusive) {
+    return nextFloat(rnd) * (maxExclusive - minInclusive) + minInclusive;
+}
+
+static inline float providerTrapezoidFloatBetween(uint64_t* rnd, float min, float max, float plateau) {
+    float f = max - min;
+    float g = (f - plateau) / 2.0F;
+    float h = f - g;
+    float a = nextFloat(rnd);
+    float b = nextFloat(rnd);
+    return min + a * h + b * g;
+}
 
 /* Finds a suitable pseudo-random location in the specified area.
  * This function is used to determine the positions of spawn and strongholds.
@@ -401,6 +878,33 @@ uint64_t chunkGenerateRnd(uint64_t worldSeed, int chunkX, int chunkZ)
  */
 int getVariant(StructureVariant *sv, int structType, int mc, uint64_t seed,
         int blockX, int blockZ, int biomeID);
+
+/**
+ * Get the distinct loot table count for chests in the structure.
+ *
+ * @param structure the structure type
+ * @param mc the Minecraft version
+ * @return the distinct count
+ */
+int getLootTableCountForStructure(int structure, int mc);
+
+/**
+ * Get a list of structure pieces for the given structure. Not all structures are supported.
+ * For the supported structures, each structure piece has information about the name, (basic)
+ * position, chest count, and loot table and seeds for each chest. The number of pieces is returned.
+ *
+ * @param list the output list of pieces
+ * @param n either for fortresses the maximum size of the output list, or for end cities a value at least END_CITY_PIECES_MAX
+ * @param stype the structure type
+ * @param ssconf the structure salt config from getStructureSaltConfig
+ * @param sv the structure variant (if available)
+ * @param mc the Minecraft version
+ * @param seed the world seed
+ * @param posX the block X-coordinate as yielded by getStructurePos
+ * @param posZ the block Z-coordinate as yielded by getStructurePos
+ * @return the number of pieces
+ */
+int getStructurePieces(Piece *list, int n, int stype, StructureSaltConfig ssconf, StructureVariant *sv, int mc, uint64_t seed, int posX, int posZ);
 
 /* Generate the structure pieces of an End City. This pieces buffer should be
  * large enough to hold END_CITY_PIECES_MAX elements.

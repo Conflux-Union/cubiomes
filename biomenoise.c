@@ -6,6 +6,7 @@
 #include "tables/btree20.h"
 #include "tables/btree21wd.h"
 #include "tables/btree215.h"
+#include "tables/btree262.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -1062,10 +1063,7 @@ void setBetaBiomeSeed(BiomeNoiseBeta *bnb, uint64_t seed)
     bnb->nptype = -1;
 }
 
-
-enum { SP_CONTINENTALNESS, SP_EROSION, SP_RIDGES, SP_WEIRDNESS };
-
-static void addSplineVal(Spline *rsp, float loc, Spline *val, float der)
+void addSplineVal(Spline *rsp, float loc, Spline *val, float der)
 {
     rsp->loc[rsp->len] = loc;
     rsp->val[rsp->len] = val;
@@ -1077,7 +1075,7 @@ static void addSplineVal(Spline *rsp, float loc, Spline *val, float der)
     //}
 }
 
-static Spline *createFixSpline(SplineStack *ss, float val)
+Spline *createFixSpline(SplineStack *ss, float val)
 {
     FixSpline *sp = &ss->fstack[ss->flen++];
     sp->len = 1;
@@ -1269,7 +1267,7 @@ static Spline *createFactorSpline(SplineStack *ss)
     return sp;
 }
 
-static float peaksValleys(float weirdness)
+static inline float peaksAndValleys(float weirdness)
 {
     return -(fabsf(fabsf(weirdness) - 0.6666667F) - 0.33333334F) * 3.0F;
 }
@@ -1277,8 +1275,8 @@ static float peaksValleys(float weirdness)
 static Spline *createJaggedRidgeValueSpline(
     SplineStack *ss, float ridgeValue, float middleValue)
 {
-    const float low = peaksValleys(0.4F);
-    const float middle = (low + peaksValleys(0.56666666F)) * 0.5F;
+    const float low = peaksAndValleys(0.4F);
+    const float middle = (low + peaksAndValleys(0.56666666F)) * 0.5F;
     Spline *sp = &ss->stack[ss->len++];
     sp->typ = SP_RIDGES;
     addSplineVal(sp, low, createFixSpline(ss, 0.0F), 0.0F);
@@ -1433,7 +1431,7 @@ int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     if (!(sample_flags & SAMPLE_NO_DEPTH))
     {
         float np_param[] = {
-            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
+            c, e, peaksAndValleys(w), w,
         };
         double off = getSpline(bn->sp, np_param) + 0.015F;
 
@@ -1474,7 +1472,7 @@ static void sampleTerrainParameters(
         &bn->climate[NP_WEIRDNESS], px, 0, pz);
     values[SP_CONTINENTALNESS] = continentalness;
     values[SP_EROSION] = erosion;
-    values[SP_RIDGES] = peaksValleys(weirdness);
+    values[SP_RIDGES] = peaksAndValleys(weirdness);
     values[SP_WEIRDNESS] = weirdness;
 }
 
@@ -2553,6 +2551,20 @@ int mapOverworldSurfaceBiome(int *out, const BiomeNoise *bn, uint64_t sha,
     return 0;
 }
 
+void sampleNoiseParameters(BiomeNoise *bn, int x, int z, float np_param[4]) {
+    double px = x + sampleDoublePerlin(&bn->climate[NP_SHIFT], x, 0, z) * 4.0;
+    double pz = z + sampleDoublePerlin(&bn->climate[NP_SHIFT], z, x, 0) * 4.0;
+
+    float c = (float)sampleDoublePerlin(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
+    float e = (float)sampleDoublePerlin(&bn->climate[NP_EROSION], px, 0, pz);
+    float w = (float)sampleDoublePerlin(&bn->climate[NP_WEIRDNESS], px, 0, pz);
+
+    np_param[0] = c;
+    np_param[1] = e;
+    np_param[2] = peaksAndValleys(w);
+    np_param[3] = w;
+}
+
 // Note: Climate noise is sampled at a 1:1 scale.
 int sampleBiomeNoiseBeta(const BiomeNoiseBeta *bnb, int64_t *np, double *nv,
     int x, int z)
@@ -2820,16 +2832,21 @@ int climateToBiome(int mc, const uint64_t np[6], uint64_t *dat)
         btree215_steps, &btree215_param[0][0], btree215_nodes, btree215_order,
         sizeof(btree215_nodes) / sizeof(uint64_t)
     };
+    static const BiomeTree btree262 = {
+        btree262_steps, &btree262_param[0][0], btree262_nodes, btree262_order,
+        sizeof(btree262_nodes) / sizeof(uint64_t)
+    };
 
     const BiomeTree *bt;
     int idx;
 
-    // THAT IS A LECTURE:
-    // When you patch a newer version, do not forget to put an 'else'
-    // here after you add the new biome tree.
-    if (mc >= MC_1_21_5)
+    // When adding a biome tree for a newer version, do not forget the 'else'
+    // on the branch that used to be first.
+    if (mc >= MC_26_2)
+        bt = &btree262;
+    else if (mc >= MC_1_21_5)
         bt = &btree215;
-    else if (mc >= MC_1_21_WD)
+    else if (mc >= MC_1_21_4)
         bt = &btree21wd;
     else if (mc >= MC_1_20_6)
         bt = &btree20;
@@ -2889,7 +2906,7 @@ double sampleClimatePara(const BiomeNoise *bn, int64_t *np, double x, double z)
         w = sampleDoublePerlin(bn->climate + NP_WEIRDNESS, x, 0, z);
 
         float np_param[] = {
-            c, e, -3.0F * ( fabsf( fabsf(w) - 0.6666667F ) - 0.33333334F ), w,
+            c, e, peaksAndValleys(w), w,
         };
         double off = getSpline(bn->sp, np_param) + 0.015F;
         int y = 0;
@@ -3342,4 +3359,122 @@ Range getVoronoiSrcRange(Range r)
         s.sy = ((ty + r.sy) >> 2) - s.y + 2;
     }
     return s;
+}
+
+int initBlendedNoise(BlendedNoise *bn, uint64_t ws, int dim)
+{
+    static const int jhash_terrain = 0x62d03a68; // minecraft:terrain
+    static const uint64_t md5_terrain[2] = {0x1ee555222ef96f14, 0xe2bedfdbebe43d33}; // minecraft:terrain
+
+    switch (dim) {
+    case DIM_OVERWORLD:
+        bn->xzScale = 0.25;
+        bn->yScale = 0.125;
+        bn->xzFactor = 80.0;
+        bn->yFactor = 160.0;
+        bn->smearScaleMultiplier = 8.0;
+        break;
+    case DIM_NETHER:
+        bn->xzScale = 0.25;
+        bn->yScale = 0.375;
+        bn->xzFactor = 80.0;
+        bn->yFactor = 60.0;
+        bn->smearScaleMultiplier = 8.0;
+        break;
+    case DIM_END:
+        bn->xzScale = 0.25;
+        bn->yScale = 0.25;
+        bn->xzFactor = 80.0;
+        bn->yFactor = 160.0;
+        bn->smearScaleMultiplier = 4.0;
+        break;
+    default:
+        fprintf(stderr, "ERR initBlendedNoise: invalid dimension %d\n", dim);
+        memset(bn, 0, sizeof(BlendedNoise));
+        return 0;
+    }
+    bn->xzMultiplier = 684.412 * bn->xzScale;
+    bn->yMultiplier = 684.412 * bn->yScale;
+    bn->smearedYScale = bn->yMultiplier * bn->smearScaleMultiplier;
+    bn->factoredSmearedYScale = bn->smearedYScale / bn->yFactor;
+
+    switch (dim) {
+    case DIM_OVERWORLD: {
+        Xoroshiro wsx;
+        xSetSeed(&wsx, ws);
+        const uint64_t lo = xNextLong(&wsx);
+        const uint64_t hi = xNextLong(&wsx);
+
+        Xoroshiro xr = {lo ^ md5_terrain[0], hi ^ md5_terrain[1]};
+        xOctaveLegacyInit(&bn->octmin, &xr, bn->oct+0, -15, 16);
+        xOctaveLegacyInit(&bn->octmax, &xr, bn->oct+16, -15, 16);
+        xOctaveLegacyInit(&bn->octmain, &xr, bn->oct+32, -7, 8);
+        break;
+    }
+    case DIM_NETHER: {
+        uint64_t wsj;
+        setSeed(&wsj, ws);
+        octaveInit(&bn->octmin, &wsj, bn->oct+0, -15, 16);
+        octaveInit(&bn->octmax, &wsj, bn->oct+16, -15, 16);
+        octaveInit(&bn->octmain, &wsj, bn->oct+32, -7, 8);
+        break;
+    }
+    case DIM_END: {
+        uint64_t wsr;
+        setSeed(&wsr, ws);
+        const uint64_t nl = nextLong(&wsr);
+
+        uint64_t rnd;
+        setSeed(&rnd, jhash_terrain ^ nl);
+        octaveInit(&bn->octmin, &rnd, bn->oct+0, -15, 16);
+        octaveInit(&bn->octmax, &rnd, bn->oct+16, -15, 16);
+        octaveInit(&bn->octmain, &rnd, bn->oct+32, -7, 8);
+        break;
+    }
+    default: UNREACHABLE();
+    }
+
+    return 1;
+}
+
+double sampleBase3dNoise(BlendedNoise *bn, int x, int y, int z)
+{
+    const double scaledX = x * bn->xzMultiplier;
+    const double scaledY = y * bn->yMultiplier;
+    const double scaledZ = z * bn->xzMultiplier;
+    const double factoredX = scaledX / bn->xzFactor;
+    const double factoredY = scaledY / bn->yFactor;
+    const double factoredZ = scaledZ / bn->xzFactor;
+
+    double minSampleTotal = 0.0;
+    double maxSampleTotal = 0.0;
+    double mainSampleTotal = 0.0;
+    double o = 1.0;
+
+    for (int octaveIdx = 0; octaveIdx < 8; octaveIdx++) {
+        mainSampleTotal += samplePerlin(&bn->octmain.octaves[octaveIdx], maintainPrecision(factoredX * o), maintainPrecision(factoredY * o), maintainPrecision(factoredZ * o), bn->factoredSmearedYScale * o, factoredY * o) / o;
+        o /= 2.0;
+    }
+
+    double q = (mainSampleTotal / 10.0 + 1.0) / 2.0;
+    o = 1.0;
+
+    for (int octaveIdx = 0; octaveIdx < 16; octaveIdx++) {
+        double sampleY = maintainPrecision(scaledY * o);
+        double sampleX = maintainPrecision(scaledX * o);
+        double sampleZ = maintainPrecision(scaledZ * o);
+        double yamp = bn->smearedYScale * o;
+        double ymax = scaledY * o;
+        if (q < 1.0) {
+            minSampleTotal += samplePerlin(&bn->octmin.octaves[octaveIdx], sampleX, sampleY, sampleZ, yamp, ymax) / o;
+        }
+
+        if (q > 0.0) {
+            maxSampleTotal += samplePerlin(&bn->octmax.octaves[octaveIdx], sampleX, sampleY, sampleZ, yamp, ymax) / o;
+        }
+
+        o /= 2.0;
+    }
+
+    return clampedLerp(q, minSampleTotal / 512.0, maxSampleTotal / 512.0) / 128.0;
 }

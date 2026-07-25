@@ -200,6 +200,21 @@ STRUCT(BiomeTree)
     uint32_t len;
 };
 
+STRUCT(BlendedNoise)
+{
+    double xzScale, yScale;
+    double xzFactor, yFactor;
+    double xzMultiplier, yMultiplier;
+    double smearScaleMultiplier;
+    double smearedYScale;
+    double factoredSmearedYScale;
+    OctaveNoise octmin;
+    OctaveNoise octmax;
+    OctaveNoise octmain;
+    PerlinNoise oct[16+16+8];
+};
+
+
 #ifdef __cplusplus
 extern "C"
 {
@@ -287,11 +302,16 @@ enum {
     SAMPLE_NO_DEPTH = 0x2,  // skip depth sampling for vertical biomes
     SAMPLE_NO_BIOME = 0x4,  // do not apply climate noise to biome mapping
 };
+enum { SP_CONTINENTALNESS, SP_EROSION, SP_RIDGES, SP_WEIRDNESS };
+void addSplineVal(Spline *rsp, float loc, Spline *val, float der);
+Spline *createFixSpline(SplineStack *ss, float val);
+float getSpline(const Spline *sp, const float *vals);
 void initBiomeNoise(BiomeNoise *bn, int mc);
 void setBiomeSeed(BiomeNoise *bn, uint64_t seed, int large);
 void setBetaBiomeSeed(BiomeNoiseBeta *bnb, uint64_t seed);
 int sampleBiomeNoise(const BiomeNoise *bn, int64_t *np, int x, int y, int z,
     uint64_t *dat, uint32_t sample_flags);
+void sampleNoiseParameters(BiomeNoise *bn, int x, int z, float np_param[4]);
 int sampleBiomeNoiseBeta(const BiomeNoiseBeta *bnb, int64_t *np, double *nv,
     int x, int z);
 double approxSurfaceBeta(const BiomeNoiseBeta *bnb, const SurfaceNoiseBeta *snb,
@@ -376,6 +396,26 @@ int getBiomeDepthAndScale(int id, double *depth, double *scale, int *grass);
 // Gets the range in the parent/source layer which may be accessed by voronoi.
 Range getVoronoiSrcRange(Range r);
 
+/**
+ * Initialise a blended noise instance.
+ *
+ * @param bn the blended noise instance
+ * @param ws the world seed
+ * @param dim the dimension
+ * @return 0 on failure
+ */
+int initBlendedNoise(BlendedNoise *bn, uint64_t ws, int dim);
+
+/**
+ * Sample `base_3d_noise` using a blended noise instance.
+ *
+ * @param bn the blended noise instance
+ * @param x the world X-coordinate
+ * @param y the world Y-coordinate
+ * @param z the world Z-coordinate
+ * @return the sampled value
+ */
+double sampleBase3dNoise(BlendedNoise *bn, int x, int y, int z);
 
 #ifdef __cplusplus
 }
