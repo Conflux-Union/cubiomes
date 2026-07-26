@@ -40,6 +40,7 @@ enum StructureType
     Trail_Ruins,
     Trial_Chambers,
     Stronghold, // not like the other structures, but nice to have a constant for it
+    Nether_Fossil,
     FEATURE_NUM
 };
 
@@ -1343,4 +1344,3 @@ Pos getLargeStructurePos(StructureConfig config, uint64_t seed, int regX, int re
 #endif
 
 #endif // FINDERS_H_
-

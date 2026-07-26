@@ -315,6 +315,7 @@ const char* struct2str(int stype)
     case Trail_Ruins:       return "trail_ruins";
     case Trial_Chambers:    return "trial_chambers";
     case Stronghold:        return "stronghold";
+    case Nether_Fossil:     return "nether_fossil";
     case Fortress:          return "fortress";
     case Bastion:           return "bastion_remnant";
     case End_City:          return "end_city";
@@ -709,5 +710,4 @@ int savePPM(const char *path, const unsigned char *pixels, const unsigned int sx
     fclose(fp);
     return written != pixelsLen;
 }
-
 

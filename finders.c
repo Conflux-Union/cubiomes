@@ -142,6 +142,7 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
     s_fortress_115          = {        0, 16,  8, Fortress,         DIM_NETHER,0},
     s_fortress              = { 30084232, 27, 23, Fortress,         DIM_NETHER,0},
     s_bastion               = { 30084232, 27, 23, Bastion,          DIM_NETHER,0},
+    s_nether_fossil         = { 14357921,  2,  1, Nether_Fossil,    DIM_NETHER,0},
     s_end_city              = { 10387313, 20,  9, End_City,         DIM_END,0},
     // for the scattered return gateways
     s_end_gateway_115       = {    30000,  1,  1, End_Gateway,      DIM_END, 700},
@@ -210,6 +211,9 @@ int getStructureConfig(int structureType, int mc, StructureConfig *sconf)
         return mc >= MC_1_0;
     case Bastion:
         *sconf = s_bastion;
+        return mc >= MC_1_16_1;
+    case Nether_Fossil:
+        *sconf = s_nether_fossil;
         return mc >= MC_1_16_1;
     case End_Gateway:
         if      (mc <= MC_1_15) *sconf = s_end_gateway_115;
@@ -459,6 +463,7 @@ int getStructurePos(int structureType, int mc, uint64_t seed, int regX, int regZ
     case Ancient_City:
     case Trail_Ruins:
     case Trial_Chambers:
+    case Nether_Fossil:
         *pos = getFeaturePos(sconf, seed, regX, regZ);
         return 1;
 
@@ -2832,6 +2837,9 @@ int isViableFeatureBiome(int mc, int structureType, int biomeID)
         if (mc <= MC_1_15) return 0;
         return (biomeID == nether_wastes || biomeID == soul_sand_valley ||
                 biomeID == warped_forest || biomeID == crimson_forest);
+
+    case Nether_Fossil:
+        return mc >= MC_1_16_1 && biomeID == soul_sand_valley;
 
     case End_City:
         if (mc <= MC_1_8) return 0;
@@ -7919,5 +7927,4 @@ int getLargestRec(int match, const int *ids, int sx, int sz, Pos *p0, Pos *p1)
     free(meta);
     return ret;
 }
-
 
