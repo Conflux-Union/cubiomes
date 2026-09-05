@@ -2978,6 +2978,65 @@ static const uint64_t g_monument_biomes1 =
     (1ULL << warm_ocean) |
     (1ULL << deep_warm_ocean);
 
+int isViableNetherFossilPos(Generator *g, BlendedNoise *noise, int blockX, int blockZ)
+{
+    if (g->dim != DIM_NETHER || g->mc < MC_1_17)
+        return 0;
+
+    int cx = floordiv(blockX, 16), cz = floordiv(blockZ, 16);
+    uint64_t rng = chunkGenerateRnd(g->seed, cx, cz);
+    int x = cx * 16 + nextInt(&rng, 16);
+    int z = cz * 16 + nextInt(&rng, 16);
+    int startY = 32 + nextInt(&rng, 94);
+    int bx = g->mc <= MC_1_17 ? cx * 4 + 2 : floordiv(x, 4);
+    int bz = g->mc <= MC_1_17 ? cz * 4 + 2 : floordiv(z, 4);
+    if (getBiomeAt(g, 4, bx, 0, bz) != soul_sand_valley || startY <= 32)
+        return 0;
+
+    BlendedNoise local;
+    if (!noise)
+    {
+        initBlendedNoise(&local, g->seed, DIM_NETHER);
+        noise = &local;
+    }
+
+    // Default Nether base columns share the legacy noise seed and 4x8x4
+    // lattice across these versions. Carvers and surface blocks are not part
+    // of vanilla getBaseColumn(). Above sea level its only solid is netherrack.
+    double columns[2][2][17];
+    int a, b, i;
+    for (a = 0; a < 2; a++)
+        for (b = 0; b < 2; b++)
+            for (i = 4; i <= (startY >> 3) + 1; i++)
+            {
+                double d = sampleBase3dNoise(noise,
+                    (floordiv(x, 4) + a) * 4, i * 8,
+                    (floordiv(z, 4) + b) * 4);
+                d = clampedLerp((128 - i * 8) / 24.0, 0.9375, d);
+                columns[a][b][i] = clampedLerp((i * 8 + 8) / 32.0, 2.5, d);
+            }
+
+    int aboveAir = 0, y;
+    for (y = startY; y >= 32; y--)
+    {
+        i = y >> 3;
+        // Vanilla interpolates Y, then X, then Z before squeezing density.
+        // Squeezing is sign-preserving; doing it at the corners instead would
+        // move air/solid boundaries and incorrectly reject real structures.
+        double d = lerp3((y & 7) / 8.0, (x & 3) / 4.0, (z & 3) / 4.0,
+            columns[0][0][i], columns[0][0][i+1],
+            columns[1][0][i], columns[1][0][i+1],
+            columns[0][1][i], columns[0][1][i+1],
+            columns[1][1][i], columns[1][1][i+1]);
+        if (aboveAir && d > 0)
+            // 1.17 keeps the air Y; 1.18+ decrements to the supporting block
+            // before checking against sea level. A floor at Y=32 differs.
+            return y + (g->mc <= MC_1_17) > 32;
+        aboveAir = d <= 0;
+    }
+    return 0;
+}
+
 int isViableStructurePos(int structureType, Generator *g, int x, int z, uint32_t flags)
 {
     int approx = 0; // enables approximation levels
@@ -2995,6 +3054,8 @@ int isViableStructurePos(int structureType, Generator *g, int x, int z, uint32_t
 
     if (g->dim == DIM_NETHER)
     {
+        if (structureType == Nether_Fossil && g->mc >= MC_1_17)
+            return isViableNetherFossilPos(g, NULL, x, z);
         if (structureType == Fortress && g->mc <= MC_1_17)
             return 1;
         if (g->mc <= MC_1_15)
@@ -7927,4 +7988,3 @@ int getLargestRec(int match, const int *ids, int sx, int sz, Pos *p0, Pos *p1)
     free(meta);
     return ret;
 }
-

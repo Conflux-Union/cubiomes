@@ -834,6 +834,13 @@ static inline uint64_t getShadow(uint64_t seed)
  */
 int isViableStructurePos(int structType, Generator *g, int blockX, int blockZ, uint32_t flags);
 
+/* Checks the default Nether fossil anchor biome and base terrain (1.17+).
+ * Pass a DIM_NETHER BlendedNoise initialized for g->seed to reuse its octaves,
+ * or NULL to initialize them for this call. Coordinates identify the attempt
+ * chunk, as returned by getStructurePos(), not the random fossil anchor.
+ */
+int isViableNetherFossilPos(Generator *g, BlendedNoise *noise, int blockX, int blockZ);
+
 /* Checks if the specified structure type could generate in the given biome.
  */
 int isViableFeatureBiome(int mc, int structureType, int biomeID);
