@@ -1708,10 +1708,32 @@ enum {
     MODERN_MAX_CELL_Y = 40,
     MODERN_COLUMN_SIZE = MODERN_MAX_CELL_Y - MODERN_MIN_CELL_Y + 1,
     MODERN_COLUMN_CACHE_LIMIT = 70000,
+    /*
+     * Quart cells searched below the noise-free density-zero crossing before the
+     * search gives up and sweeps the remainder above the band. The crossing sits
+     * within about two cells of the true first solid (3D-noise deviation,
+     * measured over 3000 columns), one cell of scan granularity below it at
+     * worst, and the four-column spline blend adds a couple more - well under
+     * six cells of combined worst case, so twelve leaves 2x headroom on top.
+     * A band of four cleared the measured deviation and still flipped coastal
+     * shelves in the tile visual corpus, which is what this margin answers.
+     */
+    MODERN_SURFACE_SEARCH_BAND = 16,
 };
 
 typedef struct {
     double density[MODERN_COLUMN_SIZE];
+    /* Column-constant density terms, filled on first use. */
+    double offset, factor, jagged;
+    int paramsReady;
+    /*
+     * Solved cells always form one contiguous index range [computed, topSolved);
+     * the empty column is computed = MODERN_COLUMN_SIZE, topSolved = 0. Reads
+     * extend the range toward whichever side they fall on, so any access order
+     * hits solved cells (see ensureModernColumnCells).
+     */
+    int computed;
+    int topSolved;
 } ModernTerrainColumn;
 
 static double applyModernSurfaceSlides(double density, int blockY)
@@ -1722,30 +1744,74 @@ static double applyModernSurfaceSlides(double density, int blockY)
     return clampedLerp(alpha, 0.1171875, density);
 }
 
-static void sampleModernTerrainColumn(
-    ModernTerrainColumn *column, const BiomeNoise *bn, int cellX, int cellZ)
+static void initModernTerrainColumn(ModernTerrainColumn *column)
 {
-    const int blockX = cellX * 4;
-    const int blockZ = cellZ * 4;
-    float values[4];
-    sampleTerrainParameters(bn, cellX, cellZ, values);
-    const double offset = -0.50375F + getSpline(bn->sp, values);
-    const double factor = getSpline(bn->factorSp, values);
-    const double jaggedness = getSpline(bn->jaggedSp, values);
-    double jagged = sampleDoublePerlin(&bn->jagged,
-        blockX * 1500.0, 0.0, blockZ * 1500.0);
-    if (jagged < 0.0)
-        jagged *= 0.5;
-    jagged *= jaggedness;
+    column->paramsReady = 0;
+    column->computed = MODERN_COLUMN_SIZE;
+    column->topSolved = 0;
+}
 
-    int cellY;
-    for (cellY = MODERN_MIN_CELL_Y; cellY <= MODERN_MAX_CELL_Y; cellY++)
+/*
+ * Solves the column's density cells on demand and keeps the solved set a
+ * contiguous range, so a read never touches an unsolved cell regardless of the
+ * caller's direction. Descending readers (the banded surface search, the fluid
+ * scan) extend the range downward one read at a time, which is what skips the
+ * never-read cells above the band start and below the surface. A reader above
+ * the range - the band-empty fallback, which sweeps back down from the build
+ * limit - extends it upward across the whole gap, paying that rare column the
+ * full remaining sweep. Each solved cell evaluates exactly what the old
+ * full-column sweep did, so values are bit-identical; only never-read cells
+ * drop out.
+ */
+static void ensureModernColumnCells(
+    ModernTerrainColumn *column, const BiomeNoise *bn, int cellX, int cellZ,
+    int cellY)
+{
+    if (!column->paramsReady)
     {
-        const int blockY = cellY * 8;
+        const int blockX = cellX * 4;
+        const int blockZ = cellZ * 4;
+        float values[4];
+        sampleTerrainParameters(bn, cellX, cellZ, values);
+        column->offset = -0.50375F + getSpline(bn->sp, values);
+        column->factor = getSpline(bn->factorSp, values);
+        const double jaggedness = getSpline(bn->jaggedSp, values);
+        double jagged = sampleDoublePerlin(&bn->jagged,
+            blockX * 1500.0, 0.0, blockZ * 1500.0);
+        if (jagged < 0.0)
+            jagged *= 0.5;
+        column->jagged = jagged * jaggedness;
+        column->paramsReady = 1;
+    }
+    const int need = cellY - MODERN_MIN_CELL_Y;
+    if (need >= column->computed && need + 1 < column->topSolved)
+        return; /* both cells the read touches are already solved */
+    int low, high;
+    if (need < column->computed)
+    {
+        /* Below the solved range: extend downward, solving only the cells this
+         * read reaches (a first touch solves just its own two cells). */
+        low = need;
+        high = column->computed < need + 2 ? column->computed : need + 2;
+        column->computed = need;
+    }
+    else
+    {
+        /* At or above the solved range's top: the read's upper cell is unsolved,
+         * so bridge the whole gap upward to keep the range contiguous. */
+        low = column->topSolved;
+        high = need + 2;
+    }
+    if (high > column->topSolved)
+        column->topSolved = high;
+    int idx;
+    for (idx = low; idx < high; idx++)
+    {
+        const int blockY = (idx + MODERN_MIN_CELL_Y) * 8;
         const double density = sampleFinalTerrainDensity(
-            bn, blockX, blockY, blockZ, offset, factor, jagged);
-        column->density[cellY - MODERN_MIN_CELL_Y] =
-            applyModernSurfaceSlides(density, blockY);
+            bn, cellX * 4, blockY, cellZ * 4,
+            column->offset, column->factor, column->jagged);
+        column->density[idx] = applyModernSurfaceSlides(density, blockY);
     }
 }
 
@@ -1813,13 +1879,19 @@ static double sampleInterpolatedNoodle(
 }
 
 static double sampleModernBaseDensity(
-    const ModernTerrainColumn *column00,
-    const ModernTerrainColumn *column01,
-    const ModernTerrainColumn *column10,
-    const ModernTerrainColumn *column11,
+    ModernTerrainColumn *column00,
+    ModernTerrainColumn *column01,
+    ModernTerrainColumn *column10,
+    ModernTerrainColumn *column11,
+    const BiomeNoise *bn,
+    int cellX, int cellZ,
     int cellY,
     double dx, double dy, double dz)
 {
+    ensureModernColumnCells(column00, bn, cellX, cellZ, cellY);
+    ensureModernColumnCells(column01, bn, cellX, cellZ + 1, cellY);
+    ensureModernColumnCells(column10, bn, cellX + 1, cellZ, cellY);
+    ensureModernColumnCells(column11, bn, cellX + 1, cellZ + 1, cellY);
     const int index = cellY - MODERN_MIN_CELL_Y;
     double density = lerp3(dy, dx, dz,
         column00->density[index], column00->density[index+1],
@@ -1832,16 +1904,16 @@ static double sampleModernBaseDensity(
 
 static double sampleModernFinalDensity(
     const BiomeNoise *bn,
-    const ModernTerrainColumn *column00,
-    const ModernTerrainColumn *column01,
-    const ModernTerrainColumn *column10,
-    const ModernTerrainColumn *column11,
+    ModernTerrainColumn *column00,
+    ModernTerrainColumn *column01,
+    ModernTerrainColumn *column10,
+    ModernTerrainColumn *column11,
     int cellX, int cellY, int cellZ,
     double dx, double dy, double dz)
 {
     const double density = sampleModernBaseDensity(
         column00, column01, column10, column11,
-        cellY, dx, dy, dz);
+        bn, cellX, cellZ, cellY, dx, dy, dz);
     const double noodle = sampleInterpolatedNoodle(
         bn, cellX, cellY, cellZ, dx, dy, dz);
     return density < noodle ? density : noodle;
@@ -1945,6 +2017,39 @@ static int estimateModernSurfaceHeight(
             return blockY;
     }
     return INT32_MAX;
+}
+
+/*
+ * Density-zero crossing of the same noise-free column model, at the search's own
+ * solidity threshold. estimateModernSurfaceHeight's 0.390625 threshold sits
+ * 0.39*128/factor blocks below the density-zero surface - a cell or two at
+ * typical spline factors but dozens of cells on low-factor shelves, which made
+ * a band start derived from it land inside the ground and read a solid far
+ * under the true surface. The zero crossing carries no factor-dependent bias,
+ * so a small fixed band above it covers the 3D-noise deviation (measured within
+ * two quart cells) and the four-column spline blend.
+ */
+static int estimateModernSurfaceCrossing(
+    const BiomeNoise *bn, int blockX, int blockZ)
+{
+    const int cellX = floordiv(blockX, 4);
+    const int cellZ = floordiv(blockZ, 4);
+    float values[4];
+    sampleTerrainParameters(bn, cellX, cellZ, values);
+    const double offset = -0.50375F + getSpline(bn->sp, values);
+    const double factor = getSpline(bn->factorSp, values);
+    int blockY;
+    for (blockY = 320; blockY >= -64; blockY -= 8)
+    {
+        const double depth = 1.0 - blockY/128.0 + offset;
+        const double scaledDepth = depth * factor;
+        double density = scaledDepth < 0.0 ? scaledDepth : 4.0*scaledDepth;
+        density = clampValue(density - 0.703125, -64.0, 64.0);
+        density = applyModernSurfaceSlides(density, blockY);
+        if (density > 0.0)
+            return blockY;
+    }
+    return INT32_MIN;
 }
 
 static int aquiferDeepDark(
@@ -2263,17 +2368,21 @@ static void initAquiferCache(
         cache->centers = (AquiferCenter*) calloc(count, sizeof(AquiferCenter));
 }
 
-static int findModernTerrainSurface(
+/*
+ * Top-down surface search over the inclusive cell range [cellFrom, cellTo].
+ * Returns the first solid block, or INT32_MIN when the range holds none.
+ */
+static int findModernTerrainSurfaceInBand(
     const BiomeNoise *bn,
-    const ModernTerrainColumn *column00,
-    const ModernTerrainColumn *column01,
-    const ModernTerrainColumn *column10,
-    const ModernTerrainColumn *column11,
-    int cellX, int cellZ, double dx, double dz)
+    ModernTerrainColumn *column00,
+    ModernTerrainColumn *column01,
+    ModernTerrainColumn *column10,
+    ModernTerrainColumn *column11,
+    int cellX, int cellZ, double dx, double dz,
+    int cellFrom, int cellTo)
 {
     int cellY;
-    for (cellY = MODERN_MAX_CELL_Y - 1;
-         cellY >= MODERN_MIN_CELL_Y; cellY--)
+    for (cellY = cellFrom; cellY >= cellTo; cellY--)
     {
         int y;
         for (y = 7; y >= 0; y--)
@@ -2281,13 +2390,48 @@ static int findModernTerrainSurface(
             const double dy = y / 8.0;
             const double density = sampleModernBaseDensity(
                 column00, column01, column10, column11,
-                cellY, dx, dy, dz);
+                bn, cellX, cellZ, cellY, dx, dy, dz);
             if (density > 0.0 && sampleInterpolatedNoodle(
                     bn, cellX, cellY, cellZ, dx, dy, dz) > 0.0)
                 return cellY * 8 + y;
         }
     }
-    return -64;
+    return INT32_MIN;
+}
+
+static int findModernTerrainSurface(
+    const BiomeNoise *bn,
+    ModernTerrainColumn *column00,
+    ModernTerrainColumn *column01,
+    ModernTerrainColumn *column10,
+    ModernTerrainColumn *column11,
+    int cellX, int cellZ, double dx, double dz)
+{
+    /*
+     * The noise-free density-zero crossing (estimateModernSurfaceCrossing, ~1us)
+     * lands within two quart cells of the true first solid, so the search starts
+     * one band above the crossing instead of at the build limit and skips most of
+     * the air column. If the band holds no solid at all, the remainder above the
+     * band is swept too, preserving the full scan's answer; the only divergence
+     * left is a solid floating above crossing+band, which the measurement never
+     * observed.
+     */
+    int startCell = floordiv(
+        estimateModernSurfaceCrossing(bn, cellX * 4, cellZ * 4), 8)
+        + MODERN_SURFACE_SEARCH_BAND;
+    if (startCell > MODERN_MAX_CELL_Y - 1)
+        startCell = MODERN_MAX_CELL_Y - 1;
+    if (startCell < MODERN_MIN_CELL_Y)
+        startCell = MODERN_MIN_CELL_Y;
+    const int found = findModernTerrainSurfaceInBand(
+        bn, column00, column01, column10, column11,
+        cellX, cellZ, dx, dz, startCell, MODERN_MIN_CELL_Y);
+    if (found != INT32_MIN)
+        return found;
+    const int above = findModernTerrainSurfaceInBand(
+        bn, column00, column01, column10, column11,
+        cellX, cellZ, dx, dz, MODERN_MAX_CELL_Y - 1, startCell + 1);
+    return above != INT32_MIN ? above : -64;
 }
 
 static int findModernTerrainSurfaceUncached(
@@ -2298,10 +2442,10 @@ static int findModernTerrainSurfaceUncached(
     const double dx = (blockX - cellX*4) / 4.0;
     const double dz = (blockZ - cellZ*4) / 4.0;
     ModernTerrainColumn columns[4];
-    sampleModernTerrainColumn(columns + 0, bn, cellX, cellZ);
-    sampleModernTerrainColumn(columns + 1, bn, cellX, cellZ+1);
-    sampleModernTerrainColumn(columns + 2, bn, cellX+1, cellZ);
-    sampleModernTerrainColumn(columns + 3, bn, cellX+1, cellZ+1);
+    initModernTerrainColumn(columns + 0);
+    initModernTerrainColumn(columns + 1);
+    initModernTerrainColumn(columns + 2);
+    initModernTerrainColumn(columns + 3);
     return findModernTerrainSurface(bn,
         columns + 0, columns + 1, columns + 2, columns + 3,
         cellX, cellZ, dx, dz);
@@ -2309,10 +2453,10 @@ static int findModernTerrainSurfaceUncached(
 
 static int resolveModernFluidSurface(
     AquiferCache *aquifer,
-    const ModernTerrainColumn *column00,
-    const ModernTerrainColumn *column01,
-    const ModernTerrainColumn *column10,
-    const ModernTerrainColumn *column11,
+    ModernTerrainColumn *column00,
+    ModernTerrainColumn *column01,
+    ModernTerrainColumn *column10,
+    ModernTerrainColumn *column11,
     int blockX, int blockZ, int solidY)
 {
     const int cellX = floordiv(blockX, 4);
@@ -2360,10 +2504,9 @@ static int mapOverworldTerrainHeightBlocksImpl(
     int i, j;
     if (columns)
     {
-        for (j = 0; j < cellH; j++)
-            for (i = 0; i < cellW; i++)
-                sampleModernTerrainColumn(columns + (size_t)j*cellW+i,
-                    bn, minCellX+i, minCellZ+j);
+        size_t index;
+        for (index = 0; index < cellCount; index++)
+            initModernTerrainColumn(columns + index);
     }
     AquiferCache aquifer;
     if (fluidY)
@@ -2390,11 +2533,10 @@ static int mapOverworldTerrainHeightBlocksImpl(
                     else
                     {
                         ModernTerrainColumn local[4];
-                        const int localCellX = floordiv(sampleX, 4);
-                        sampleModernTerrainColumn(local + 0, bn, localCellX, cellZ);
-                        sampleModernTerrainColumn(local + 1, bn, localCellX, cellZ+1);
-                        sampleModernTerrainColumn(local + 2, bn, localCellX+1, cellZ);
-                        sampleModernTerrainColumn(local + 3, bn, localCellX+1, cellZ+1);
+                        initModernTerrainColumn(local + 0);
+                        initModernTerrainColumn(local + 1);
+                        initModernTerrainColumn(local + 2);
+                        initModernTerrainColumn(local + 3);
                         fluidY[j*w+i] = resolveModernFluidSurface(
                             &aquifer, local + 0, local + 1, local + 2, local + 3,
                             sampleX, sampleZ, y[j*w+i]);
@@ -2406,9 +2548,9 @@ static int mapOverworldTerrainHeightBlocksImpl(
             const double dx = (sampleX - cellX*4) / 4.0;
             const int offsetX = cellX - minCellX;
             const int offsetZ = cellZ - minCellZ;
-            const ModernTerrainColumn *column00 = columns
+            ModernTerrainColumn *column00 = columns
                 + (size_t)offsetZ*cellW + offsetX;
-            const ModernTerrainColumn *column01 = column00 + cellW;
+            ModernTerrainColumn *column01 = column00 + cellW;
             y[j*w+i] = findModernTerrainSurface(bn,
                 column00, column01, column00+1, column01+1,
                 cellX, cellZ, dx, dz);
