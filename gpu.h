@@ -3,16 +3,18 @@
 
 /*
  * Optional OpenCL GPU execution for the 1.18+ Overworld climate biome
- * sampling. The GPU engine mirrors mapOverworldSurfaceBiome() + depth-aware
- * sampleBiomeNoise() semantics exactly (the depth channel included); a parity
- * harness (gpu_test.c, `make gpu-test`) gates every change as bit-exact
+ * sampling and the terrain overview heights. The GPU engine mirrors
+ * mapOverworldSurfaceBiome() + depth-aware sampleBiomeNoise() and
+ * mapOverworldTerrainHeight() semantics exactly; a parity harness
+ * (gpu_test.c, `make gpu-test`) gates every change as bit-exact
  * against the CPU reference. The engine is a pure executor: it never applies
  * an approximation, and any CPU/GPU mismatch is a defect to fix, never a
  * tolerance to accept.
  *
  * Tables are packed from the live Generator/BiomeNoise structs (perm tables,
  * per-octave noise parameters, spline trees, biome tree), so all 1.18+
- * versions come free without per-version hardcoded tables in this layer.
+ * versions come free without per-version hardcoded tables in this layer. One
+ * packed table set serves both the biome and the height kernel.
  *
  * Thread model: one process-global engine with ONE command queue. A mutex
  * serializes submit+read around each dispatch, so concurrent callers queue up
@@ -24,12 +26,13 @@
  * GPU when available and silently falls back to the CPU otherwise; "off"
  * never touches the GPU; "force" is a debug aid that reports loudly when the
  * GPU is unavailable. Read-only queries (gpuGetMode/gpuAvailable) never fail
- * because of the GPU; the dispatch below returns nonzero on a GPU error and
- * latches the engine dead for the process so later calls fall back too.
+ * because of the GPU; the dispatches below return nonzero on a GPU error and
+ * latch the engine dead for the process so later calls fall back too.
  *
  * Transparent dispatch: when a consumer builds this module together with
  * CUBIOMES_ENABLE_GPU, mapOverworldSurfaceBiome() (biomenoise.c) tries the
- * GPU hook below before its CPU body. The generic flat-Y queries
+ * GPU hook below before its CPU body, and so does mapOverworldTerrainHeight()
+ * for the terrain overview heights. The generic flat-Y queries
  * (genBiomes()/getBiomeAt()) deliberately stay on the CPU: the kernel derives
  * the terrain surface per column, which is a different contract than the
  * caller-chosen Y of those queries.
@@ -67,8 +70,14 @@ const char *gpuDeviceName(void);
 
 /* Number of surface-biome dispatches the engine has completed successfully
  * (kernel run + results read back), process-global. Diagnostic aid for
- * verifying that a code path actually engaged the GPU. */
+ * verifying that a code path actually engaged the GPU. Height dispatches are
+ * counted separately by gpuHeightDispatchCount(). */
 uint64_t gpuDispatchCount(void);
+
+/* Number of terrain-height dispatches the engine has completed
+ * successfully, process-global. Diagnostic aid, same contract as
+ * gpuDispatchCount(). */
+uint64_t gpuHeightDispatchCount(void);
 
 /*
  * The guarded GPU dispatch behind mapOverworldSurfaceBiome() when compiled
@@ -93,5 +102,21 @@ int gpuTrySurfaceBiomeHook(int *out, const BiomeNoise *bn, uint64_t sha,
  */
 int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
     int scale, int x, int z, int w, int h, int64_t *np);
+
+/*
+ * The guarded GPU dispatch behind mapOverworldTerrainHeight() when compiled
+ * with CUBIOMES_ENABLE_GPU, the height-path twin of
+ * gpuTrySurfaceBiomeHook(). Returns 0 only when the GPU served the whole
+ * area (identical to the CPU result): y[] receives the quart-scale surface
+ * heights and, when ids is non-NULL, ids[] the surface-biome ids at the
+ * clamped surface, both bit-exact. Returns nonzero whenever the caller must
+ * run the CPU path - unsupported arguments (NULL y, non-positive or oversized
+ * area, a BiomeNoise not fully initialized by setBiomeSeed(), pre-1.18
+ * versions), disabled/dead engine, or any GPU error. Block-scale strided
+ * height queries (mapOverworldTerrainHeightBlocks and friends) are not
+ * covered and stay on the CPU.
+ */
+int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
+    int x, int z, int w, int h);
 
 #endif

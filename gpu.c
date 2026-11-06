@@ -1,9 +1,11 @@
 /*
- * GPU engine for the 1.18+ Overworld surface biome map, see gpu.h.
+ * GPU engine for the 1.18+ Overworld surface biome map and the terrain
+ * overview heights, see gpu.h.
  *
  * One process-global engine: dlopen'd OpenCL runtime (opencl_host.c), the
- * kernel source (gpu_cl_kernels.h), tables packed from the live generator
- * structs, and the dispatch mirroring mapOverworldSurfaceBiome(). Everything
+ * kernel sources (gpu_cl_kernels.h), tables packed from the live generator
+ * structs, and the dispatches mirroring mapOverworldSurfaceBiome() and
+ * mapOverworldTerrainHeight(). Everything
  * that can fail resolves to "unavailable" and the caller falls back to the
  * CPU; a runtime GPU error latches the engine dead for the process.
  */
@@ -95,18 +97,19 @@ typedef struct
     int dead;
     int forceWarned;
     GpuCl cl;
+    cl_kernel kHeight;  // terrainHeightKernel, created from the built program
     size_t localSize;
     GpuTables tables;
-    uint64_t keySha;
     uint64_t keyProbe;
     int keyMc;
     int haveKey;
     int keyFailed;
     uint64_t dispatchCount;
+    uint64_t heightCount;
     cl_mem mPerm, mPinfo, mNoff, mNamp;
     cl_mem mStyp, mSlen, mSloc, mSder, mSchild;
     cl_mem mSteps, mParam, mNodes;
-    cl_mem mOutNp, mOutId;
+    cl_mem mOutNp, mOutId, mOutY;
     int outCap;
 } GpuEngine;
 
@@ -119,13 +122,13 @@ static GpuEngine g_gpu =
 #endif
     -1, GPU_MODE_AUTO, 0,
     0, 0, 0, 0,
-    {{0}}, 64,
+    {{0}}, NULL, 64,
     {0},
     0, 0, 0, 0, 0, 0,
     NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL, NULL,
     NULL, NULL, NULL,
-    NULL, NULL, 0,
+    NULL, NULL, NULL, 0,
 };
 
 static void gpuClErr(GpuEngine *e, cl_int err, const char *what)
@@ -179,8 +182,11 @@ static void gpuReleaseOut(GpuEngine *e)
         e->cl.fn.ReleaseMemObject(e->mOutNp);
     if (e->mOutId)
         e->cl.fn.ReleaseMemObject(e->mOutId);
+    if (e->mOutY)
+        e->cl.fn.ReleaseMemObject(e->mOutY);
     e->mOutNp = NULL;
     e->mOutId = NULL;
+    e->mOutY = NULL;
     e->outCap = 0;
 }
 
@@ -255,9 +261,23 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
         e->clAvail = 0;
         return;
     }
+    cl_int err = CL_SUCCESS;
+    e->kHeight = e->cl.fn.CreateKernel(e->cl.program, "terrainHeightKernel",
+        &err);
+    if (!e->kHeight || err != CL_SUCCESS)
+    {
+        e->clAvail = 0;
+        return;
+    }
+    // One local size serves both kernels: the smaller workgroup limit wins.
     size_t wg = 0;
     e->cl.fn.GetKernelWorkGroupInfo(e->cl.kernel, e->cl.device,
         CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL);
+    size_t wgh = 0;
+    e->cl.fn.GetKernelWorkGroupInfo(e->kHeight, e->cl.device,
+        CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgh), &wgh, NULL);
+    if (wgh > 0 && (wg == 0 || wgh < wg))
+        wg = wgh;
     if (wg > 0)
         e->localSize = wg < GPU_LOCAL_SIZE_MAX ? wg : GPU_LOCAL_SIZE_MAX;
 }
@@ -563,15 +583,22 @@ static uint64_t gpuTableProbe(const BiomeNoise *bn)
     return h;
 }
 
-static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn, uint64_t sha)
+/*
+ * Cache-key guard for the packed tables. The key is (mc, probe): the probe
+ * witnesses the seed-derived table state, and every state change a reseed or
+ * a large-biomes flip can produce shows up in the probed channels. The seed
+ * hash is deliberately not part of the key - it derives from the seed just
+ * like the tables do, so the probe already separates the states, and the
+ * height dispatch has no sha argument to offer (its entry point is
+ * sha-free), which must not evict a biome dispatch's tables or vice versa.
+ */
+static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn)
 {
     uint64_t probe = gpuTableProbe(bn);
-    if (e->haveKey && e->keyMc == bn->mc && e->keySha == sha
-        && e->keyProbe == probe)
+    if (e->haveKey && e->keyMc == bn->mc && e->keyProbe == probe)
         return e->tables.valid && !e->keyFailed;
     gpuReleasePack(e);
     e->keyMc = bn->mc;
-    e->keySha = sha;
     e->keyProbe = probe;
     e->haveKey = 1;
     if (packTables(&e->tables, bn))
@@ -637,6 +664,14 @@ uint64_t gpuDispatchCount(void)
     return count;
 }
 
+uint64_t gpuHeightDispatchCount(void)
+{
+    GPU_LOCK;
+    uint64_t count = g_gpu.heightCount;
+    GPU_UNLOCK;
+    return count;
+}
+
 static int gpuSurfaceBiomeAvailable(const BiomeNoise *bn)
 {
     if (!bn || bn->nptype >= 0 || bn->mc < MC_1_18)
@@ -667,10 +702,60 @@ static int gpuEnsureOutLocked(GpuEngine *e, int points)
     if (e->mOutNp)
         e->mOutId = gpuBuf(e, CL_MEM_READ_WRITE,
             sizeof(int) * (size_t)points, NULL);
-    if (!e->mOutId)
+    if (e->mOutId)
+        e->mOutY = gpuBuf(e, CL_MEM_READ_WRITE,
+            sizeof(float) * (size_t)points, NULL);
+    if (!e->mOutY)
         return 1;
     e->outCap = points;
     return 0;
+}
+
+/*
+ * The packed-table arguments shared by both kernels, in their common prefix
+ * order. *a is the running argument index; it is advanced past the table
+ * args. Returns CL_SUCCESS or the first argument error seen.
+ */
+static cl_int gpuSetTableArgsLocked(cl_kernel k, cl_uint *a)
+{
+    cl_int err = CL_SUCCESS;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mPerm);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mPinfo);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNoff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNamp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mStyp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSlen);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSloc);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSder);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSchild);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootSp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootFactor);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootJagged);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSteps);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mParam);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNodes);
+    cl_uint btLen = g_gpu.tables.btLen;
+    cl_uint btOrder = g_gpu.tables.btOrder;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btLen);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btOrder);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snXZScale);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snYScale);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snXZFactor);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snYFactor);
+    cl_int octMinOff = g_gpu.tables.octMinOff;
+    cl_int octMaxOff = g_gpu.tables.octMaxOff;
+    cl_int octMainOff = g_gpu.tables.octMainOff;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMinOff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMaxOff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMainOff);
+    return err;
 }
 
 /*
@@ -705,7 +790,7 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
         GPU_UNLOCK;
         return 1;
     }
-    if (!gpuPackForLocked(&g_gpu, bn, sha))
+    if (!gpuPackForLocked(&g_gpu, bn))
     {
         GPU_UNLOCK;
         return 1;
@@ -720,42 +805,7 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
     cl_kernel k = g_gpu.cl.kernel;
     cl_int err = CL_SUCCESS;
     cl_uint a = 0;
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mPerm);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mPinfo);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mNoff);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mNamp);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mStyp);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mSlen);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mSloc);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mSder);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mSchild);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int),
-        &g_gpu.tables.rootSp);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int),
-        &g_gpu.tables.rootFactor);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int),
-        &g_gpu.tables.rootJagged);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mSteps);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mParam);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mNodes);
-    cl_uint btLen = g_gpu.tables.btLen;
-    cl_uint btOrder = g_gpu.tables.btOrder;
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_uint), &btLen);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_uint), &btOrder);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(double),
-        &g_gpu.tables.snXZScale);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(double),
-        &g_gpu.tables.snYScale);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(double),
-        &g_gpu.tables.snXZFactor);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(double),
-        &g_gpu.tables.snYFactor);
-    cl_int octMinOff = g_gpu.tables.octMinOff;
-    cl_int octMaxOff = g_gpu.tables.octMaxOff;
-    cl_int octMainOff = g_gpu.tables.octMainOff;
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &octMinOff);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &octMaxOff);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &octMainOff);
+    err |= gpuSetTableArgsLocked(k, &a);
     cl_int modeArg = scale == 1 ? 1 : 0;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &modeArg);
     cl_int originX = x, originZ = z, width = w, height = h;
@@ -810,4 +860,95 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
     if (!g || g->dim != DIM_OVERWORLD)
         return 1;
     return gpuSurfaceBiomeDispatch(out, &g->bn, sha, scale, x, z, w, h, np);
+}
+
+/*
+ * The one guarded terrain-height dispatch behind gpuTryHeightHook, the
+ * height-path twin of gpuSurfaceBiomeDispatch. Rejects unsupported arguments
+ * and engine states, reuses the packed tables and the same guard semantics;
+ * a GPU error latches the engine dead here too. Heights are quart-scale like
+ * the CPU reference, so there is no scale/sha argument; ids are optional.
+ */
+static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
+    int x, int z, int w, int h)
+{
+    if (!y || !bn || w <= 0 || h <= 0 || (int64_t)w * h > GPU_MAX_POINTS)
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+
+    GPU_LOCK;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    gpuEnsureRuntimeLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    // Same packed tables and cache entry as the biome dispatch: one pack per
+    // generator state serves both kernels.
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    int points = w * h;
+    if (gpuEnsureOutLocked(&g_gpu, points))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = g_gpu.kHeight;
+    cl_int err = CL_SUCCESS;
+    cl_uint a = 0;
+    err |= gpuSetTableArgsLocked(k, &a);
+    cl_int wantIds = ids != NULL;
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &wantIds);
+    cl_int originX = x, originZ = z, width = w, height = h;
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &originX);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &originZ);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &width);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &height);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutY);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutId);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    size_t global = ((size_t)points + g_gpu.localSize - 1) / g_gpu.localSize
+        * g_gpu.localSize;
+    err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 1, NULL,
+        &global, &g_gpu.localSize, 0, NULL, NULL);
+    if (err == CL_SUCCESS)
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutY,
+            CL_TRUE, 0, sizeof(float) * (size_t)points, y, 0, NULL, NULL);
+    if (err == CL_SUCCESS && ids)
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutId,
+            CL_TRUE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "gpu height dispatch");
+        GPU_UNLOCK;
+        return 1;
+    }
+    g_gpu.heightCount++;
+    GPU_UNLOCK;
+    return 0;
+}
+
+int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
+    int x, int z, int w, int h)
+{
+    return gpuHeightDispatch(y, ids, bn, x, z, w, h);
 }

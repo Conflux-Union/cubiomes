@@ -1,6 +1,6 @@
 /*
- * CPU-vs-GPU parity harness for the 1.18+ Overworld surface biome GPU
- * engine (gpu.c). Build and run via `make gpu-test`.
+ * CPU-vs-GPU parity harness for the 1.18+ Overworld surface biome and
+ * terrain-height GPU engine (gpu.c). Build and run via `make gpu-test`.
  *
  * The CPU side is the reference itself: the real mapOverworldSurfaceBiome()
  * wrapper guards the harness's own replication (which additionally exposes
@@ -16,6 +16,14 @@
  * (quart 7.5M) x scale {1, 4} dense x scale-4 strided rows). Each case prints
  * its header before it runs and its timing after, so a stall names the case
  * and the phase that caused it.
+ *
+ * Height sections exercise the terrain overview heights the same way: the
+ * guarded dispatch (gpuTryHeightHook) against the CPU reference over the
+ * consumer query shapes (dense quart maps, the mod's strided overview rows,
+ * 4x4 chunk tiles, isolated single columns), the transparent
+ * mapOverworldTerrainHeight()/mapApproxHeight() entries in off/auto/force
+ * with engagement counting, and a row-vs-isolated shape-invariance case.
+ * Heights and the ids at the surface are compared bit-exact.
  *
  * A transparent-path section exercises the public mapOverworldSurfaceBiome()
  * entry (the guarded GPU hook) in off/auto/force modes: every pass must match
@@ -81,6 +89,23 @@ static int64_t npDelta(int64_t a, int64_t b)
 }
 
 /*
+ * CPU height reference. mapOverworldTerrainHeight() is transparently
+ * GPU-accelerated when CUBIOMES_ENABLE_GPU is compiled in, so the reference
+ * pins the engine off around the call to stay a pure-CPU golden.
+ */
+static double cpuHeightRef(float *y, int *ids, const BiomeNoise *bn,
+    int x, int z, int w, int h)
+{
+    const int modeBefore = gpuGetMode();
+    gpuSetMode(GPU_MODE_OFF);
+    double t0 = nowSeconds();
+    mapOverworldTerrainHeight(y, ids, bn, x, z, w, h);
+    double t1 = nowSeconds();
+    gpuSetMode(modeBefore);
+    return t1 - t0;
+}
+
+/*
  * Replication of mapOverworldSurfaceBiome() that also exposes the climate
  * np values per point. Uses the same public primitives as the wrapper
  * (mapOverworldTerrainHeight, floordiv, voronoiAccess3D, sampleBiomeNoise).
@@ -96,7 +121,7 @@ static void cpuSurfaceBiomeRef(int *out, int64_t *np, const BiomeNoise *bn,
             fprintf(stderr, "gpu-test: out of memory\n");
             exit(2);
         }
-        mapOverworldTerrainHeight(height, 0, bn, x, z, w, h);
+        cpuHeightRef(height, 0, bn, x, z, w, h);
         for (int j = 0; j < h; j++)
         {
             for (int i = 0; i < w; i++)
@@ -124,7 +149,7 @@ static void cpuSurfaceBiomeRef(int *out, int64_t *np, const BiomeNoise *bn,
         fprintf(stderr, "gpu-test: out of memory\n");
         exit(2);
     }
-    mapOverworldTerrainHeight(height, 0, bn, x4min, z4min, sw, sh);
+    cpuHeightRef(height, 0, bn, x4min, z4min, sw, sh);
     for (int j = 0; j < h; j++)
     {
         const int blockZ = z + j;
@@ -159,6 +184,7 @@ typedef struct
     long long pts;
     long long idMismatch;
     long long npMismatch;
+    long long heightMismatch;
     int64_t maxNpDelta;
     long long refReplicationMismatch;
     double tWrap, tRef, tGpu;
@@ -584,6 +610,321 @@ static void runTransparentReseedCase(int mc, uint32_t flags, uint64_t seedA,
         *fail = 1;
 }
 
+//----------------------------------------------------------------------
+// Terrain overview heights: the guarded dispatch (gpuTryHeightHook) and the
+// transparent mapOverworldTerrainHeight()/mapApproxHeight() entries, against
+// the pure-CPU reference (cpuHeightRef pins the engine off), bit-exact on
+// the heights and on the ids at the clamped surface.
+
+typedef struct
+{
+    int stride;     // 1 = one dense 2D call, > 1 = strided per-row calls
+    int w, h;
+    int ids;        // also compare the biome ids at the surface
+} HShape;
+
+static const HShape HSHAPES[] =
+{
+    {1, DENSE_W, DENSE_H, 1},                   // dense quart map with ids
+    {STRIDED_STRIDE, STRIDED_W, STRIDED_H, 1},  // strided overview rows
+    {1, 4, 4, 1},                               // 4x4 chunk tile
+    {1, DENSE_W, DENSE_H, 0},                   // dense quart map without ids
+};
+#define HSHAPE_CNT (int)(sizeof(HSHAPES) / sizeof(HSHAPES[0]))
+
+static const char *hshapeNameByIdx(int idx)
+{
+    static const char *names[] = { "dense-ids", "strided-ids", "tile4x4-ids",
+        "dense-noids" };
+    return names[idx];
+}
+
+static void reportHeightCase(const CaseStats *st)
+{
+    printf("  -> %s: %lld pts, height mismatch %lld, id mismatch %lld "
+        "[cpu %.1fs gpu %.1fs]\n",
+        st->heightMismatch == 0 && st->idMismatch == 0 ? "ok" : "FAIL",
+        st->pts, st->heightMismatch, st->idMismatch, st->tRef, st->tGpu);
+    fflush(stdout);
+}
+
+/*
+ * One (version, seed, origin, shape) height case: the guarded GPU dispatch
+ * vs the CPU reference. Dense shapes go through a single 2D call per side
+ * (the tile/map usage), strided shapes through per-row calls (the mod's
+ * overview-row streaming).
+ */
+static void runHeightCase(int mc, uint32_t flags, uint64_t seed, int ox,
+    int oz, int shapeIdx, CaseStats *total, int *fail)
+{
+    const HShape *sh = &HSHAPES[shapeIdx];
+    printf("height case mc=%d seed=%llu origin=(%d,%d) %s\n",
+        mc, (unsigned long long) seed, ox, oz, hshapeNameByIdx(shapeIdx));
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    const int stride = sh->stride;
+    const int rawW = (sh->w - 1) * stride + 1;
+    float *refY = malloc(sizeof(float) * (size_t)rawW * sh->h);
+    float *gpuY = malloc(sizeof(float) * (size_t)rawW * sh->h);
+    int *refIds = sh->ids ? malloc(sizeof(int) * (size_t)rawW * sh->h) : NULL;
+    int *gpuIds = sh->ids ? malloc(sizeof(int) * (size_t)rawW * sh->h) : NULL;
+    if (!refY || !gpuY || (sh->ids && (!refIds || !gpuIds)))
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    CaseStats st = {0};
+    const int calls = stride == 1 ? 1 : sh->h;
+    for (int c = 0; c < calls; c++)
+    {
+        const int rowZ = oz + c * stride;
+        const int rw = stride == 1 ? sh->w : rawW;
+        const int rh = stride == 1 ? sh->h : 1;
+        st.tRef += cpuHeightRef(refY, refIds, &g.bn, ox, rowZ, rw, rh);
+        double t0 = nowSeconds();
+        if (gpuTryHeightHook(gpuY, gpuIds, &g.bn, ox, rowZ, rw, rh))
+        {
+            fprintf(stderr, "gpu-test: GPU height dispatch failed at mc=%d "
+                "seed=%llu (%d,%d) - engine reported unavailable\n",
+                mc, (unsigned long long) seed, ox, rowZ);
+            exit(2);
+        }
+        double t1 = nowSeconds();
+        st.tGpu += t1 - t0;
+
+        for (int j = 0; j < rh; j++)
+        {
+            for (int i = 0; i < rw; i += stride)
+            {
+                const int idx = j * rw + i;
+                st.pts++;
+                if (gpuY[idx] != refY[idx])
+                {
+                    st.heightMismatch++;
+                    if (st.heightMismatch <= 3)
+                        printf("  height @(%d,%d): gpu=%f cpu=%f\n",
+                            ox + i, rowZ + j, (double) gpuY[idx],
+                            (double) refY[idx]);
+                }
+                if (sh->ids && gpuIds[idx] != refIds[idx])
+                {
+                    st.idMismatch++;
+                    if (st.idMismatch <= 3)
+                        printf("  id @(%d,%d): gpu=%d cpu=%d\n",
+                            ox + i, rowZ + j, gpuIds[idx], refIds[idx]);
+                }
+            }
+        }
+    }
+
+    reportHeightCase(&st);
+    free(refY);
+    free(gpuY);
+    free(refIds);
+    free(gpuIds);
+    total->pts += st.pts;
+    total->heightMismatch += st.heightMismatch;
+    total->idMismatch += st.idMismatch;
+    if (st.heightMismatch || st.idMismatch)
+        *fail = 1;
+}
+
+/*
+ * Transparent height dispatch through the public mapOverworldTerrainHeight()
+ * entry in off/auto/force: every pass must match the pure-CPU reference,
+ * auto/force must engage the engine on every public call
+ * (gpuHeightDispatchCount, CUBIOMES_ENABLE_GPU builds), off must not touch
+ * it. The auto pass also re-queries sampled points as isolated single
+ * columns: one strided/dense row dispatch must equal the isolated calls.
+ */
+static void runTransparentHeightCase(int mc, uint32_t flags, uint64_t seed,
+    int ox, int oz, CaseStats *total, int *fail)
+{
+    const int w = 64;
+    const int rows = 2;
+    printf("transparent height case mc=%d seed=%llu origin=(%d,%d) "
+        "w=%d rows=%d + isolated\n",
+        mc, (unsigned long long) seed, ox, oz, w, rows);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    float *refY = malloc(sizeof(float) * (size_t)w * rows);
+    int *refIds = malloc(sizeof(int) * (size_t)w * rows);
+    float *pubY = malloc(sizeof(float) * (size_t)w * rows);
+    int *pubIds = malloc(sizeof(int) * (size_t)w * rows);
+    if (!refY || !refIds || !pubY || !pubIds)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    static const int modes[] =
+        { GPU_MODE_OFF, GPU_MODE_AUTO, GPU_MODE_FORCE };
+    static const char *modeNames[] = { "off", "auto", "force" };
+    const int modeBefore = gpuGetMode();
+    long long heightMismatch = 0, idMismatch = 0;
+    int shapeFail = 0;
+
+    for (int p = 0; p < 3; p++)
+    {
+        for (int j = 0; j < rows; j++)
+            cpuHeightRef(refY + (size_t)j * w, refIds + (size_t)j * w,
+                &g.bn, ox, oz + j, w, 1);
+
+        gpuSetMode(modes[p]);
+        uint64_t before = gpuHeightDispatchCount();
+        for (int j = 0; j < rows; j++)
+            mapOverworldTerrainHeight(pubY + (size_t)j * w,
+                pubIds + (size_t)j * w, &g.bn, ox, oz + j, w, 1);
+        uint64_t engaged = gpuHeightDispatchCount() - before;
+        uint64_t expected = 0;
+#ifdef CUBIOMES_ENABLE_GPU
+        if (modes[p] != GPU_MODE_OFF)
+            expected = (uint64_t) rows;
+        if (engaged != expected)
+        {
+            fprintf(stderr, "gpu-test: public height entry %s mode engaged "
+                "%llu/%llu dispatches (mc=%d seed=%llu)\n", modeNames[p],
+                (unsigned long long) engaged, (unsigned long long) expected,
+                mc, (unsigned long long) seed);
+            shapeFail = 1;
+        }
+#endif
+        for (int j = 0; j < rows; j++)
+        {
+            for (int i = 0; i < w; i++)
+            {
+                const int idx = j * w + i;
+                if (pubY[idx] != refY[idx])
+                {
+                    heightMismatch++;
+                    if (heightMismatch <= 3)
+                        printf("  %s height @(%d,%d): pub=%f ref=%f\n",
+                            modeNames[p], ox + i, oz + j,
+                            (double) pubY[idx], (double) refY[idx]);
+                }
+                if (pubIds[idx] != refIds[idx])
+                {
+                    idMismatch++;
+                    if (idMismatch <= 3)
+                        printf("  %s id @(%d,%d): pub=%d ref=%d\n",
+                            modeNames[p], ox + i, oz + j,
+                            pubIds[idx], refIds[idx]);
+                }
+            }
+        }
+        printf("  -> %s: height mismatch %lld, id mismatch %lld "
+            "[gpu %llu/%llu]\n", modeNames[p], heightMismatch, idMismatch,
+            (unsigned long long) engaged, (unsigned long long) expected);
+        fflush(stdout);
+    }
+
+    // Shape invariance: isolated single-column queries through the same
+    // public entry must reproduce the row dispatch's heights and ids.
+    gpuSetMode(GPU_MODE_AUTO);
+    for (int i = 0; i < w; i += 7)
+    {
+        float oneY;
+        int oneId;
+        mapOverworldTerrainHeight(&oneY, &oneId, &g.bn, ox + i, oz, 1, 1);
+        if (oneY != pubY[i] || oneId != pubIds[i])
+        {
+            heightMismatch++;
+            if (heightMismatch <= 3)
+                printf("  isolated @(%d,%d): one=(%f,%d) row=(%f,%d)\n",
+                    ox + i, oz, (double) oneY, oneId,
+                    (double) pubY[i], pubIds[i]);
+        }
+    }
+    gpuSetMode(modeBefore);
+
+    free(refY);
+    free(refIds);
+    free(pubY);
+    free(pubIds);
+    total->pts += (long long) w * rows;
+    total->heightMismatch += heightMismatch;
+    total->idMismatch += idMismatch;
+    if (heightMismatch || idMismatch || shapeFail)
+        *fail = 1;
+}
+
+/*
+ * The Generator-facing consumer entry mapApproxHeight(): on 1.18+ Overworld
+ * it gates nptype and delegates to mapOverworldTerrainHeight(). The tile and
+ * single-column shapes real consumers use, in auto mode, against the
+ * mode-off CPU reference.
+ */
+static void runApproxHeightCase(int mc, uint32_t flags, uint64_t seed,
+    int ox, int oz, CaseStats *total, int *fail)
+{
+    printf("transparent mapApproxHeight case mc=%d seed=%llu origin=(%d,%d) "
+        "tile4x4 + single\n", mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    SurfaceNoise sn;
+    initSurfaceNoise(&sn, DIM_OVERWORLD, g.seed);
+
+    const int w = 4, h = 4;
+    float refY[16], pubY[16];
+    int refIds[16], pubIds[16];
+    long long heightMismatch = 0, idMismatch = 0;
+
+    cpuHeightRef(refY, refIds, &g.bn, ox, oz, w, h);
+    mapApproxHeight(pubY, pubIds, &g, &sn, ox, oz, w, h);
+    for (int i = 0; i < w * h; i++)
+    {
+        if (pubY[i] != refY[i])
+        {
+            heightMismatch++;
+            if (heightMismatch <= 3)
+                printf("  tile height @(%d,%d): pub=%f ref=%f\n",
+                    ox + i % w, oz + i / w, (double) pubY[i],
+                    (double) refY[i]);
+        }
+        if (pubIds[i] != refIds[i])
+        {
+            idMismatch++;
+            if (idMismatch <= 3)
+                printf("  tile id @(%d,%d): pub=%d ref=%d\n",
+                    ox + i % w, oz + i / w, pubIds[i], refIds[i]);
+        }
+    }
+
+    float oneRefY, onePubY;
+    int oneRefId, onePubId;
+    cpuHeightRef(&oneRefY, &oneRefId, &g.bn, ox + 2, oz + 2, 1, 1);
+    mapApproxHeight(&onePubY, &onePubId, &g, &sn, ox + 2, oz + 2, 1, 1);
+    if (onePubY != oneRefY || onePubId != oneRefId)
+    {
+        heightMismatch++;
+        printf("  single @(%d,%d): pub=(%f,%d) ref=(%f,%d)\n",
+            ox + 2, oz + 2, (double) onePubY, onePubId,
+            (double) oneRefY, oneRefId);
+    }
+
+    printf("  -> %s: height mismatch %lld, id mismatch %lld\n",
+        heightMismatch == 0 && idMismatch == 0 ? "ok" : "FAIL",
+        heightMismatch, idMismatch);
+    fflush(stdout);
+    total->pts += (long long) w * h + 1;
+    total->heightMismatch += heightMismatch;
+    total->idMismatch += idMismatch;
+    if (heightMismatch || idMismatch)
+        *fail = 1;
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -706,6 +1047,47 @@ int main(int argc, char **argv)
     }
     runTransparentReseedCase(mainMc, 0, seeds[0], seeds[1], &total, &fail);
 
+    // Terrain overview heights: guarded dispatch matrix over the consumer
+    // query shapes, then the transparent public entries. Default: main
+    // version, one seed, all origins, the ids shapes plus the version sweep
+    // at the origin; --full extends to all seeds and shapes and sweeps the
+    // world-border origin on the other versions.
+    const int hshapeCnt = full ? HSHAPE_CNT : 3;
+    for (int si = 0; si < seedCnt; si++)
+    {
+        for (int oi = 0; oi < (int)(sizeof(origins) / sizeof(origins[0])); oi++)
+        {
+            for (int shape = 0; shape < hshapeCnt; shape++)
+                runHeightCase(mainMc, 0, seeds[si], origins[oi][0],
+                    origins[oi][1], shape, &total, &fail);
+        }
+    }
+    for (size_t vi = 0; vi < sizeof(versions) / sizeof(versions[0]); vi++)
+    {
+        if (versions[vi] == mainMc)
+            continue;
+        for (int oi = 0; oi < (int)(sizeof(origins) / sizeof(origins[0])); oi++)
+        {
+            if (origins[oi][0] != 0 && !(full && origins[oi][0] == 7500000))
+                continue;
+            runHeightCase(versions[vi], 0, seeds[0], origins[oi][0],
+                origins[oi][1], 0, &total, &fail);
+        }
+    }
+    runHeightCase(mainMc, LARGE_BIOMES, seeds[0], origins[0][0],
+        origins[0][1], 0, &total, &fail);
+    for (int oi = 0; oi < (int)(sizeof(origins) / sizeof(origins[0])); oi++)
+    {
+        if (!full && oi > 1)
+            continue;
+        runTransparentHeightCase(mainMc, 0, seeds[0], origins[oi][0],
+            origins[oi][1], &total, &fail);
+    }
+    runTransparentHeightCase(MC_1_18, 0, seeds[0], 0, 0, &total, &fail);
+    runTransparentHeightCase(MC_26_3, 0, seeds[0], 0, 0, &total, &fail);
+    runApproxHeightCase(mainMc, 0, seeds[0], origins[0][0], origins[0][1],
+        &total, &fail);
+
     printf("\n");
     if (total.refReplicationMismatch)
     {
@@ -716,10 +1098,10 @@ int main(int argc, char **argv)
     if (fail)
     {
         printf("PARITY FAIL: %lld / %lld points mismatched "
-            "(id %lld, np %lld, max np delta %lld)\n",
-            total.idMismatch + total.npMismatch, total.pts,
-            total.idMismatch, total.npMismatch,
-            (long long) total.maxNpDelta);
+            "(id %lld, np %lld, height %lld, max np delta %lld)\n",
+            total.idMismatch + total.npMismatch + total.heightMismatch,
+            total.pts, total.idMismatch, total.npMismatch,
+            total.heightMismatch, (long long) total.maxNpDelta);
         return 1;
     }
     printf("PARITY OK: %lld points, 0 mismatches\n", total.pts);

@@ -2,16 +2,21 @@
 #define GPU_CL_KERNELS_H_
 
 /*
- * OpenCL kernel shipped as a C string and built at runtime by gpu.c.
+ * OpenCL kernels shipped as a C string and built at runtime by gpu.c.
  *
- * Mirrors, in call order, the CPU chain of mapOverworldSurfaceBiome() +
- * depth-aware sampleBiomeNoise() from biomenoise.c: climate double perlin
- * noises, terrain-parameter splines (evaluated iteratively - OpenCL forbids
- * recursion), the modern terrain column density with the banded surface
- * search, depth = f(surface y), and the biome tree lookup (also iterative).
- * The kernel is a pure double-precision executor: any output difference from
- * the CPU reference is a defect, so the float casts, uint8 wrap-arounds and
- * fixed-point TO_NP conversions of the CPU code are kept verbatim.
+ * surfaceBiomeKernel mirrors, in call order, the CPU chain of
+ * mapOverworldSurfaceBiome() + depth-aware sampleBiomeNoise() from
+ * biomenoise.c: climate double perlin noises, terrain-parameter splines
+ * (evaluated iteratively - OpenCL forbids recursion), the modern terrain
+ * column density with the banded surface search, depth = f(surface y), and
+ * the biome tree lookup (also iterative). terrainHeightKernel runs the same
+ * terrain column machinery for the terrain overview heights
+ * (mapOverworldTerrainHeight), emitting each quart column's first solid
+ * block and, when requested, the surface-biome id at the clamped surface.
+ * The kernels are pure double-precision executors: any output difference
+ * from the CPU reference is a defect, so the float casts, uint8
+ * wrap-arounds and fixed-point TO_NP conversions of the CPU code are kept
+ * verbatim.
  *
  * The host-side counterparts of the constants here live in gpu.c (packTables
  * and its _Static_asserts) and must be kept in sync.
@@ -913,7 +918,8 @@ static const char GPU_CL_SRC[] =
 "    const int cellZ = floordivK(blockZ, 4);\n"
 "    const double dx = (blockX - cellX*4) / 4.0;\n"
 "    const double dz = (blockZ - cellZ*4) / 4.0;\n"
-"    KColumn col00, col01, col10, col11;\n"
+"    // zero-init: colEnsureCellsK branches on ready before any write\n"
+"    KColumn col00 = {0}, col01 = {0}, col10 = {0}, col11 = {0};\n"
 "    return findModernTerrainSurfaceK(ctx,\n"
 "        &col00, &col01, &col10, &col11, cellX, cellZ, dx, dz);\n"
 "}\n"
@@ -1118,6 +1124,87 @@ static const char GPU_CL_SRC[] =
 "    for (int k = 0; k < 6; k++)\n"
 "        outNp[(size_t)gi * 6 + k] = np[k];\n"
 "    outId[gi] = id;\n"
+"}\n"
+"\n"
+"// The terrain overview heights: one quart column's first solid block per\n"
+"// point (the uncached CPU path of mapOverworldTerrainHeight), plus the\n"
+"// surface-biome id at the clamped surface when the caller asks for ids.\n"
+"__kernel void terrainHeightKernel(\n"
+"    __global const uchar *perm,\n"
+"    __global const double *pinfo,\n"
+"    __global const int *noff,\n"
+"    __global const double *namp,\n"
+"    __global const int *styp,\n"
+"    __global const int *slen,\n"
+"    __global const float *sloc,\n"
+"    __global const float *sder,\n"
+"    __global const int *schild,\n"
+"    const int rootSp,\n"
+"    const int rootFactor,\n"
+"    const int rootJagged,\n"
+"    __global const uint *btSteps,\n"
+"    __global const int *btParam,\n"
+"    __global const u64 *btNodes,\n"
+"    const uint btLen,\n"
+"    const uint btOrder,\n"
+"    const double snXZScale,\n"
+"    const double snYScale,\n"
+"    const double snXZFactor,\n"
+"    const double snYFactor,\n"
+"    const int octMinOff,\n"
+"    const int octMaxOff,\n"
+"    const int octMainOff,\n"
+"    const int wantIds,\n"
+"    const int originX,\n"
+"    const int originZ,\n"
+"    const int W,\n"
+"    const int H,\n"
+"    __global float *outY,\n"
+"    __global int *outId)\n"
+"{\n"
+"    KCtx ctx;\n"
+"    ctx.perm = perm;\n"
+"    ctx.pinfo = pinfo;\n"
+"    ctx.noff = noff;\n"
+"    ctx.namp = namp;\n"
+"    ctx.styp = styp;\n"
+"    ctx.slen = slen;\n"
+"    ctx.sloc = sloc;\n"
+"    ctx.sder = sder;\n"
+"    ctx.schild = schild;\n"
+"    ctx.btSteps = btSteps;\n"
+"    ctx.btParam = btParam;\n"
+"    ctx.btNodes = btNodes;\n"
+"    ctx.btLen = btLen;\n"
+"    ctx.btOrder = btOrder;\n"
+"    ctx.rootSp = rootSp;\n"
+"    ctx.rootFactor = rootFactor;\n"
+"    ctx.rootJagged = rootJagged;\n"
+"    ctx.snXZScale = snXZScale;\n"
+"    ctx.snYScale = snYScale;\n"
+"    ctx.snXZFactor = snXZFactor;\n"
+"    ctx.snYFactor = snYFactor;\n"
+"    ctx.octMinOff = octMinOff;\n"
+"    ctx.octMaxOff = octMaxOff;\n"
+"    ctx.octMainOff = octMainOff;\n"
+"\n"
+"    int gi = (int)get_global_id(0);\n"
+"    int total = W * H;\n"
+"    if (gi >= total)\n"
+"        return;\n"
+"\n"
+"    const int x = originX + gi % W;\n"
+"    const int z = originZ + gi / W;\n"
+"    int surface = terrainSurfaceAtK(&ctx, x, z);\n"
+"    outY[gi] = (float) surface;\n"
+"    if (wantIds)\n"
+"    {\n"
+"        i64 np[6];\n"
+"        int id;\n"
+"        if (surface < 62) surface = 62;\n"
+"        sampleBiomeNoiseDepthK(&ctx, x, floordivK(surface, 4), z, np, &id);\n"
+"        outId[gi] = id;\n"
+"    }\n"
 "}\n"
 ;
 

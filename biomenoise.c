@@ -2601,6 +2601,10 @@ int getOverworldTerrainHeight(
 int mapOverworldTerrainHeight(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int h)
 {
+#ifdef CUBIOMES_ENABLE_GPU
+    if (gpuTryHeightHook(y, ids, bn, x, z, w, h) == 0)
+        return 0;
+#endif
     int i, j;
     for (j = 0; j < h; j++)
     {
