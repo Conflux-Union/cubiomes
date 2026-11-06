@@ -9,6 +9,9 @@ docs/LayerSummary.toc
 *.o
 *.a
 *.out
+/gpu_test
+/*.d
+/features/*.d
 
 *.so
 *.dylib
