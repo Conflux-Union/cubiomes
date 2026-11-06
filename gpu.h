@@ -26,6 +26,13 @@
  * GPU is unavailable. Read-only queries (gpuGetMode/gpuAvailable) never fail
  * because of the GPU; the dispatch below returns nonzero on a GPU error and
  * latches the engine dead for the process so later calls fall back too.
+ *
+ * Transparent dispatch: when a consumer builds this module together with
+ * CUBIOMES_ENABLE_GPU, mapOverworldSurfaceBiome() (biomenoise.c) tries the
+ * GPU hook below before its CPU body. The generic flat-Y queries
+ * (genBiomes()/getBiomeAt()) deliberately stay on the CPU: the kernel derives
+ * the terrain surface per column, which is a different contract than the
+ * caller-chosen Y of those queries.
  */
 
 #include "generator.h"
@@ -58,10 +65,26 @@ int gpuAvailable(const Generator *g);
  * when unavailable. Diagnostic aid, not part of the dispatch contract. */
 const char *gpuDeviceName(void);
 
+/* Number of surface-biome dispatches the engine has completed successfully
+ * (kernel run + results read back), process-global. Diagnostic aid for
+ * verifying that a code path actually engaged the GPU. */
+uint64_t gpuDispatchCount(void);
+
+/*
+ * The guarded GPU dispatch behind mapOverworldSurfaceBiome() when compiled
+ * with CUBIOMES_ENABLE_GPU. This is the single place that owns the dispatch
+ * guard; it returns 0 only when the GPU served the whole area (identical to
+ * the wrapper's CPU result) and nonzero whenever the caller must run the CPU
+ * path - unsupported arguments, disabled/dead engine, or any GPU error.
+ * gpuMapOverworldSurfaceBiome() is the Generator-facing form of the same
+ * dispatch and shares this guard.
+ */
+int gpuTrySurfaceBiomeHook(int *out, const BiomeNoise *bn, uint64_t sha,
+    int scale, int x, int z, int w, int h);
+
 /*
  * GPU equivalent of mapOverworldSurfaceBiome(out, &g->bn, sha, scale, x, z,
- * w, h) - the internal dispatch the genBiomes hook (see generator.c) falls
- * back on. Returns 0 on success; nonzero when the GPU engine is disabled,
+ * w, h). Returns 0 on success; nonzero when the GPU engine is disabled,
  * dead, or the arguments are unsupported (mirrors the wrapper's error
  * convention so callers fall back to the CPU path). When `np` is non-NULL it
  * receives NP_MAX climate noise parameters per point (int64_t[np? w*h :

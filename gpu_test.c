@@ -16,6 +16,12 @@
  * (quart 7.5M) x scale {1, 4} dense x scale-4 strided rows). Each case prints
  * its header before it runs and its timing after, so a stall names the case
  * and the phase that caused it.
+ *
+ * A transparent-path section exercises the public mapOverworldSurfaceBiome()
+ * entry (the guarded GPU hook) in off/auto/force modes: every pass must match
+ * the CPU reference, auto/force must engage the engine on every public call
+ * (dispatch counter, CUBIOMES_ENABLE_GPU builds), and a row-vs-isolated case
+ * asserts query-shape invariance through the entry.
  */
 
 #include "gpu.h"
@@ -292,6 +298,292 @@ static void runAndAccount(int mc, uint32_t flags, uint64_t seed, int ox,
         total->maxNpDelta = st.maxNpDelta;
 }
 
+//----------------------------------------------------------------------
+// Transparent dispatch path: the public mapOverworldSurfaceBiome() entry,
+// which tries the guarded GPU hook before its CPU body when compiled with
+// CUBIOMES_ENABLE_GPU. Every pass must reproduce the CPU reference
+// bit-exactly; auto/force must engage the engine on every public call
+// (dispatch counter), off must not touch it. Points are counted once per
+// case even though all three passes compare them.
+
+static const Shape TSHAPES[] =
+{
+    {4, 1, 64, 8},                                  // surface scale 4 dense
+    {1, 1, 64, 8},                                  // surface scale 1 dense
+    {4, STRIDED_STRIDE, STRIDED_W, 2},              // surface scale 4 strided
+};
+
+static const char *tshapeNameByIdx(int idx)
+{
+    static const char *names[] = { "surface4-dense", "surface1-dense",
+        "surface4-strided" };
+    return names[idx];
+}
+
+static void reportTransparent(const char *mode, long long idMismatch,
+    uint64_t engaged, uint64_t expected)
+{
+    printf("  -> %s %s: id mismatch %lld [gpu %llu/%llu]\n",
+        mode,
+        idMismatch == 0 && engaged == expected ? "ok" : "FAIL",
+        idMismatch, (unsigned long long) engaged,
+        (unsigned long long) expected);
+    fflush(stdout);
+}
+
+static void runTransparentCase(int mc, uint32_t flags, uint64_t seed, int ox,
+    int oz, int shapeIdx, CaseStats *total, int *fail)
+{
+    const Shape *sh = &TSHAPES[shapeIdx];
+    printf("transparent case mc=%d seed=%llu origin=(%d,%d) %s\n",
+        mc, (unsigned long long) seed, ox, oz, tshapeNameByIdx(shapeIdx));
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    const int stride = sh->stride;
+    const int rawW = (sh->w - 1) * stride + 1;
+    int *refIds = malloc(sizeof(int) * (size_t)rawW);
+    int *pubIds = malloc(sizeof(int) * (size_t)rawW);
+    int64_t *refNp = malloc(sizeof(int64_t) * (size_t)rawW * NP_CH);
+    if (!refIds || !pubIds || !refNp)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    static const int modes[] =
+        { GPU_MODE_OFF, GPU_MODE_AUTO, GPU_MODE_FORCE };
+    static const char *modeNames[] = { "off", "auto", "force" };
+    const int modeBefore = gpuGetMode();
+    long long idMismatch = 0;
+    int shapeFail = 0;
+
+    for (int p = 0; p < 3; p++)
+    {
+        gpuSetMode(modes[p]);
+        uint64_t before = gpuDispatchCount();
+        for (int j = 0; j < sh->h; j++)
+        {
+            const int rowZ = oz + j * stride;
+            cpuSurfaceBiomeRef(refIds, refNp, &g.bn, g.sha, sh->scale,
+                ox, rowZ, rawW, 1);
+            mapOverworldSurfaceBiome(pubIds, &g.bn, g.sha, sh->scale,
+                ox, rowZ, rawW, 1);
+            for (int i = 0; i < rawW; i++)
+            {
+                if (pubIds[i] != refIds[i])
+                {
+                    idMismatch++;
+                    if (idMismatch <= 3)
+                        printf("  %s id @(%d,%d): pub=%d ref=%d\n",
+                            modeNames[p], ox + i, rowZ, pubIds[i], refIds[i]);
+                }
+            }
+        }
+        uint64_t engaged = gpuDispatchCount() - before;
+        uint64_t expected = 0;
+#ifdef CUBIOMES_ENABLE_GPU
+        if (modes[p] != GPU_MODE_OFF)
+            expected = (uint64_t) sh->h;
+        if (engaged != expected)
+        {
+            fprintf(stderr, "gpu-test: public entry %s mode engaged %llu/%llu"
+                " dispatches (mc=%d seed=%llu)\n", modeNames[p],
+                (unsigned long long) engaged, (unsigned long long) expected,
+                mc, (unsigned long long) seed);
+            shapeFail = 1;
+        }
+#endif
+        reportTransparent(modeNames[p], idMismatch, engaged, expected);
+    }
+    gpuSetMode(modeBefore);
+
+    free(refIds);
+    free(pubIds);
+    free(refNp);
+    total->pts += (long long) sh->w * sh->h;
+    total->idMismatch += idMismatch;
+    if (idMismatch || shapeFail)
+        *fail = 1;
+}
+
+/*
+ * Query-shape invariance through the public entry: one strided/dense row
+ * computed by a single GPU dispatch must equal isolated single-point public
+ * queries (each its own dispatch) and the CPU reference row.
+ */
+static void runTransparentShapeCase(int mc, uint32_t flags, uint64_t seed,
+    int ox, int oz, CaseStats *total, int *fail)
+{
+    printf("transparent shape case mc=%d seed=%llu origin=(%d,%d) "
+        "row-vs-isolated\n", mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    const int modeBefore = gpuGetMode();
+    gpuSetMode(GPU_MODE_AUTO);
+    const uint64_t countBefore = gpuDispatchCount();
+    uint64_t calls = 0;
+    long long idMismatch = 0;
+    int shapeFail = 0;
+    long long pts = 0;
+
+    for (int s = 0; s < 2; s++)
+    {
+        const int scale = s == 0 ? 4 : 1;
+        const int w = scale == 4
+            ? (STRIDED_W - 1) * STRIDED_STRIDE + 1
+            : 64;
+        const int step = scale == 4 ? STRIDED_STRIDE : 7;
+        int *row = malloc(sizeof(int) * (size_t)w);
+        int *refIds = malloc(sizeof(int) * (size_t)w);
+        int64_t *refNp = malloc(sizeof(int64_t) * (size_t)w * NP_CH);
+        if (!row || !refIds || !refNp)
+        {
+            fprintf(stderr, "gpu-test: out of memory\n");
+            exit(2);
+        }
+        cpuSurfaceBiomeRef(refIds, refNp, &g.bn, g.sha, scale, ox, oz, w, 1);
+        mapOverworldSurfaceBiome(row, &g.bn, g.sha, scale, ox, oz, w, 1);
+        calls++;
+        long long scaleMismatch = 0;
+        for (int i = 0; i < w; i += step)
+        {
+            int one;
+            mapOverworldSurfaceBiome(&one, &g.bn, g.sha, scale,
+                ox + i, oz, 1, 1);
+            calls++;
+            if (one != row[i])
+            {
+                scaleMismatch++;
+                if (scaleMismatch <= 3)
+                    printf("  scale%d isolated @(%d,%d): one=%d row=%d\n",
+                        scale, ox + i, oz, one, row[i]);
+            }
+            if (row[i] != refIds[i])
+            {
+                scaleMismatch++;
+                if (scaleMismatch <= 3)
+                    printf("  scale%d ref @(%d,%d): row=%d ref=%d\n",
+                        scale, ox + i, oz, row[i], refIds[i]);
+            }
+            pts++;
+        }
+        printf("  -> scale%d: %lld sampled pts, id mismatch %lld\n",
+            scale, pts, scaleMismatch);
+        fflush(stdout);
+        idMismatch += scaleMismatch;
+        free(row);
+        free(refIds);
+        free(refNp);
+    }
+
+#ifdef CUBIOMES_ENABLE_GPU
+    uint64_t engaged = gpuDispatchCount() - countBefore;
+    if (engaged != calls)
+    {
+        fprintf(stderr, "gpu-test: shape case engaged %llu/%llu dispatches"
+            " (mc=%d)\n", (unsigned long long) engaged,
+            (unsigned long long) calls, mc);
+        shapeFail = 1;
+    }
+#else
+    (void) countBefore;
+    (void) calls;
+#endif
+    gpuSetMode(modeBefore);
+
+    total->pts += pts;
+    total->idMismatch += idMismatch;
+    if (idMismatch || shapeFail)
+        *fail = 1;
+}
+
+/*
+ * Reseed regression for the table cache: the engine keys its packed tables
+ * on a fingerprint of the seed-derived state, because setBiomeSeed()
+ * re-derives the tables in place and pointer identity cannot see a reseed.
+ * Public-entry calls on the SAME BiomeNoise across a reseed and across a
+ * large-biomes flip (same seed, same sha) must each match the CPU reference;
+ * a stale cache would repeat the first configuration's tables.
+ */
+static void runTransparentReseedCase(int mc, uint32_t flags, uint64_t seedA,
+    uint64_t seedB, CaseStats *total, int *fail)
+{
+    printf("transparent reseed case mc=%d seeds %llu -> %llu -> %llu(large)\n",
+        mc, (unsigned long long) seedA, (unsigned long long) seedB,
+        (unsigned long long) seedA);
+    fflush(stdout);
+
+    Generator g;
+    const int w = 64;
+    int *pubIds = malloc(sizeof(int) * (size_t)w);
+    int *refIds = malloc(sizeof(int) * (size_t)w);
+    int64_t *refNp = malloc(sizeof(int64_t) * (size_t)w * NP_CH);
+    if (!pubIds || !refIds || !refNp)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    const int modeBefore = gpuGetMode();
+    gpuSetMode(GPU_MODE_AUTO);
+    const uint64_t countBefore = gpuDispatchCount();
+    const struct { uint64_t seed; uint32_t flags; } passes[] =
+    {
+        { seedA, flags },
+        { seedB, flags },
+        { seedA, flags | LARGE_BIOMES },
+    };
+    long long idMismatch = 0;
+    for (int p = 0; p < 3; p++)
+    {
+        setupGenerator(&g, mc, passes[p].flags);
+        applySeed(&g, DIM_OVERWORLD, passes[p].seed);
+        cpuSurfaceBiomeRef(refIds, refNp, &g.bn, g.sha, 4, 0, 0, w, 1);
+        mapOverworldSurfaceBiome(pubIds, &g.bn, g.sha, 4, 0, 0, w, 1);
+        for (int i = 0; i < w; i++)
+        {
+            if (pubIds[i] != refIds[i])
+            {
+                idMismatch++;
+                if (idMismatch <= 3)
+                    printf("  pass %d id @(%d,0): pub=%d ref=%d\n",
+                        p, i, pubIds[i], refIds[i]);
+            }
+        }
+    }
+    int shapeFail = 0;
+#ifdef CUBIOMES_ENABLE_GPU
+    if (gpuDispatchCount() - countBefore != 3)
+    {
+        fprintf(stderr, "gpu-test: reseed case engaged %llu/3 dispatches\n",
+            (unsigned long long) (gpuDispatchCount() - countBefore));
+        shapeFail = 1;
+    }
+#else
+    (void) countBefore;
+#endif
+    gpuSetMode(modeBefore);
+
+    printf("  -> %s: id mismatch %lld\n",
+        idMismatch == 0 && !shapeFail ? "ok" : "FAIL", idMismatch);
+    fflush(stdout);
+    free(pubIds);
+    free(refIds);
+    free(refNp);
+    total->pts += 3 * w;
+    total->idMismatch += idMismatch;
+    if (idMismatch || shapeFail)
+        *fail = 1;
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -382,6 +674,37 @@ int main(int argc, char **argv)
     for (int shape = 0; shape < 2; shape++)
         runAndAccount(mainMc, LARGE_BIOMES, seeds[0], origins[0][0],
             origins[0][1], shape, &total, &fail);
+
+    // Transparent dispatch path through the public mapOverworldSurfaceBiome
+    // entry (guarded hook). Default: the main version over the first two
+    // origins and both dense shapes plus one row-vs-isolated case; --full
+    // extends to all origins/shapes and every supported biome-tree version.
+#ifndef CUBIOMES_ENABLE_GPU
+    printf("transparent path: CUBIOMES_ENABLE_GPU not compiled in, "
+        "public-entry cases run the CPU body (engagement checks off)\n\n");
+#endif
+    const int tshapeCnt = full
+        ? (int)(sizeof(TSHAPES) / sizeof(TSHAPES[0]))
+        : 2;
+    for (int oi = 0; oi < (int)(sizeof(origins) / sizeof(origins[0])); oi++)
+    {
+        if (!full && oi > 1)
+            continue;
+        for (int shape = 0; shape < tshapeCnt; shape++)
+            runTransparentCase(mainMc, 0, seeds[0], origins[oi][0],
+                origins[oi][1], shape, &total, &fail);
+        runTransparentShapeCase(mainMc, 0, seeds[0], origins[oi][0],
+            origins[oi][1], &total, &fail);
+    }
+    for (size_t vi = 0; vi < sizeof(versions) / sizeof(versions[0]); vi++)
+    {
+        if (versions[vi] == mainMc)
+            continue;
+        if (!full && versions[vi] != MC_1_18 && versions[vi] != MC_26_3)
+            continue;
+        runTransparentCase(versions[vi], 0, seeds[0], 0, 0, 0, &total, &fail);
+    }
+    runTransparentReseedCase(mainMc, 0, seeds[0], seeds[1], &total, &fail);
 
     printf("\n");
     if (total.refReplicationMismatch)

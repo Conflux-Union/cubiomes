@@ -9,7 +9,12 @@
 # floating-point expressions.
 
 CC := cc
-CFLAGS := -O2 -Wall -MMD -MP -fno-fast-math -ffp-contract=off
+# -DCUBIOMES_ENABLE_GPU compiles the transparent dispatch hook into
+# biomenoise.c (mapOverworldSurfaceBiome tries the GPU engine first).
+# Without the define the GPU code is unreachable through the public API and
+# consumers that do not build gpu.c at all are unaffected.
+CFLAGS := -O2 -Wall -MMD -MP -fno-fast-math -ffp-contract=off \
+	-DCUBIOMES_ENABLE_GPU
 LDLIBS := -lm -ldl -lpthread
 
 # Compile list of the mod's native library (native/README.md) + GPU engine.

@@ -97,11 +97,12 @@ typedef struct
     GpuCl cl;
     size_t localSize;
     GpuTables tables;
-    uint64_t keySeed;
+    uint64_t keySha;
+    uint64_t keyProbe;
     int keyMc;
-    uint32_t keyFlags;
     int haveKey;
     int keyFailed;
+    uint64_t dispatchCount;
     cl_mem mPerm, mPinfo, mNoff, mNamp;
     cl_mem mStyp, mSlen, mSloc, mSder, mSchild;
     cl_mem mSteps, mParam, mNodes;
@@ -120,7 +121,7 @@ static GpuEngine g_gpu =
     0, 0, 0, 0,
     {{0}}, 64,
     {0},
-    0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0,
     NULL, NULL, NULL, NULL,
     NULL, NULL, NULL, NULL, NULL,
     NULL, NULL, NULL,
@@ -442,9 +443,8 @@ static void packBTree(GpuTables *t, int mc)
     t->btLen = (uint32_t)(t->btNodesSize / sizeof(uint64_t));
 }
 
-static int packTables(GpuTables *t, const Generator *g)
+static int packTables(GpuTables *t, const BiomeNoise *bn)
 {
-    const BiomeNoise *bn = &g->bn;
     memset(t, 0, sizeof(*t));
 
     // The terrain column kernel unrolls the octave counts of the modern
@@ -510,7 +510,7 @@ static int packTables(GpuTables *t, const Generator *g)
     if (packSplineStack(t, &bn->jaggedSs, bn->jaggedSp, &t->rootJagged))
         return 1;
 
-    packBTree(t, g->mc);
+    packBTree(t, bn->mc);
     if (t->btLen == 0 || t->btOrder == 0 || t->btOrder > 63)
         return 1;
 
@@ -524,21 +524,61 @@ static int packTables(GpuTables *t, const Generator *g)
     return 0;
 }
 
-static int gpuPackForLocked(GpuEngine *e, const Generator *g)
+/*
+ * Fingerprint of the seed-derived perm tables the kernel consumes. The
+ * tables are re-derived in place on every setBiomeSeed(), so pointer
+ * identity cannot detect a reseed of the same BiomeNoise. These witness
+ * octaves change whenever the table state changes: a reseed re-derives every
+ * channel, and a large-biomes change re-salts continentalness and erosion.
+ * A collision between genuinely different states requires all four witnesses
+ * to alias (~2^-4000 per pair), far below the 2^-64 chance of any 64-bit key.
+ */
+static uint64_t gpuProbeMix(uint64_t h, const void *data, size_t len)
 {
-    if (e->haveKey && e->keySeed == g->seed && e->keyMc == g->mc
-        && e->keyFlags == g->flags)
+    const uint8_t *p = data;
+    while (len--)
+    {
+        h ^= *p++;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static uint64_t gpuProbeOctave(uint64_t h, const OctaveNoise *on)
+{
+    int cnt = on->octcnt;
+    h = gpuProbeMix(h, &cnt, sizeof(cnt));
+    if (cnt > 0 && on->octaves)
+        h = gpuProbeMix(h, on->octaves[0].d, sizeof(on->octaves[0].d));
+    return h;
+}
+
+static uint64_t gpuTableProbe(const BiomeNoise *bn)
+{
+    uint64_t h = gpuProbeMix(1469598103934665603ULL, &bn->mc, sizeof(bn->mc));
+    h = gpuProbeOctave(h, &bn->climate[NP_CONTINENTALNESS].octA);
+    h = gpuProbeOctave(h, &bn->climate[NP_EROSION].octA);
+    h = gpuProbeOctave(h, &bn->jagged.octA);
+    h = gpuProbeOctave(h, &bn->terrain.octmin);
+    return h;
+}
+
+static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn, uint64_t sha)
+{
+    uint64_t probe = gpuTableProbe(bn);
+    if (e->haveKey && e->keyMc == bn->mc && e->keySha == sha
+        && e->keyProbe == probe)
         return e->tables.valid && !e->keyFailed;
     gpuReleasePack(e);
-    e->keySeed = g->seed;
-    e->keyMc = g->mc;
-    e->keyFlags = g->flags;
+    e->keyMc = bn->mc;
+    e->keySha = sha;
+    e->keyProbe = probe;
     e->haveKey = 1;
-    if (packTables(&e->tables, g))
+    if (packTables(&e->tables, bn))
     {
         e->keyFailed = 1;
         fprintf(stderr, "gpu: unsupported generator state (mc %d), "
-            "falling back to CPU\n", g->mc);
+            "falling back to CPU\n", bn->mc);
         return 0;
     }
     e->keyFailed = 0;
@@ -589,9 +629,17 @@ const char *gpuDeviceName(void)
     return name;
 }
 
-int gpuAvailable(const Generator *g)
+uint64_t gpuDispatchCount(void)
 {
-    if (!g || g->mc < MC_1_18 || g->dim != DIM_OVERWORLD || g->bn.nptype >= 0)
+    GPU_LOCK;
+    uint64_t count = g_gpu.dispatchCount;
+    GPU_UNLOCK;
+    return count;
+}
+
+static int gpuSurfaceBiomeAvailable(const BiomeNoise *bn)
+{
+    if (!bn || bn->nptype >= 0 || bn->mc < MC_1_18)
         return 0;
     GPU_LOCK;
     gpuEnsureRuntimeLocked(&g_gpu);
@@ -600,6 +648,13 @@ int gpuAvailable(const Generator *g)
         gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
     GPU_UNLOCK;
     return healthy;
+}
+
+int gpuAvailable(const Generator *g)
+{
+    if (!g || g->dim != DIM_OVERWORLD)
+        return 0;
+    return gpuSurfaceBiomeAvailable(&g->bn);
 }
 
 static int gpuEnsureOutLocked(GpuEngine *e, int points)
@@ -618,14 +673,21 @@ static int gpuEnsureOutLocked(GpuEngine *e, int points)
     return 0;
 }
 
-int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
-    int scale, int x, int z, int w, int h, int64_t *np)
+/*
+ * The one guarded surface-biome dispatch: both the transparent hook
+ * (gpuTrySurfaceBiomeHook) and the Generator-facing entry below funnel into
+ * this single guard, so the dispatch condition exists in exactly one place.
+ * The guard rejects unsupported arguments and engine states before the CPU
+ * caller sees any effect; a GPU error latches the engine dead here.
+ */
+static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
+    uint64_t sha, int scale, int x, int z, int w, int h, int64_t *np)
 {
-    if (!out || !g || w <= 0 || h <= 0 || (int64_t)w * h > GPU_MAX_POINTS)
+    if (!out || !bn || w <= 0 || h <= 0 || (int64_t)w * h > GPU_MAX_POINTS)
         return 1;
     if (scale != 1 && scale != 4)
         return 1;
-    if (g->mc < MC_1_18 || g->dim != DIM_OVERWORLD || g->bn.nptype >= 0)
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
         return 1;
 
     GPU_LOCK;
@@ -643,7 +705,7 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
         GPU_UNLOCK;
         return 1;
     }
-    if (!gpuPackForLocked(&g_gpu, g))
+    if (!gpuPackForLocked(&g_gpu, bn, sha))
     {
         GPU_UNLOCK;
         return 1;
@@ -731,6 +793,21 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
         GPU_UNLOCK;
         return 1;
     }
+    g_gpu.dispatchCount++;
     GPU_UNLOCK;
     return 0;
+}
+
+int gpuTrySurfaceBiomeHook(int *out, const BiomeNoise *bn, uint64_t sha,
+    int scale, int x, int z, int w, int h)
+{
+    return gpuSurfaceBiomeDispatch(out, bn, sha, scale, x, z, w, h, NULL);
+}
+
+int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
+    int scale, int x, int z, int w, int h, int64_t *np)
+{
+    if (!g || g->dim != DIM_OVERWORLD)
+        return 1;
+    return gpuSurfaceBiomeDispatch(out, &g->bn, sha, scale, x, z, w, h, np);
 }

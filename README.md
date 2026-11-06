@@ -22,6 +22,16 @@ Below is a list of all the major additions:
 
 MSVC is **not** supported for this fork. Please use MinGW, UCRT64, Clang, or GCC.
 
+## GPU acceleration (optional)
+
+The surface-biome map path, `mapOverworldSurfaceBiome()`, can run on an OpenCL device for Minecraft 1.18+ Overworld at the 1:1 and 1:4 scales. GPU results are bit-identical to the CPU implementation; a parity harness (`make gpu-test`) enforces this over a multi-version, multi-origin matrix.
+
+The GPU module is compiled in when the library is built with `-DCUBIOMES_ENABLE_GPU` and the sources `gpu.c` and `opencl_host.c` are part of the build. Without that flag none of the GPU code is compiled and the library behaves exactly as before. The OpenCL runtime is loaded dynamically, so no link-time dependency is added; the device must support double precision (`cl_khr_fp64`). Consumers compiling the CPU side should use `-ffp-contract=off -fno-fast-math` to keep the two paths bit-exact.
+
+Runtime behavior is controlled by the `CUBIOMES_GPU` environment variable: `off` never touches the GPU, `auto` (the default) uses it when a suitable device is present, and `force` is a debug aid that reports loudly when no usable device is available. Any GPU error permanently falls back to the CPU for the rest of the process; queries never fail because of the GPU.
+
+The generic flat-Y queries (`genBiomes()`, `getBiomeAt()`) always run on the CPU. The GPU kernel mirrors the surface-biome contract, deriving the terrain surface per column, which is a different query than a caller-chosen Y; a Y-parameterized kernel may be added in the future.
+
 ## Java bindings
 I have set up the automatic creation of Java bindings based on commits to the master branch. See the [java-bindings](https://github.com/xpple/cubiomes/tree/java-bindings) branch for more information.
 

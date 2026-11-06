@@ -1,5 +1,9 @@
 #include "biomenoise.h"
 
+#ifdef CUBIOMES_ENABLE_GPU
+#include "gpu.h"
+#endif
+
 #include "tables/btree18.h"
 #include "tables/btree192.h"
 #include "tables/btree19.h"
@@ -2620,6 +2624,10 @@ int mapOverworldTerrainHeight(float *y, int *ids, const BiomeNoise *bn,
 int mapOverworldSurfaceBiome(int *out, const BiomeNoise *bn, uint64_t sha,
     int scale, int x, int z, int w, int h)
 {
+#ifdef CUBIOMES_ENABLE_GPU
+    if (gpuTrySurfaceBiomeHook(out, bn, sha, scale, x, z, w, h) == 0)
+        return 0;
+#endif
     if (scale != 1 && scale != 4)
         return 1;
 
