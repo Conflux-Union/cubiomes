@@ -172,4 +172,48 @@ int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
 int gpuMapOverworldTerrainHeightRows(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int rows, int zStride);
 
+/*
+ * Bit-exact dispatches for the mod's product hot path (confluxnative.c).
+ * Unlike the float approximations above, these re-run the shim's own CPU
+ * chains in double precision and must stay bit-identical to them: the shim
+ * compiles with -ffp-contract=off, the kernels run with FP_CONTRACT OFF,
+ * and the packed tables carry the seed-derived noise parameters at full
+ * double fidelity. They need an fp64 OpenCL device (cl_khr_fp64); without
+ * one they return nonzero on every call and the caller stays on the CPU.
+ * Mode handling, engine latching and table caching are shared with the
+ * float dispatches; the counters count by family (height vs biome), not
+ * per kernel flavor.
+ */
+
+/*
+ * The shim's cfxModernOverviewHeight() over a rectangular quart lattice:
+ * heights[row*gridW + col] receives the solver result for quart cell
+ * (x4 + col*stepX4, z4 + row*stepZ4). The caller owns the lattice shape
+ * (macro grid with step 1 for the shim's stride<4 path, stride/4 steps for
+ * its direct path) and the cheap integer interpolation between lattice
+ * points. mainFirst/minMaxFirst/truncated are the shim's
+ * cfxNoiseDetailForStride() result for the sampling stride. Returns 0 when
+ * the GPU filled all gridW*gridH heights bit-exactly; nonzero means run
+ * the CPU path (unsupported arguments, disabled/dead engine, no fp64
+ * device, or any GPU error).
+ */
+int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
+    int x4, int z4, int gridW, int gridH, int stepX4, int stepZ4,
+    int mainFirst, int minMaxFirst, int truncated);
+
+/*
+ * The shim's cfxSurfaceBiomes() inner loop: for each point (blockX +
+ * col*stride, blockZ + row*stride), terrainY[row*w + col] (clamped at 62,
+ * exactly like the shim) picks the voronoi nucleus and the double climate
+ * stack resolves the surface biome id into ids[row*w + col]. terrainY is
+ * row-major w*rows and uploads per call. The CPU nucleus memo this may
+ * replace is itself bit-identical to the shim's plain loop, so the kernel
+ * inherits bit-exactness against both. Batch-size policy (skip tiny refine
+ * cells) belongs to the caller; this guard rejects only unsupported shapes
+ * (pre-1.18, over-cap batches, engine problems, no fp64 device).
+ */
+int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
+    int blockX, int blockZ, int w, int rows, int stride,
+    const int *terrainY);
+
 #endif

@@ -1362,6 +1362,445 @@ static void runZStrideCase(int mc, uint32_t flags, uint64_t seed, int ox,
         *fail = 1;
 }
 
+//----------------------------------------------------------------------
+// cfx product parity: the mod's shim hot path (confluxnative.c), bit-exact.
+//
+// confluxnative.c is JNI-bound, so the harness mirrors its analytic overview
+// solver and caller-Y biome loop below. The shim compiles with the same
+// -ffp-contract=off -fno-fast-math discipline as this file, and the
+// gpu-cfxmap integration report's JNI-stub harness pins this replication
+// against the real shim source. The biome stage needs no replication: the
+// shim calls cubiomes' own voronoiAccess3D() + sampleBiomeNoise() directly,
+// so the harness calls them too and the kernel must match bit-for-bit.
+
+#define CFX_JAGGED_KEEP_OCTAVES 4
+#define CFX_OVERVIEW_ITERATIONS 2
+
+static double cfxMaintainPrecisionRef(double value)
+{
+    return value - floor(value / 33554432.0 + 0.5) * 33554432.0;
+}
+
+static float cfxPeaksAndValleysRef(float weirdness)
+{
+    return -(fabsf(fabsf(weirdness) - 0.6666667F) - 0.33333334F) * 3.0F;
+}
+
+static void cfxTerrainParametersRef(const BiomeNoise *bn, int cellX,
+    int cellZ, float values[4])
+{
+    double px = cellX;
+    double pz = cellZ;
+    px += sampleDoublePerlin(&bn->climate[NP_SHIFT], cellX, 0, cellZ) * 4.0;
+    pz += sampleDoublePerlin(&bn->climate[NP_SHIFT], cellZ, cellX, 0) * 4.0;
+    const float weirdness = sampleDoublePerlin(
+        &bn->climate[NP_WEIRDNESS], px, 0, pz);
+    values[0] = sampleDoublePerlin(&bn->climate[NP_CONTINENTALNESS], px, 0, pz);
+    values[1] = sampleDoublePerlin(&bn->climate[NP_EROSION], px, 0, pz);
+    values[2] = cfxPeaksAndValleysRef(weirdness);
+    values[3] = weirdness;
+}
+
+/* sampleDoublePerlin over only the first maxOct octaves (coarsest first). */
+static double cfxSampleDoublePerlinPrefixRef(const DoublePerlinNoise *dp,
+    double x, double y, double z, int maxOct)
+{
+    const double f = 337.0 / 331.0;
+    double v = 0.0;
+    int i;
+    for (i = 0; i < maxOct && i < dp->octA.octcnt; i++)
+    {
+        const PerlinNoise *p = dp->octA.octaves + i;
+        const double lf = p->lacunarity;
+        v += p->amplitude * samplePerlin(p,
+            maintainPrecision(x * lf), maintainPrecision(y * lf),
+            maintainPrecision(z * lf), 0, 0);
+    }
+    for (i = 0; i < maxOct && i < dp->octB.octcnt; i++)
+    {
+        const PerlinNoise *p = dp->octB.octaves + i;
+        const double lf = p->lacunarity;
+        const double bx = x * f;
+        const double by = y * f;
+        const double bz = z * f;
+        v += p->amplitude * samplePerlin(p,
+            maintainPrecision(bx * lf), maintainPrecision(by * lf),
+            maintainPrecision(bz * lf), 0, 0);
+    }
+    return v * dp->amplitude;
+}
+
+static double cfxModernTerrainNoiseRef(const SurfaceNoise *sn, int x, int y,
+    int z, int mainFirst, int minMaxFirst)
+{
+    const double scaledXz = 684.412 * sn->xzScale;
+    const double scaledY = 684.412 * sn->yScale;
+    const double dx = x * scaledXz;
+    const double dy = y * scaledY;
+    const double dz = z * scaledXz;
+    const double mainX = dx / sn->xzFactor;
+    const double mainY = dy / sn->yFactor;
+    const double mainZ = dz / sn->xzFactor;
+    const double smearY = scaledY * 8.0;
+    const double mainSmearY = smearY / sn->yFactor;
+    double interpolation = 0.0;
+    double frequency = ldexp(1.0, -mainFirst);
+    int i;
+
+    for (i = mainFirst; i < 8; i++)
+    {
+        interpolation += samplePerlin(&sn->octmain.octaves[i],
+            cfxMaintainPrecisionRef(mainX * frequency),
+            cfxMaintainPrecisionRef(mainY * frequency),
+            cfxMaintainPrecisionRef(mainZ * frequency),
+            mainSmearY * frequency,
+            mainY * frequency) / frequency;
+        frequency *= 0.5;
+    }
+
+    const double blend = (interpolation / 10.0 + 1.0) * 0.5;
+    double lower = 0.0;
+    double upper = 0.0;
+    frequency = ldexp(1.0, -minMaxFirst);
+    for (i = minMaxFirst; i < 16; i++)
+    {
+        const double sx = cfxMaintainPrecisionRef(dx * frequency);
+        const double sy = cfxMaintainPrecisionRef(dy * frequency);
+        const double sz = cfxMaintainPrecisionRef(dz * frequency);
+        const double yScale = smearY * frequency;
+        if (blend < 1.0)
+            lower += samplePerlin(&sn->octmin.octaves[i],
+                sx, sy, sz, yScale, dy * frequency) / frequency;
+        if (blend > 0.0)
+            upper += samplePerlin(&sn->octmax.octaves[i],
+                sx, sy, sz, yScale, dy * frequency) / frequency;
+        frequency *= 0.5;
+    }
+    return clampedLerp(blend, lower / 512.0, upper / 512.0) / 128.0;
+}
+
+static int cfxModernOverviewHeightRef(const BiomeNoise *bn, int x4, int z4,
+    int mainFirst, int minMaxFirst, int truncated)
+{
+    float values[4];
+    cfxTerrainParametersRef(bn, x4, z4, values);
+    const double offset = -0.50375F + getSpline(bn->sp, values);
+    const double factor = getSpline(bn->factorSp, values);
+    const double jaggedness = getSpline(bn->jaggedSp, values);
+    double jagged = 0.0;
+    if (!truncated)
+    {
+        jagged = sampleDoublePerlin(&bn->jagged,
+            x4 * 4 * 1500.0, 0.0, z4 * 4 * 1500.0);
+        if (jagged < 0.0)
+            jagged *= 0.5;
+        jagged *= jaggedness;
+    }
+    else if (jaggedness != 0.0F)
+    {
+        jagged = cfxSampleDoublePerlinPrefixRef(&bn->jagged,
+            x4 * 4 * 1500.0, 0.0, z4 * 4 * 1500.0, CFX_JAGGED_KEEP_OCTAVES);
+        if (jagged < 0.0)
+            jagged *= 0.5;
+        jagged *= jaggedness;
+    }
+
+    const double base = 1.0 + offset + jagged;
+    double y = 128.0 * base;
+    if (factor <= 1e-9)
+        return (int) floor(y);
+
+    for (int i = 0; i < CFX_OVERVIEW_ITERATIONS; i++)
+    {
+        const double noise = cfxModernTerrainNoiseRef(&bn->terrain,
+            x4 * 4, (int) floor(y), z4 * 4, mainFirst, minMaxFirst);
+        const double above = 128.0 * (base + noise / factor);
+        const double below = 128.0 * (base + noise / (4.0 * factor));
+        const double next = above >= 128.0 * base ? above : below;
+        if (fabs(next - y) < 0.5)
+        {
+            y = next;
+            break;
+        }
+        y = next;
+    }
+    return (int) floor(y);
+}
+
+/* The shim's cfxNoiseDetailForStride(): coarse strides drop fine octaves. */
+static void cfxNoiseDetailForStrideRef(const SurfaceNoise *sn, int stride,
+    int *mainFirst, int *minMaxFirst, int *truncated)
+{
+    *mainFirst = 0;
+    *minMaxFirst = 0;
+    *truncated = 0;
+    if (stride < 8)
+        return;
+    *truncated = 1;
+    const double scaledXz = 684.412 * sn->xzScale;
+    double w = 1.0 / scaledXz;
+    while (*minMaxFirst < 16 && w < (double) stride * 0.5)
+    {
+        w *= 2.0;
+        (*minMaxFirst)++;
+    }
+    w = 1.0 / (scaledXz / sn->xzFactor);
+    while (*mainFirst < 8 && w < (double) stride * 0.25)
+    {
+        w *= 2.0;
+        (*mainFirst)++;
+    }
+}
+
+// Overview lattices the shim's tile pipeline solves: the dense LOD0-1
+// quart macro grids (step 1, full detail) and the LOD2-4 coarse anchor
+// lattices (stride/4 steps, truncated detail). The kernel parity runs on
+// the lattice itself; the shim's integer interpolation between anchors is
+// host-side code the GPU never touches.
+typedef struct
+{
+    int step4;
+    int stride;
+    int w, h;
+} CfxLShape;
+
+static const CfxLShape CFX_LSHAPES[] =
+{
+    {1, 1, 66, 66},     // LOD0 dense overview macro lattice
+    {1, 2, 130, 130},   // LOD1 macro lattice
+    {2, 8, 130, 130},   // LOD2 coarse anchors
+    {4, 16, 130, 130},  // LOD3 coarse anchors
+    {8, 32, 66, 66},    // LOD4 coarse anchors (reduced size to bound runtime)
+};
+#define CFX_LSHAPE_CNT (int)(sizeof(CFX_LSHAPES) / sizeof(CFX_LSHAPES[0]))
+
+// Caller-Y biome batches of the tile pipeline: dense LOD0-1 and the
+// LOD2-4 anchor sweeps (the tiny lattice-refine 2x2 cells stay CPU by
+// dispatch-overhead policy and are shape-covered by the small dense cases).
+typedef struct
+{
+    int stride;
+    int w, h;
+} CfxBShape;
+
+static const CfxBShape CFX_BSHAPES[] =
+{
+    {1, 258, 258},   // LOD0 dense
+    {2, 129, 129},   // LOD1 dense
+    {8, 130, 130},   // LOD2 anchors
+    {16, 130, 130},  // LOD3 anchors
+    {32, 130, 130},  // LOD4 anchors
+};
+#define CFX_BSHAPE_CNT (int)(sizeof(CFX_BSHAPES) / sizeof(CFX_BSHAPES[0]))
+
+static int runCfxLatticeCase(const Generator *g, int ox4, int oz4,
+    const CfxLShape *sh, CaseStats *total, int *fail)
+{
+    const int w = sh->w, h = sh->h, points = w * h;
+    int mf, mmf, tr;
+    cfxNoiseDetailForStrideRef(&g->bn.terrain, sh->stride, &mf, &mmf, &tr);
+
+    int *ref = malloc(sizeof(int) * (size_t)points);
+    int *gpu = malloc(sizeof(int) * (size_t)points);
+    if (!ref || !gpu)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+    double t0 = nowSeconds();
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            ref[j * w + i] = cfxModernOverviewHeightRef(&g->bn,
+                ox4 + i * sh->step4, oz4 + j * sh->step4, mf, mmf, tr);
+    double t1 = nowSeconds();
+    int rc = gpuCfxOverviewHeights(gpu, &g->bn, ox4, oz4, w, h,
+        sh->step4, sh->step4, mf, mmf, tr);
+    double t2 = nowSeconds();
+    if (rc != 0)
+    {
+        printf("  FAIL: gpuCfxOverviewHeights rejected (stride %d, rc %d)\n",
+            sh->stride, rc);
+        *fail = 1;
+    }
+    int mismatches = 0;
+    for (int p = 0; p < points; p++)
+        if (gpu[p] != ref[p])
+            mismatches++;
+    if (mismatches)
+    {
+        printf("  FAIL: overview lattice stride=%d: %d/%d height mismatches"
+            " (mf=%d mmf=%d tr=%d)\n",
+            sh->stride, mismatches, points, mf, mmf, tr);
+        const int show = mismatches < 3 ? mismatches : 3;
+        int shown = 0;
+        for (int j = 0; j < h && shown < show; j++)
+            for (int i = 0; i < w && shown < show; i++)
+                if (gpu[j * w + i] != ref[j * w + i])
+                {
+                    printf("    @(x4=%d,z4=%d): gpu=%d ref=%d\n",
+                        ox4 + i * sh->step4, oz4 + j * sh->step4,
+                        gpu[j * w + i], ref[j * w + i]);
+                    shown++;
+                }
+        *fail = 1;
+    }
+    printf("  overview lattice stride=%d %dx%d: %d mismatches"
+        " [cpu %.0fms gpu %.0fms]\n",
+        sh->stride, w, h, mismatches, (t1 - t0) * 1e3, (t2 - t1) * 1e3);
+    total->pts += points;
+    free(ref);
+    free(gpu);
+    return mismatches;
+}
+
+static int runCfxBiomeCase(const Generator *g, int ox, int oz,
+    const CfxBShape *sh, CaseStats *total, int *fail)
+{
+    const int w = sh->w, h = sh->h, points = w * h;
+    int mf, mmf, tr;
+    cfxNoiseDetailForStrideRef(&g->bn.terrain, sh->stride, &mf, &mmf, &tr);
+
+    int *terrainY = malloc(sizeof(int) * (size_t)points);
+    int *ref = malloc(sizeof(int) * (size_t)points);
+    int *gpu = malloc(sizeof(int) * (size_t)points);
+    if (!terrainY || !ref || !gpu)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+    // The caller-Y contract resolves biomes from already-sampled terrain;
+    // feed the batch the same solver heights the product would.
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            terrainY[j * w + i] = cfxModernOverviewHeightRef(&g->bn,
+                floordiv(ox + i * sh->stride, 4),
+                floordiv(oz + j * sh->stride, 4), mf, mmf, tr);
+
+    double t0 = nowSeconds();
+    for (int j = 0; j < h; j++)
+    {
+        for (int i = 0; i < w; i++)
+        {
+            const int idx = j * w + i;
+            int x4, y4, z4;
+            voronoiAccess3D(g->sha, ox + i * sh->stride,
+                terrainY[idx] < 62 ? 62 : terrainY[idx],
+                oz + j * sh->stride, &x4, &y4, &z4);
+            ref[idx] = sampleBiomeNoise(&g->bn, NULL, x4, y4, z4, NULL, 0);
+        }
+    }
+    double t1 = nowSeconds();
+    int rc = gpuCfxSurfaceBiomes(gpu, &g->bn, g->sha, ox, oz, w, h,
+        sh->stride, terrainY);
+    double t2 = nowSeconds();
+    if (rc != 0)
+    {
+        printf("  FAIL: gpuCfxSurfaceBiomes rejected (stride %d, rc %d)\n",
+            sh->stride, rc);
+        *fail = 1;
+    }
+    int mismatches = 0;
+    for (int p = 0; p < points; p++)
+        if (gpu[p] != ref[p])
+            mismatches++;
+    if (mismatches)
+    {
+        printf("  FAIL: caller-Y biomes stride=%d: %d/%d id mismatches\n",
+            sh->stride, mismatches, points);
+        const int show = mismatches < 3 ? mismatches : 3;
+        int shown = 0;
+        for (int j = 0; j < h && shown < show; j++)
+            for (int i = 0; i < w && shown < show; i++)
+                if (gpu[j * w + i] != ref[j * w + i])
+                {
+                    printf("    @(%d,%d): gpu=%d ref=%d\n",
+                        ox + i * sh->stride, oz + j * sh->stride,
+                        gpu[j * w + i], ref[j * w + i]);
+                    shown++;
+                }
+        *fail = 1;
+    }
+    printf("  caller-Y biomes stride=%d %dx%d: %d mismatches"
+        " [cpu %.0fms gpu %.0fms]\n",
+        sh->stride, w, h, mismatches, (t1 - t0) * 1e3, (t2 - t1) * 1e3);
+    total->pts += points;
+    free(terrainY);
+    free(ref);
+    free(gpu);
+    return mismatches;
+}
+
+static void runCfxCase(int mc, uint32_t flags, uint64_t seed, int ox, int oz,
+    int shapeCnt, CaseStats *total, int *fail)
+{
+    printf("cfx parity mc=%d seed=%llu origin=(%d,%d)\n",
+        mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    if (g.bn.nptype >= 0)
+    {
+        fprintf(stderr, "gpu-test: generator for mc %d not initialized\n", mc);
+        exit(2);
+    }
+
+    const int ox4 = floordiv(ox, 4);
+    const int oz4 = floordiv(oz, 4);
+    for (int s = 0; s < shapeCnt && s < CFX_LSHAPE_CNT; s++)
+        runCfxLatticeCase(&g, ox4, oz4, &CFX_LSHAPES[s], total, fail);
+    for (int s = 0; s < shapeCnt && s < CFX_BSHAPE_CNT; s++)
+        runCfxBiomeCase(&g, ox, oz, &CFX_BSHAPES[s], total, fail);
+}
+
+// Mode handling of the cfx entries: off must decline without touching the
+// outputs, force must still dispatch on a working device.
+static void runCfxModeCase(uint64_t seed, CaseStats *total, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    int ref[64], gpu[64], terrainY[64];
+    for (int i = 0; i < 64; i++)
+        terrainY[i] = 64;
+
+    const int modeBefore = gpuGetMode();
+    gpuSetMode(GPU_MODE_OFF);
+    int rcH = gpuCfxOverviewHeights(gpu, &g.bn, 0, 0, 8, 8, 1, 1, 0, 0, 0);
+    int rcB = gpuCfxSurfaceBiomes(gpu, &g.bn, g.sha, 0, 0, 8, 8, 1, terrainY);
+    gpuSetMode(modeBefore);
+    if (rcH == 0 || rcB == 0)
+    {
+        printf("  FAIL: cfx dispatch succeeded in off mode (%d %d)\n", rcH, rcB);
+        *fail = 1;
+    }
+
+    gpuSetMode(GPU_MODE_FORCE);
+    int rcF = gpuCfxOverviewHeights(gpu, &g.bn, 0, 0, 8, 8, 1, 1, 0, 0, 0);
+    gpuSetMode(modeBefore);
+    if (rcF != 0)
+    {
+        printf("  FAIL: cfx dispatch rejected in force mode (rc %d)\n", rcF);
+        *fail = 1;
+    }
+    else
+    {
+        const int mf = 0, mmf = 0, tr = 0;
+        for (int j = 0; j < 8; j++)
+            for (int i = 0; i < 8; i++)
+                ref[j * 8 + i] = cfxModernOverviewHeightRef(&g.bn,
+                    i, j, mf, mmf, tr);
+        if (memcmp(gpu, ref, sizeof(ref)) != 0)
+        {
+            printf("  FAIL: force-mode cfx heights drifted from the CPU\n");
+            *fail = 1;
+        }
+        total->pts += 64;
+    }
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -1388,6 +1827,7 @@ int main(int argc, char **argv)
         // calls (deterministic accessor, not a timing probe).
         float y[4];
         int ids[4];
+        int hi[4], yi[4];
         if (gpuRuntimeInitialized())
         {
             printf("FAIL: runtime initialized before any dispatch in off"
@@ -1400,6 +1840,15 @@ int main(int argc, char **argv)
         gpuMapOverworldSurfaceBiomeRows(ids, &probe.bn, probe.sha, 4,
             0, 0, 2, 2, 16);
         gpuMapOverworldTerrainHeightRows(y, ids, &probe.bn, 0, 0, 2, 2, 16);
+        // ... and so do the bit-exact cfx product dispatches
+        if (gpuCfxOverviewHeights(hi, &probe.bn, 0, 0, 1, 1, 1, 1,
+                0, 0, 0) == 0
+            || gpuCfxSurfaceBiomes(ids, &probe.bn, probe.sha, 0, 0, 1, 1, 1,
+                yi) == 0)
+        {
+            printf("FAIL: cfx dispatch succeeded in off mode\n");
+            return 1;
+        }
         if (gpuRuntimeInitialized())
         {
             printf("FAIL: runtime initialized in off mode\n");
@@ -1574,6 +2023,31 @@ int main(int argc, char **argv)
         &total, &fail);
     runZStrideCase(MC_1_18, 0, seeds[0], 0, 0, 96, 8, 7, 4, &total, &fail);
     runZStrideCase(MC_26_3, 0, seeds[0], 0, 0, 96, 8, 33, 4, &total, &fail);
+
+    // cfx product parity: the mod's shim hot path re-run bit-exactly on the
+    // fp64 kernels. Default: the main version over the first three origins
+    // (origin straddle, far field, negative quadrant) with every covered
+    // LOD shape; --full extends to all seeds, the world-border origins and
+    // the oldest/newest biome-tree versions plus a large-biomes case. Any
+    // single mismatch is a porting bug - there are no drift budgets here.
+    const int cfxShapeCnt = CFX_LSHAPE_CNT;
+    for (int si = 0; si < (full ? seedCnt : 1); si++)
+    {
+        const int cfxOriginCnt = full
+            ? (int)(sizeof(origins) / sizeof(origins[0]))
+            : 3;
+        for (int oi = 0; oi < cfxOriginCnt; oi++)
+            runCfxCase(mainMc, 0, seeds[si], origins[oi][0], origins[oi][1],
+                cfxShapeCnt, &total, &fail);
+    }
+    if (full)
+    {
+        runCfxCase(MC_1_18, 0, seeds[0], 0, 0, 2, &total, &fail);
+        runCfxCase(MC_26_3, 0, seeds[0], 1000000, 1000000, 2, &total, &fail);
+        runCfxCase(mainMc, LARGE_BIOMES, seeds[0], 100000, 100000, 1,
+            &total, &fail);
+    }
+    runCfxModeCase(seeds[0], &total, &fail);
 
     printf("\n");
     if (total.wrapperReplicationMismatch)

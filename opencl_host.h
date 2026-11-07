@@ -41,6 +41,7 @@ enum
     CL_DEVICE_TYPE_GPU = (1 << 2),
     CL_DEVICE_NAME = 0x102B,
     CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002,
+    CL_DEVICE_EXTENSIONS = 0x1030,
 
     CL_MEM_READ_WRITE = (1 << 0),
     CL_MEM_READ_ONLY = (1 << 2),
@@ -79,6 +80,8 @@ typedef cl_int (*clEnqueueNDRangeKernel_t)(cl_command_queue, cl_kernel,
     const cl_event *, cl_event *);
 typedef cl_int (*clEnqueueReadBuffer_t)(cl_command_queue, cl_mem, cl_bool,
     size_t, size_t, void *, cl_uint, const cl_event *, cl_event *);
+typedef cl_int (*clEnqueueWriteBuffer_t)(cl_command_queue, cl_mem, cl_bool,
+    size_t, size_t, const void *, cl_uint, const cl_event *, cl_event *);
 typedef cl_int (*clGetKernelWorkGroupInfo_t)(cl_kernel, cl_device_id,
     cl_uint, size_t, void *, size_t *);
 
@@ -104,6 +107,7 @@ typedef struct
     clSetKernelArg_t SetKernelArg;
     clEnqueueNDRangeKernel_t EnqueueNDRangeKernel;
     clEnqueueReadBuffer_t EnqueueReadBuffer;
+    clEnqueueWriteBuffer_t EnqueueWriteBuffer;
     clGetKernelWorkGroupInfo_t GetKernelWorkGroupInfo;
 } GpuClFuncs;
 

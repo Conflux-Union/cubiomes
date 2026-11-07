@@ -68,9 +68,11 @@ typedef struct
     int valid;
     int octTotal;
     uint8_t *perm;   // octTotal * 257
-    float *pinfo;    // octTotal * 8
+    float *pinfo;    // octTotal * 8 (float copy, float kernels)
+    double *pinfoD;  // octTotal * 8 (double copy, cfx kernels); slot 7 = h2
     int noff[GPU_INST_COUNT * 4];
     float namp[GPU_INST_COUNT];
+    double nampD[GPU_INST_COUNT];
     int sNodeTotal;
     int *styp, *slen, *schild;
     float *sloc, *sder;
@@ -81,6 +83,10 @@ typedef struct
     size_t btStepsSize, btParamSize, btNodesSize;
     uint32_t btLen, btOrder;
     float snXZScale, snYScale, snXZFactor, snYFactor;
+    // The cfx kernels re-run the shim's double chains, so they need the
+    // SurfaceNoise scales at full double fidelity (the float copies above
+    // serve the float kernels, which were already float-approximate).
+    double snXZScaleD, snYScaleD, snXZFactorD, snYFactorD;
     int octMinOff, octMaxOff, octMainOff;
 } GpuTables;
 
@@ -99,7 +105,11 @@ typedef struct
     int dead;
     int forceWarned;
     GpuCl cl;
+    cl_program cfxProgram;  // fp64 cfx kernels; separate from the float program
     cl_kernel kHeight;  // terrainHeightKernel, created from the built program
+    cl_kernel kCfxHeight, kCfxBiome;  // cfxOverviewHeightKernel, cfxBiomeAtYKernel
+    int cfxAvail;       // fp64 program built + both cfx kernels live
+    int cfxInited;      // the one lazy cfx build attempt has been made
     size_t localSize;
     GpuTables tables;
     uint64_t keyProbe;
@@ -109,9 +119,11 @@ typedef struct
     uint64_t dispatchCount;
     uint64_t heightCount;
     cl_mem mPerm, mPinfo, mNoff, mNamp;
+    cl_mem mPinfoD, mNampD;
     cl_mem mStyp, mSlen, mSloc, mSder, mSchild;
     cl_mem mSteps, mParam, mNodes;
     cl_mem mOutNp, mOutId, mOutY;
+    cl_mem mInY, mOutYi;  // cfx biome input heights, cfx height int output
     int outCap;
 } GpuEngine;
 
@@ -122,15 +134,11 @@ static GpuEngine g_gpu =
 #else
     PTHREAD_MUTEX_INITIALIZER,
 #endif
-    -1, GPU_MODE_AUTO, 0,
-    0, 0, 0, 0,
-    {{0}}, NULL, 64,
-    {0},
-    0, 0, 0, 0, 0, 0,
-    NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL,
-    NULL, NULL, NULL, 0,
+    -1, GPU_MODE_AUTO,
+    // Everything after modeUser/modeEnv is zero-initialized: modeEnvParsed,
+    // clInited, clAvail, dead, forceWarned, cl, kHeight, cfxAvail,
+    // localSize (re-set at first init), tables, cache key, counters,
+    // buffers, outCap.
 };
 
 static void gpuClErr(GpuEngine *e, cl_int err, const char *what)
@@ -157,6 +165,7 @@ static void gpuReleasePack(GpuEngine *e)
     cl_mem *bufs[] =
     {
         &e->mPerm, &e->mPinfo, &e->mNoff, &e->mNamp,
+        &e->mPinfoD, &e->mNampD,
         &e->mStyp, &e->mSlen, &e->mSloc, &e->mSder, &e->mSchild,
         &e->mSteps, &e->mParam, &e->mNodes,
     };
@@ -168,6 +177,7 @@ static void gpuReleasePack(GpuEngine *e)
     }
     free(e->tables.perm);
     free(e->tables.pinfo);
+    free(e->tables.pinfoD);
     free(e->tables.styp);
     free(e->tables.slen);
     free(e->tables.schild);
@@ -186,9 +196,15 @@ static void gpuReleaseOut(GpuEngine *e)
         e->cl.fn.ReleaseMemObject(e->mOutId);
     if (e->mOutY)
         e->cl.fn.ReleaseMemObject(e->mOutY);
+    if (e->mInY)
+        e->cl.fn.ReleaseMemObject(e->mInY);
+    if (e->mOutYi)
+        e->cl.fn.ReleaseMemObject(e->mOutYi);
     e->mOutNp = NULL;
     e->mOutId = NULL;
     e->mOutY = NULL;
+    e->mInY = NULL;
+    e->mOutYi = NULL;
     e->outCap = 0;
 }
 
@@ -249,6 +265,90 @@ int gpuGetMode(void)
 //----------------------------------------------------------------------
 // Runtime init
 
+/*
+ * The float program is built from the shipped source text byte-for-byte,
+ * so devices (and drivers' JIT caches) keep the engine's existing
+ * first-use compile behavior untouched. The fp64 cfx kernels compile into
+ * a SECOND program, built lazily (see gpuEnsureCfxLocked) and only when
+ * the device advertises cl_khr_fp64: a cfx compile failure - or a device
+ * without fp64 - then leaves the float path fully intact and only the cfx
+ * dispatches report unavailable.
+ */
+static int gpuDeviceHasFp64(const GpuCl *cl)
+{
+    size_t extLen = 0;
+    if (cl->fn.GetDeviceInfo(cl->device, CL_DEVICE_EXTENSIONS, 0, NULL,
+            &extLen) != CL_SUCCESS || extLen == 0)
+        return 0;
+    char *ext = malloc(extLen);
+    if (!ext)
+        return 0;
+    int has = 0;
+    if (cl->fn.GetDeviceInfo(cl->device, CL_DEVICE_EXTENSIONS, extLen, ext,
+            NULL) == CL_SUCCESS)
+    {
+        ext[extLen - 1] = 0;
+        has = strstr(ext, "cl_khr_fp64") != NULL;
+    }
+    free(ext);
+    return has;
+}
+
+/*
+ * Builds the fp64 cfx program from the pragma + cfx source section. A
+ * build failure prints the compiler log once and reports unavailable, so
+ * a device that advertises the extension but cannot compile the kernels
+ * degrades to the CPU path like any other engine problem.
+ */
+static cl_program gpuBuildCfxProgram(GpuEngine *e)
+{
+    const char *parts[2] = { GPU_CL_PRAGMA_FP64, GPU_CL_SRC_CFX };
+    const size_t lens[2] =
+    {
+        strlen(GPU_CL_PRAGMA_FP64),
+        strlen(GPU_CL_SRC_CFX),
+    };
+    cl_int err = CL_SUCCESS;
+    cl_program program = e->cl.fn.CreateProgramWithSource(e->cl.context, 2,
+        parts, lens, &err);
+    if (!program || err != CL_SUCCESS)
+        return NULL;
+    err = e->cl.fn.BuildProgram(program, 1, &e->cl.device, GPU_CL_OPTS,
+        NULL, NULL);
+    if (err != CL_SUCCESS)
+    {
+        size_t logLen = 0;
+        e->cl.fn.GetProgramBuildInfo(program, e->cl.device,
+            CL_PROGRAM_BUILD_LOG, 0, NULL, &logLen);
+        if (logLen > 0)
+        {
+            char *log = (char *) malloc(logLen + 1);
+            if (log)
+            {
+                e->cl.fn.GetProgramBuildInfo(program, e->cl.device,
+                    CL_PROGRAM_BUILD_LOG, logLen, log, NULL);
+                log[logLen - 1] = 0;
+                fprintf(stderr, "gpu: cfx fp64 program build failed:\n%s\n",
+                    log);
+                free(log);
+            }
+        }
+        e->cl.fn.ReleaseProgram(program);
+        return NULL;
+    }
+    return program;
+}
+
+static cl_kernel gpuKernelFromProgram(GpuEngine *e, cl_program program,
+    const char *name)
+{
+    cl_int err = CL_SUCCESS;
+    cl_kernel k = e->cl.fn.CreateKernel(program, name, &err);
+    if (!k || err != CL_SUCCESS)
+        return NULL;
+    return k;
+}
+
 static void gpuEnsureRuntimeLocked(GpuEngine *e)
 {
     if (e->clInited)
@@ -271,7 +371,11 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
         e->clAvail = 0;
         return;
     }
-    // One local size serves both kernels: the smaller workgroup limit wins.
+
+    // One local size serves every built kernel: the smallest workgroup
+    // limit wins. The cfx program may not exist yet (built lazily on the
+    // first cfx dispatch, so float-only consumers never pay its JIT cost);
+    // gpuEnsureCfxLocked folds its kernels into the minimum when it does.
     size_t wg = 0;
     e->cl.fn.GetKernelWorkGroupInfo(e->cl.kernel, e->cl.device,
         CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL);
@@ -282,6 +386,46 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
         wg = wgh;
     if (wg > 0)
         e->localSize = wg < GPU_LOCAL_SIZE_MAX ? wg : GPU_LOCAL_SIZE_MAX;
+}
+
+/*
+ * Lazy fp64 build for the cfx product kernels: compiled on the first cfx
+ * dispatch rather than at engine init, so consumers that only ever use the
+ * float paths never pay this program's JIT compile cost. Safe under the
+ * engine mutex (both cfx dispatches hold it); cfxInited latches the single
+ * attempt - a failed build (no fp64, compiler failure) is not retried, and
+ * the dispatches fall back to the CPU for the process lifetime like any
+ * other engine problem.
+ */
+static int gpuEnsureCfxLocked(GpuEngine *e)
+{
+    if (e->cfxInited)
+        return e->cfxAvail;
+    e->cfxInited = 1;
+    if (!gpuDeviceHasFp64(&e->cl))
+        return 0;
+    e->cfxProgram = gpuBuildCfxProgram(e);
+    if (!e->cfxProgram)
+        return 0;
+    e->kCfxHeight = gpuKernelFromProgram(e, e->cfxProgram,
+        "cfxOverviewHeightKernel");
+    e->kCfxBiome = gpuKernelFromProgram(e, e->cfxProgram,
+        "cfxBiomeAtYKernel");
+    e->cfxAvail = e->kCfxHeight && e->kCfxBiome;
+    if (!e->cfxAvail)
+        return 0;
+
+    // Fold the new kernels into the workgroup minimum.
+    cl_kernel all[] = { e->kCfxHeight, e->kCfxBiome };
+    for (int i = 0; i < (int)(sizeof(all) / sizeof(*all)); i++)
+    {
+        size_t wgi = 0;
+        e->cl.fn.GetKernelWorkGroupInfo(all[i], e->cl.device,
+            CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgi), &wgi, NULL);
+        if (wgi > 0 && wgi < e->localSize)
+            e->localSize = wgi < GPU_LOCAL_SIZE_MAX ? wgi : GPU_LOCAL_SIZE_MAX;
+    }
+    return 1;
 }
 
 //----------------------------------------------------------------------
@@ -299,6 +443,18 @@ static void packPerlin(GpuTables *t, const PerlinNoise *p, int slot)
     info[5] = (float) p->d2;
     info[6] = (float) p->t2;
     info[7] = 0.0f;
+    // The cfx kernels re-run the shim's exact double chains, so they get
+    // the struct values verbatim (a/b/c/amp/lac are seed-derived doubles
+    // the float copy would round).
+    double *infoD = t->pinfoD + (size_t)slot * 8;
+    infoD[0] = p->a;
+    infoD[1] = p->b;
+    infoD[2] = p->c;
+    infoD[3] = p->amplitude;
+    infoD[4] = p->lacunarity;
+    infoD[5] = p->d2;
+    infoD[6] = p->t2;
+    infoD[7] = p->h2;   // uint8_t; (int)info[7] in the kernel recovers it
 }
 
 static int packDoublePerlin(GpuTables *t, const DoublePerlinNoise *dp,
@@ -317,6 +473,7 @@ static int packDoublePerlin(GpuTables *t, const DoublePerlinNoise *dp,
         packPerlin(t, &dp->octB.octaves[i], (*cursor)++);
     t->noff[inst * 4 + 3] = dp->octB.octcnt;
     t->namp[inst] = (float) dp->amplitude;
+    t->nampD[inst] = dp->amplitude;
     return 0;
 }
 
@@ -560,8 +717,9 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     t->sder = malloc(sizeof(float) * (size_t)sNodes * 12);
     t->perm = malloc((size_t)cap * 257);
     t->pinfo = malloc(sizeof(float) * (size_t)cap * 8);
+    t->pinfoD = malloc(sizeof(double) * (size_t)cap * 8);
     if (!t->styp || !t->slen || !t->schild || !t->sloc || !t->sder
-        || !t->perm || !t->pinfo)
+        || !t->perm || !t->pinfo || !t->pinfoD)
         return 1;
 
     int cursor = 0;
@@ -617,6 +775,10 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     t->snYScale = sn->yScale;
     t->snXZFactor = sn->xzFactor;
     t->snYFactor = sn->yFactor;
+    t->snXZScaleD = sn->xzScale;
+    t->snYScaleD = sn->yScale;
+    t->snXZFactorD = sn->xzFactor;
+    t->snYFactorD = sn->yFactor;
 
     t->valid = 1;
     return 0;
@@ -697,12 +859,17 @@ static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn)
         (size_t)e->tables.octTotal * 257, e->tables.perm);
     e->mPinfo = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(float) * (size_t)e->tables.octTotal * 8, e->tables.pinfo);
+    e->mPinfoD = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        sizeof(double) * (size_t)e->tables.octTotal * 8, e->tables.pinfoD);
     e->mNoff = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(e->tables.noff), e->tables.noff);
     e->mNamp = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(e->tables.namp), e->tables.namp);
+    e->mNampD = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        sizeof(e->tables.nampD), e->tables.nampD);
     size_t nodes = (size_t)e->tables.sNodeTotal;
-    if (e->mPerm && e->mPinfo && e->mNoff && e->mNamp)
+    if (e->mPerm && e->mPinfo && e->mPinfoD && e->mNoff && e->mNamp
+        && e->mNampD)
     {
         e->mStyp = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             sizeof(int) * nodes, e->tables.styp);
@@ -800,7 +967,13 @@ static int gpuEnsureOutLocked(GpuEngine *e, int points)
     if (e->mOutId)
         e->mOutY = gpuBuf(e, CL_MEM_READ_WRITE,
             sizeof(float) * (size_t)points, NULL);
-    if (!e->mOutY)
+    if (e->mOutY)
+        e->mInY = gpuBuf(e, CL_MEM_READ_ONLY,
+            sizeof(int) * (size_t)points, NULL);
+    if (e->mInY)
+        e->mOutYi = gpuBuf(e, CL_MEM_READ_WRITE,
+            sizeof(int) * (size_t)points, NULL);
+    if (!e->mOutYi)
         return 1;
     e->outCap = points;
     return 0;
@@ -1089,4 +1262,261 @@ int gpuMapOverworldTerrainHeightRows(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int rows, int zStride)
 {
     return gpuHeightDispatch(y, ids, bn, x, z, w, rows, zStride);
+}
+
+/*
+ * The cfx product dispatches behind the mod's shim (confluxnative.c):
+ * bit-exact double-precision re-runs of the shim's own CPU chains, unlike
+ * the float approximations above. Same engine, same packed tables (the
+ * double pinfo/namp copies serve these kernels), same guard discipline
+ * - OFF never initializes the runtime, any GPU error latches the engine
+ * dead, and a nonzero return always means "run the CPU path".
+ */
+
+/*
+ * The packed-table argument prefix shared by the two cfx kernels, in their
+ * common order. *a is the running argument index.
+ */
+static cl_int gpuSetCfxTableArgsLocked(cl_kernel k, cl_uint *a)
+{
+    cl_int err = CL_SUCCESS;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mPerm);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mPinfoD);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNoff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNampD);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mStyp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSlen);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSloc);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSder);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSchild);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootSp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootFactor);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootJagged);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSteps);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mParam);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNodes);
+    cl_uint btLen = g_gpu.tables.btLen;
+    cl_uint btOrder = g_gpu.tables.btOrder;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btLen);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btOrder);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snXZScaleD);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snYScaleD);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snXZFactorD);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+        &g_gpu.tables.snYFactorD);
+    cl_int octMinOff = g_gpu.tables.octMinOff;
+    cl_int octMaxOff = g_gpu.tables.octMaxOff;
+    cl_int octMainOff = g_gpu.tables.octMainOff;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMinOff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMaxOff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMainOff);
+    return err;
+}
+
+/*
+ * One guarded dispatch of the shim's cfxModernOverviewHeight() over a
+ * rectangular quart lattice: heights[i] receives the solver result for
+ * (x4 + col*stepX4, z4 + row*stepZ4). The caller derives the lattice and
+ * keeps the cheap integer interpolation host-side (the shim's macro path).
+ * The detail scalars are the shim's cfxNoiseDetailForStride() result; the
+ * kernel trusts them like it trusts the packed tables. Returns 0 when the
+ * GPU filled all gridW*gridH heights bit-exactly and nonzero when the
+ * caller must run the CPU path.
+ */
+int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
+    int x4, int z4, int gridW, int gridH, int stepX4, int stepZ4,
+    int mainFirst, int minMaxFirst, int truncated)
+{
+    if (!heights || !bn || gridW <= 0 || gridH <= 0
+        || (int64_t)gridW * gridH > GPU_MAX_POINTS
+        || stepX4 <= 0 || stepZ4 <= 0
+        || mainFirst < 0 || mainFirst > 7
+        || minMaxFirst < 0 || minMaxFirst > 15
+        || (truncated != 0 && truncated != 1))
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+
+    GPU_LOCK;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init on purpose, same as the float paths.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    gpuEnsureRuntimeLocked(&g_gpu);
+    const int cfxReady = gpuEnsureCfxLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead || !cfxReady)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu,
+                !g_gpu.clAvail || g_gpu.dead
+                    ? "no usable OpenCL device"
+                    : "no fp64 OpenCL device for the cfx kernels");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    const int points = gridW * gridH;
+    if (gpuEnsureOutLocked(&g_gpu, points))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = g_gpu.kCfxHeight;
+    cl_int err = CL_SUCCESS;
+    cl_uint a = 0;
+    err |= gpuSetCfxTableArgsLocked(k, &a);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &mainFirst);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &minMaxFirst);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &truncated);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &x4);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &z4);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stepX4);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stepZ4);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &gridW);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &gridH);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutYi);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    size_t ls = g_gpu.localSize;
+    size_t global[2] =
+    {
+        ((size_t) gridW + ls - 1) / ls * ls,
+        (size_t) gridH
+    };
+    size_t local[2] = { ls, 1 };
+    err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
+        global, local, 0, NULL, NULL);
+    if (err == CL_SUCCESS)
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutYi,
+            CL_TRUE, 0, sizeof(int) * (size_t)points, heights, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "gpu cfx height dispatch");
+        GPU_UNLOCK;
+        return 1;
+    }
+    g_gpu.heightCount++;
+    GPU_UNLOCK;
+    return 0;
+}
+
+/*
+ * One guarded dispatch of the shim's cfxSurfaceBiomes() inner loop: for
+ * each point (blockX + col*stride, blockZ + row*stride) the caller's
+ * terrain height (clamped at 62) picks the voronoi nucleus, and the
+ * double-precision climate stack resolves the biome id. terrainY is
+ * row-major w*rows and uploads per call; ids receives w*rows biome ids.
+ * The nucleus-memoized CPU path this replaces is itself bit-identical to
+ * the plain loop, so bit-exactness against the kernel is preserved. The
+ * caller decides the minimum batch size (dispatch overhead dominates tiny
+ * refine cells); this guard only rejects technically unsupported shapes.
+ * Returns 0 when the GPU filled all ids bit-exactly and nonzero when the
+ * caller must run the CPU path.
+ */
+int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
+    int blockX, int blockZ, int w, int rows, int stride,
+    const int *terrainY)
+{
+    if (!ids || !terrainY || !bn || w <= 0 || rows <= 0 || stride <= 0
+        || (int64_t)w * rows > GPU_MAX_POINTS)
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+
+    GPU_LOCK;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    gpuEnsureRuntimeLocked(&g_gpu);
+    const int cfxReady = gpuEnsureCfxLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead || !cfxReady)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu,
+                !g_gpu.clAvail || g_gpu.dead
+                    ? "no usable OpenCL device"
+                    : "no fp64 OpenCL device for the cfx kernels");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    const int points = w * rows;
+    if (gpuEnsureOutLocked(&g_gpu, points))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = g_gpu.kCfxBiome;
+    cl_int err = CL_SUCCESS;
+    cl_uint a = 0;
+    err |= gpuSetCfxTableArgsLocked(k, &a);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &blockX);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &blockZ);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &w);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &rows);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stride);
+    cl_ulong shaArg = sha;
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &shaArg);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mInY);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutId);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, g_gpu.mInY, CL_TRUE,
+        0, sizeof(int) * (size_t)points, terrainY, 0, NULL, NULL);
+    if (err == CL_SUCCESS)
+    {
+        size_t ls = g_gpu.localSize;
+        size_t global[2] =
+        {
+            ((size_t) w + ls - 1) / ls * ls,
+            (size_t) rows
+        };
+        size_t local[2] = { ls, 1 };
+        err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
+            global, local, 0, NULL, NULL);
+    }
+    if (err == CL_SUCCESS)
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutId,
+            CL_TRUE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "gpu cfx biome dispatch");
+        GPU_UNLOCK;
+        return 1;
+    }
+    g_gpu.dispatchCount++;
+    GPU_UNLOCK;
+    return 0;
 }
