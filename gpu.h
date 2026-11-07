@@ -122,6 +122,26 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
     int scale, int x, int z, int w, int h, int64_t *np);
 
 /*
+ * Batched strided-rows form of the surface-biome dispatch: computes
+ * `rows` separate w-wide biome rows in ONE GPU dispatch, row j at
+ * z = z + j*zStride (so the contiguous h-row block of
+ * gpuMapOverworldSurfaceBiome() is the zStride == 1 case), each written to
+ * out[j*w .. j*w+w-1] row-major. Consumers that stream strided overview
+ * rows row by row pay one dispatch per row, which collapses occupancy when
+ * a row alone cannot fill the device; this entry folds the whole row set
+ * into a single dispatch with identical per-point results. Returns 0 when
+ * the GPU served all rows*W points (float-precision approximation, same
+ * drift contract as above) and nonzero when the caller must run the CPU
+ * path per row - unsupported arguments (non-positive w/rows/zStride,
+ * scale other than 1 or 4, rows*w over the ~1M-point dispatch cap,
+ * pre-1.18 versions), disabled/dead engine, or any GPU error. Climate np
+ * values are not exposed here; use gpuMapOverworldSurfaceBiome() if the
+ * caller needs them.
+ */
+int gpuMapOverworldSurfaceBiomeRows(int *out, const BiomeNoise *bn,
+    uint64_t sha, int scale, int x, int z, int w, int rows, int zStride);
+
+/*
  * The guarded GPU dispatch behind mapOverworldTerrainHeight() when compiled
  * with CUBIOMES_ENABLE_GPU, the height-path twin of
  * gpuTrySurfaceBiomeHook(). Returns 0 only when the GPU served the whole
@@ -136,5 +156,20 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
  */
 int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int h);
+
+/*
+ * Batched strided-rows form of the terrain-height dispatch, the height twin
+ * of gpuMapOverworldSurfaceBiomeRows(): `rows` w-wide height rows, row j at
+ * z = z + j*zStride, one GPU dispatch for the whole set, each row written to
+ * y[j*w .. j*w+w-1] (and ids[j*w ..] when ids is non-NULL) row-major.
+ * Returns 0 when the GPU served all rows*w points (float-precision
+ * approximation, same drift contract as the guarded hook) and nonzero when
+ * the caller must run the CPU path per row - unsupported arguments
+ * (NULL y, non-positive w/rows/zStride, rows*w over the ~1M-point dispatch
+ * cap, a BiomeNoise not fully initialized by setBiomeSeed(), pre-1.18
+ * versions), disabled/dead engine, or any GPU error.
+ */
+int gpuMapOverworldTerrainHeightRows(float *y, int *ids, const BiomeNoise *bn,
+    int x, int z, int w, int rows, int zStride);
 
 #endif

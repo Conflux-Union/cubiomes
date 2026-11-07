@@ -859,11 +859,19 @@ static cl_int gpuSetTableArgsLocked(cl_kernel k, cl_uint *a)
  * this single guard, so the dispatch condition exists in exactly one place.
  * The guard rejects unsupported arguments and engine states before the CPU
  * caller sees any effect; a GPU error latches the engine dead here.
+ *
+ * The block covers `w` columns x `rows` rows with z advancing by `zStride`
+ * per row (zStride 1 = the contiguous w x rows block). The kernel runs on a
+ * 2D NDRange, so a strided row set (overview consumers advancing z past the
+ * queried rows) folds into ONE dispatch instead of one per row; a small
+ * width no longer means a near-empty workgroup.
  */
 static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
-    uint64_t sha, int scale, int x, int z, int w, int h, int64_t *np)
+    uint64_t sha, int scale, int x, int z, int w, int rows, int zStride,
+    int64_t *np)
 {
-    if (!out || !bn || w <= 0 || h <= 0 || (int64_t)w * h > GPU_MAX_POINTS)
+    if (!out || !bn || w <= 0 || rows <= 0 || zStride <= 0
+        || (int64_t)w * rows > GPU_MAX_POINTS)
         return 1;
     if (scale != 1 && scale != 4)
         return 1;
@@ -892,7 +900,7 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
         GPU_UNLOCK;
         return 1;
     }
-    int points = w * h;
+    int points = w * rows;
     if (gpuEnsureOutLocked(&g_gpu, points))
     {
         GPU_UNLOCK;
@@ -905,11 +913,12 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
     err |= gpuSetTableArgsLocked(k, &a);
     cl_int modeArg = scale == 1 ? 1 : 0;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &modeArg);
-    cl_int originX = x, originZ = z, width = w, height = h;
+    cl_int originX = x, originZ = z, width = w, height = rows;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &originX);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &originZ);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &width);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &height);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &zStride);
     cl_ulong shaArg = sha;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &shaArg);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutNp);
@@ -921,10 +930,18 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
         return 1;
     }
 
-    size_t global = ((size_t)points + g_gpu.localSize - 1) / g_gpu.localSize
-        * g_gpu.localSize;
-    err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 1, NULL,
-        &global, &g_gpu.localSize, 0, NULL, NULL);
+    // Workgroups span localSize columns of one row: ceil(w/localSize) *
+    // rows groups, so strided rows fill the device instead of collapsing
+    // occupancy into a single group.
+    size_t ls = g_gpu.localSize;
+    size_t global[2] =
+    {
+        ((size_t) w + ls - 1) / ls * ls,
+        (size_t) rows
+    };
+    size_t local[2] = { ls, 1 };
+    err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
+        global, local, 0, NULL, NULL);
     if (err == CL_SUCCESS)
     {
         err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutId,
@@ -948,7 +965,7 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
 int gpuTrySurfaceBiomeHook(int *out, const BiomeNoise *bn, uint64_t sha,
     int scale, int x, int z, int w, int h)
 {
-    return gpuSurfaceBiomeDispatch(out, bn, sha, scale, x, z, w, h, NULL);
+    return gpuSurfaceBiomeDispatch(out, bn, sha, scale, x, z, w, h, 1, NULL);
 }
 
 int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
@@ -956,7 +973,15 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
 {
     if (!g || g->dim != DIM_OVERWORLD)
         return 1;
-    return gpuSurfaceBiomeDispatch(out, &g->bn, sha, scale, x, z, w, h, np);
+    return gpuSurfaceBiomeDispatch(out, &g->bn, sha, scale, x, z, w, h, 1,
+        np);
+}
+
+int gpuMapOverworldSurfaceBiomeRows(int *out, const BiomeNoise *bn,
+    uint64_t sha, int scale, int x, int z, int w, int rows, int zStride)
+{
+    return gpuSurfaceBiomeDispatch(out, bn, sha, scale, x, z, w, rows,
+        zStride, NULL);
 }
 
 /*
@@ -965,11 +990,14 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
  * and engine states, reuses the packed tables and the same guard semantics;
  * a GPU error latches the engine dead here too. Heights are quart-scale like
  * the CPU reference, so there is no scale/sha argument; ids are optional.
+ * The rows/zStride block shape matches the biome dispatch (2D NDRange, one
+ * dispatch per strided row set).
  */
 static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
-    int x, int z, int w, int h)
+    int x, int z, int w, int rows, int zStride)
 {
-    if (!y || !bn || w <= 0 || h <= 0 || (int64_t)w * h > GPU_MAX_POINTS)
+    if (!y || !bn || w <= 0 || rows <= 0 || zStride <= 0
+        || (int64_t)w * rows > GPU_MAX_POINTS)
         return 1;
     if (bn->nptype >= 0 || bn->mc < MC_1_18)
         return 1;
@@ -997,7 +1025,7 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
         GPU_UNLOCK;
         return 1;
     }
-    int points = w * h;
+    int points = w * rows;
     if (gpuEnsureOutLocked(&g_gpu, points))
     {
         GPU_UNLOCK;
@@ -1010,11 +1038,12 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
     err |= gpuSetTableArgsLocked(k, &a);
     cl_int wantIds = ids != NULL;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &wantIds);
-    cl_int originX = x, originZ = z, width = w, height = h;
+    cl_int originX = x, originZ = z, width = w, height = rows;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &originX);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &originZ);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &width);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &height);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &zStride);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutY);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutId);
     if (err != CL_SUCCESS)
@@ -1024,10 +1053,15 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
         return 1;
     }
 
-    size_t global = ((size_t)points + g_gpu.localSize - 1) / g_gpu.localSize
-        * g_gpu.localSize;
-    err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 1, NULL,
-        &global, &g_gpu.localSize, 0, NULL, NULL);
+    size_t ls = g_gpu.localSize;
+    size_t global[2] =
+    {
+        ((size_t) w + ls - 1) / ls * ls,
+        (size_t) rows
+    };
+    size_t local[2] = { ls, 1 };
+    err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
+        global, local, 0, NULL, NULL);
     if (err == CL_SUCCESS)
         err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutY,
             CL_TRUE, 0, sizeof(float) * (size_t)points, y, 0, NULL, NULL);
@@ -1048,5 +1082,11 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
 int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int h)
 {
-    return gpuHeightDispatch(y, ids, bn, x, z, w, h);
+    return gpuHeightDispatch(y, ids, bn, x, z, w, h, 1);
+}
+
+int gpuMapOverworldTerrainHeightRows(float *y, int *ids, const BiomeNoise *bn,
+    int x, int z, int w, int rows, int zStride)
+{
+    return gpuHeightDispatch(y, ids, bn, x, z, w, rows, zStride);
 }

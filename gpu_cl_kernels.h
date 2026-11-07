@@ -21,6 +21,12 @@
  * the uint8 wrap-arounds and the fixed-point TO_NP quantization - is kept
  * verbatim.
  *
+ * Both kernels run on a 2D NDRange: global id 0 is the column within the
+ * block, global id 1 the row, and z = originZ + row * Z_STRIDE (Z_STRIDE 1
+ * recovers the contiguous block). Per-point work depends only on the
+ * coordinates, so a strided row set (one dispatch) and the same rows issued
+ * row by row compute identical values.
+ *
  * The host-side counterparts of the constants here live in gpu.c (packTables
  * and its _Static_asserts) and must be kept in sync.
  */
@@ -1058,6 +1064,7 @@ static const char GPU_CL_SRC[] =
 "    const int originZ,\n"
 "    const int W,\n"
 "    const int H,\n"
+"    const int Z_STRIDE,\n"
 "    const u64 sha,\n"
 "    __global i64 *outNp,\n"
 "    __global int *outId)\n"
@@ -1088,25 +1095,26 @@ static const char GPU_CL_SRC[] =
 "    ctx.octMaxOff = octMaxOff;\n"
 "    ctx.octMainOff = octMainOff;\n"
 "\n"
-"    int gi = (int)get_global_id(0);\n"
-"    int total = W * H;\n"
-"    if (gi >= total)\n"
+"    int col = (int)get_global_id(0);\n"
+"    int row = (int)get_global_id(1);\n"
+"    if (col >= W || row >= H)\n"
 "        return;\n"
+"    const int gi = row * W + col;\n"
 "\n"
 "    i64 np[6];\n"
 "    int id;\n"
 "    if (mode == 0)\n"
 "    {\n"
-"        const int x = originX + gi % W;\n"
-"        const int z = originZ + gi / W;\n"
+"        const int x = originX + col;\n"
+"        const int z = originZ + row * Z_STRIDE;\n"
 "        int surface = terrainSurfaceAtK(&ctx, x, z);\n"
 "        if (surface < 62) surface = 62;\n"
 "        sampleBiomeNoiseDepthK(&ctx, x, floordivK(surface, 4), z, np, &id);\n"
 "    }\n"
 "    else\n"
 "    {\n"
-"        const int blockX = originX + gi % W;\n"
-"        const int blockZ = originZ + gi / W;\n"
+"        const int blockX = originX + col;\n"
+"        const int blockZ = originZ + row * Z_STRIDE;\n"
 "        const int baseX = floordivK(blockX, 4);\n"
 "        const int baseZ = floordivK(blockZ, 4);\n"
 "        const int fx = blockX - baseX * 4;\n"
@@ -1162,6 +1170,7 @@ static const char GPU_CL_SRC[] =
 "    const int originZ,\n"
 "    const int W,\n"
 "    const int H,\n"
+"    const int Z_STRIDE,\n"
 "    __global float *outY,\n"
 "    __global int *outId)\n"
 "{\n"
@@ -1191,13 +1200,14 @@ static const char GPU_CL_SRC[] =
 "    ctx.octMaxOff = octMaxOff;\n"
 "    ctx.octMainOff = octMainOff;\n"
 "\n"
-"    int gi = (int)get_global_id(0);\n"
-"    int total = W * H;\n"
-"    if (gi >= total)\n"
+"    int col = (int)get_global_id(0);\n"
+"    int row = (int)get_global_id(1);\n"
+"    if (col >= W || row >= H)\n"
 "        return;\n"
+"    const int gi = row * W + col;\n"
 "\n"
-"    const int x = originX + gi % W;\n"
-"    const int z = originZ + gi / W;\n"
+"    const int x = originX + col;\n"
+"    const int z = originZ + row * Z_STRIDE;\n"
 "    int surface = terrainSurfaceAtK(&ctx, x, z);\n"
 "    outY[gi] = (float) surface;\n"
 "    if (wantIds)\n"

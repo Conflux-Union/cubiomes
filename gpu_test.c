@@ -38,6 +38,15 @@
  * 4x4 chunk tiles, isolated single columns), the transparent
  * mapOverworldTerrainHeight()/mapApproxHeight() entries in off/auto/force
  * with engagement counting, and a row-vs-isolated shape-invariance case.
+ */
+
+/*
+ * z-stride row batching: the batched entries fold a whole strided row set
+ * into ONE dispatch. Each case gates two things: batched vs the CPU
+ * reference (budgeted through the same three-bucket accounting) and batched
+ * vs the row-by-row guarded dispatch (bit-identical - same kernel, same
+ * per-point math, only a different NDRange). Strides 16 (the mod's overview
+ * rows) plus 7 and 33 catch z-decode bugs; negative origins ride along.
  *
  * A transparent-path section exercises the public mapOverworldSurfaceBiome()
  * entry (the guarded GPU hook) in off/auto/force modes: off must reproduce
@@ -1145,6 +1154,214 @@ static void runApproxHeightCase(int mc, uint32_t flags, uint64_t seed,
     total->pts += (long long) w * h + 1;
 }
 
+//----------------------------------------------------------------------
+// z-stride row batching: the batched entries
+// (gpuMapOverworldSurfaceBiomeRows / gpuMapOverworldTerrainHeightRows)
+// serve a whole strided row set in ONE dispatch. Per case: batched vs the
+// CPU reference (budgeted, three-bucket accounting) and batched vs the
+// row-by-row guarded dispatch (bit-identical: same kernel, same per-point
+// math, only a different NDRange). Degenerate shapes must reject without a
+// dispatch.
+
+static void runZStrideCase(int mc, uint32_t flags, uint64_t seed, int ox,
+    int oz, int w, int rows, int zStride, int scale, CaseStats *total,
+    int *fail)
+{
+    const int bucket = bucketOf(ox, oz);
+    printf("z-stride case mc=%d seed=%llu origin=(%d,%d) w=%d rows=%d "
+        "zStride=%d scale=%d [%s]\n",
+        mc, (unsigned long long) seed, ox, oz, w, rows, zStride, scale,
+        bucketNames[bucket]);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    const size_t pts = (size_t) w * rows;
+    int *refIds = malloc(sizeof(int) * pts);
+    int *rowIds = malloc(sizeof(int) * pts);
+    int *batchIds = malloc(sizeof(int) * pts);
+    int64_t *refNp = malloc(sizeof(int64_t) * pts * NP_CH);
+    int64_t *rowNp = malloc(sizeof(int64_t) * pts * NP_CH);
+    float *refY = malloc(sizeof(float) * pts);
+    float *rowY = malloc(sizeof(float) * pts);
+    float *batchY = malloc(sizeof(float) * pts);
+    int *refHids = malloc(sizeof(int) * pts);
+    int *rowHids = malloc(sizeof(int) * pts);
+    int *batchHids = malloc(sizeof(int) * pts);
+    if (!refIds || !rowIds || !batchIds || !refNp || !rowNp
+        || !refY || !rowY || !batchY || !refHids || !rowHids || !batchHids)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    // Pure-CPU references, one row at a time (both batched entries take the
+    // same per-row coordinates).
+    for (int j = 0; j < rows; j++)
+    {
+        cpuSurfaceBiomeRef(refIds + (size_t) j * w,
+            refNp + (size_t) j * w * NP_CH, &g.bn, g.sha, scale,
+            ox, oz + j * zStride, w, 1);
+        cpuHeightRef(refY + (size_t) j * w, refHids + (size_t) j * w,
+            &g.bn, ox, oz + j * zStride, w, 1);
+    }
+
+    const int modeBefore = gpuGetMode();
+    gpuSetMode(GPU_MODE_AUTO);
+
+    uint64_t bio0 = gpuDispatchCount();
+    for (int j = 0; j < rows; j++)
+        gpuMapOverworldSurfaceBiome(rowIds + (size_t) j * w, &g, g.sha,
+            scale, ox, oz + j * zStride, w, 1,
+            rowNp + (size_t) j * w * NP_CH);
+    uint64_t bioRows = gpuDispatchCount() - bio0;
+    uint64_t bio1 = gpuDispatchCount();
+    if (gpuMapOverworldSurfaceBiomeRows(batchIds, &g.bn, g.sha, scale,
+            ox, oz, w, rows, zStride))
+    {
+        fprintf(stderr, "gpu-test: batched biome dispatch failed at mc=%d "
+            "seed=%llu (%d,%d) w=%d rows=%d zStride=%d\n", mc,
+            (unsigned long long) seed, ox, oz, w, rows, zStride);
+        exit(2);
+    }
+    uint64_t bioBatch = gpuDispatchCount() - bio1;
+
+    uint64_t h0 = gpuHeightDispatchCount();
+    for (int j = 0; j < rows; j++)
+        gpuTryHeightHook(rowY + (size_t) j * w, rowHids + (size_t) j * w,
+            &g.bn, ox, oz + j * zStride, w, 1);
+    uint64_t hRows = gpuHeightDispatchCount() - h0;
+    uint64_t h1 = gpuHeightDispatchCount();
+    if (gpuMapOverworldTerrainHeightRows(batchY, batchHids, &g.bn, ox, oz,
+            w, rows, zStride))
+    {
+        fprintf(stderr, "gpu-test: batched height dispatch failed at mc=%d "
+            "seed=%llu (%d,%d) w=%d rows=%d zStride=%d\n", mc,
+            (unsigned long long) seed, ox, oz, w, rows, zStride);
+        exit(2);
+    }
+    uint64_t hBatch = gpuHeightDispatchCount() - h1;
+    gpuSetMode(modeBefore);
+
+    long long idDrift = 0, npDrift = 0, heightDrift = 0, hidDrift = 0;
+    long long biomeBit = 0, heightBit = 0;
+    for (int j = 0; j < rows; j++)
+    {
+        for (int i = 0; i < w; i++)
+        {
+            const size_t idx = (size_t) j * w + i;
+            // batched vs CPU reference: budgeted drift
+            accountIds(bucket, batchIds[idx], refIds[idx]);
+            if (batchIds[idx] != refIds[idx])
+            {
+                idDrift++;
+                if (idDrift <= 3)
+                    printf("  biome id @(%d,%d): batch=%d cpu=%d\n",
+                        ox + i, oz + j * zStride, batchIds[idx],
+                        refIds[idx]);
+            }
+            accountNp(bucket, rowNp + idx * NP_CH, refNp + idx * NP_CH);
+            for (int k = 0; k < NP_CH; k++)
+                if (rowNp[idx * NP_CH + k] != refNp[idx * NP_CH + k])
+                    npDrift++;
+            accountHeight(bucket, batchY[idx], refY[idx]);
+            if (batchY[idx] != refY[idx])
+                heightDrift++;
+            accountIds(bucket, batchHids[idx], refHids[idx]);
+            if (batchHids[idx] != refHids[idx])
+                hidDrift++;
+            // batched vs row-by-row GPU: bit-identical, never drift
+            if (batchIds[idx] != rowIds[idx])
+            {
+                biomeBit++;
+                if (biomeBit <= 3)
+                    printf("  biome bit @(%d,%d): batch=%d rows=%d\n",
+                        ox + i, oz + j * zStride, batchIds[idx],
+                        rowIds[idx]);
+            }
+            if (batchY[idx] != rowY[idx] || batchHids[idx] != rowHids[idx])
+            {
+                heightBit++;
+                if (heightBit <= 3)
+                    printf("  height bit @(%d,%d): batch=(%f,%d) "
+                        "rows=(%f,%d)\n",
+                        ox + i, oz + j * zStride, (double) batchY[idx],
+                        batchHids[idx], (double) rowY[idx], rowHids[idx]);
+            }
+        }
+    }
+
+    // Engagement: one dispatch per entry form (batched = 1, rows = rows).
+    int shapeFail = 0;
+#ifdef CUBIOMES_ENABLE_GPU
+    if (bioBatch != 1 || bioRows != (uint64_t) rows
+        || hBatch != 1 || hRows != (uint64_t) rows)
+    {
+        fprintf(stderr, "gpu-test: z-stride engagement biome %llu(batch)/"
+            "%llu(rows) height %llu(batch)/%llu(rows), expected 1/%d each"
+            " (mc=%d)\n",
+            (unsigned long long) bioBatch, (unsigned long long) bioRows,
+            (unsigned long long) hBatch, (unsigned long long) hRows,
+            rows, mc);
+        shapeFail = 1;
+    }
+#else
+    (void) bioBatch; (void) bioRows; (void) hBatch; (void) hRows;
+#endif
+
+    // Argument guard: degenerate shapes reject before the engine is touched
+    // (nonzero return, zero new dispatches, in any mode).
+    int junk[2];
+    float junkY[2];
+    gpuSetMode(GPU_MODE_AUTO);
+    uint64_t g0 = gpuDispatchCount() + gpuHeightDispatchCount();
+    int r1 = gpuMapOverworldSurfaceBiomeRows(junk, &g.bn, g.sha, 4,
+        ox, oz, 2, 2, 0);
+    int r2 = gpuMapOverworldSurfaceBiomeRows(junk, &g.bn, g.sha, 4,
+        ox, oz, 0, 2, zStride);
+    int r3 = gpuMapOverworldSurfaceBiomeRows(junk, &g.bn, g.sha, 4,
+        ox, oz, 2, (1 << 20), zStride); // over the dispatch cap
+    int r4 = gpuMapOverworldTerrainHeightRows(junkY, junk, &g.bn,
+        ox, oz, 2, -1, zStride);
+    uint64_t g1 = gpuDispatchCount() + gpuHeightDispatchCount();
+    gpuSetMode(modeBefore);
+    if (!(r1 && r2 && r3 && r4) || g1 != g0)
+    {
+        fprintf(stderr, "gpu-test: z-stride argument guard leak "
+            "(r=%d%d%d%d, dispatches %llu -> %llu)\n", r1, r2, r3, r4,
+            (unsigned long long) g0, (unsigned long long) g1);
+        shapeFail = 1;
+    }
+
+    printf("  -> %s: id drift %lld, np drift %lld, height drift %lld, "
+        "height id drift %lld, bit-identical %s/%s [disp b %llu/%llu "
+        "h %llu/%llu]\n",
+        shapeFail || biomeBit || heightBit ? "FAIL"
+            : (idDrift || npDrift || heightDrift || hidDrift) ? "drift"
+            : "ok",
+        idDrift, npDrift, heightDrift, hidDrift,
+        biomeBit ? "FAIL" : "ok", heightBit ? "FAIL" : "ok",
+        (unsigned long long) bioBatch, (unsigned long long) bioRows,
+        (unsigned long long) hBatch, (unsigned long long) hRows);
+    fflush(stdout);
+    free(refIds);
+    free(rowIds);
+    free(batchIds);
+    free(refNp);
+    free(rowNp);
+    free(refY);
+    free(rowY);
+    free(batchY);
+    free(refHids);
+    free(rowHids);
+    free(batchHids);
+    total->pts += (long long) pts;
+    if (shapeFail || biomeBit || heightBit)
+        *fail = 1;
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -1169,8 +1386,8 @@ int main(int argc, char **argv)
     {
         // OFF must leave the runtime untouched even through real dispatch
         // calls (deterministic accessor, not a timing probe).
-        float y[1];
-        int ids[1];
+        float y[4];
+        int ids[4];
         if (gpuRuntimeInitialized())
         {
             printf("FAIL: runtime initialized before any dispatch in off"
@@ -1179,6 +1396,10 @@ int main(int argc, char **argv)
         }
         mapOverworldSurfaceBiome(ids, &probe.bn, probe.sha, 4, 0, 0, 1, 1);
         gpuTryHeightHook(y, ids, &probe.bn, 0, 0, 1, 1);
+        // the batched strided-rows entries share the off contract
+        gpuMapOverworldSurfaceBiomeRows(ids, &probe.bn, probe.sha, 4,
+            0, 0, 2, 2, 16);
+        gpuMapOverworldTerrainHeightRows(y, ids, &probe.bn, 0, 0, 2, 2, 16);
         if (gpuRuntimeInitialized())
         {
             printf("FAIL: runtime initialized in off mode\n");
@@ -1335,6 +1556,24 @@ int main(int argc, char **argv)
     runTransparentHeightCase(MC_26_3, 0, seeds[0], 0, 0, &total, &fail);
     runApproxHeightCase(mainMc, 0, seeds[0], origins[0][0], origins[0][1],
         &total, &fail);
+
+    // z-stride row batching: stride 16 is the mod's overview-row shape,
+    // 7 and 33 are off-parity strides that catch z-decode bugs. A positive,
+    // a negative, a zero-straddling and two far origins cover the buckets;
+    // both biome scales; heights ride on every case; the oldest and newest
+    // biome trees get one parity probe each.
+    runZStrideCase(mainMc, 0, seeds[0], 100000, 100000, 96, 8, 16, 4,
+        &total, &fail);
+    runZStrideCase(mainMc, 0, seeds[0], -100000, -100000, 96, 8, 7, 4,
+        &total, &fail);
+    runZStrideCase(mainMc, 0, seeds[0], -48, -48, 64, 6, 33, 1,
+        &total, &fail);
+    runZStrideCase(mainMc, 0, seeds[0], 1000000, 1000000, 96, 8, 33, 4,
+        &total, &fail);
+    runZStrideCase(mainMc, 0, seeds[0], 7500000, 7500000, 64, 6, 16, 4,
+        &total, &fail);
+    runZStrideCase(MC_1_18, 0, seeds[0], 0, 0, 96, 8, 7, 4, &total, &fail);
+    runZStrideCase(MC_26_3, 0, seeds[0], 0, 0, 96, 8, 33, 4, &total, &fail);
 
     printf("\n");
     if (total.wrapperReplicationMismatch)
