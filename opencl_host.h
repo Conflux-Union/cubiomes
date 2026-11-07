@@ -9,8 +9,8 @@
  * OpenCL.dll on Windows. Declares only the types, constants and entry points
  * the engine needs (~40 lines of own declarations) - Khronos headers are not
  * vendored and nothing is linked against OpenCL. Every failure (no loader, no
- * GPU device, no fp64) surfaces as a nonzero return and the caller falls back
- * to the CPU path.
+ * GPU device) surfaces as a nonzero return and the caller falls back to the
+ * CPU path.
  */
 
 #include <stddef.h>
@@ -41,7 +41,6 @@ enum
     CL_DEVICE_TYPE_GPU = (1 << 2),
     CL_DEVICE_NAME = 0x102B,
     CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002,
-    CL_DEVICE_DOUBLE_FP_CONFIG = 0x1032,
 
     CL_MEM_READ_WRITE = (1 << 0),
     CL_MEM_READ_ONLY = (1 << 2),
@@ -123,10 +122,9 @@ typedef struct
     cl_kernel kernel;
     char devName[256];
     cl_uint cus;
-    int fp64;
 } GpuCl;
 
-/* Resolves the OpenCL loader, probes the first GPU device (fp64 flag, name,
+/* Resolves the OpenCL loader, probes the first GPU device (name,
  * compute units) and creates a context plus one command queue.
  * Returns 0 on success, nonzero when OpenCL/a usable GPU is not available. */
 int gpuClInit(GpuCl *cl);

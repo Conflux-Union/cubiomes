@@ -92,19 +92,11 @@ int gpuClInit(GpuCl *cl)
         if (cl->fn.GetDeviceIDs(plats[p], CL_DEVICE_TYPE_GPU, 8, devs,
                 &ndevs) != CL_SUCCESS)
             continue;
-        for (cl_uint d = 0; d < ndevs; d++)
-        {
-            cl_ulong fpconf = 0;
-            cl->fn.GetDeviceInfo(devs[d], CL_DEVICE_DOUBLE_FP_CONFIG,
-                sizeof(fpconf), &fpconf, NULL);
-            if (!fpconf)
-                continue; /* no fp64: the engine is a pure executor or nothing */
-            cl->platform = plats[p];
-            cl->device = devs[d];
-            cl->fp64 = 1;
-            found = 1;
-            break;
-        }
+        /* First GPU device wins: float-only kernels make every OpenCL GPU
+         * eligible. */
+        cl->platform = plats[p];
+        cl->device = devs[0];
+        found = 1;
     }
     if (!found)
         return 1;

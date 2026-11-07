@@ -5,11 +5,14 @@
  * Optional OpenCL GPU execution for the 1.18+ Overworld climate biome
  * sampling and the terrain overview heights. The GPU engine mirrors
  * mapOverworldSurfaceBiome() + depth-aware sampleBiomeNoise() and
- * mapOverworldTerrainHeight() semantics exactly; a parity harness
- * (gpu_test.c, `make gpu-test`) gates every change as bit-exact
- * against the CPU reference. The engine is a pure executor: it never applies
- * an approximation, and any CPU/GPU mismatch is a defect to fix, never a
- * tolerance to accept.
+ * mapOverworldTerrainHeight() semantics, evaluated in single precision: the
+ * CPU reference computes its noise chains in double, so GPU outputs carry a
+ * coordinate-dependent drift against it (negligible near the origin, growing
+ * toward the world border; see the GPU section of README.md). A drift-budget
+ * harness (gpu_test.c, `make gpu-test`) gates every change: biome-id flip
+ * rates and height/climate delta budgets per distance bucket, plus exact
+ * checks for everything that must stay deterministic (query-shape
+ * invariance, mode handling, CPU self-consistency).
  *
  * Tables are packed from the live Generator/BiomeNoise structs (perm tables,
  * per-octave noise parameters, spline trees, biome tree), so all 1.18+
@@ -62,8 +65,8 @@ void gpuSetMode(int mode);
 int gpuGetMode(void);
 
 /*
- * Cheap health check for GPU dispatch of the given generator: OpenCL with an
- * fp64 device is present and healthy, the generator is an unseeded-special
+ * Cheap health check for GPU dispatch of the given generator: an OpenCL
+ * GPU device is present and healthy, the generator is an unseeded-special
  * 1.18+ Overworld biome-noise generator (the supported version/dimension
  * combination). Scale coverage is fixed: the dispatch supports the surface
  * scales 1 (block + voronoi) and 4 (quart). Does not validate the requested
@@ -94,8 +97,9 @@ uint64_t gpuHeightDispatchCount(void);
 /*
  * The guarded GPU dispatch behind mapOverworldSurfaceBiome() when compiled
  * with CUBIOMES_ENABLE_GPU. This is the single place that owns the dispatch
- * guard; it returns 0 only when the GPU served the whole area (identical to
- * the wrapper's CPU result) and nonzero whenever the caller must run the CPU
+ * guard; it returns 0 only when the GPU served the whole area (the
+ * float-precision approximation of the wrapper's CPU result) and nonzero
+ * whenever the caller must run the CPU
  * path - unsupported arguments, disabled/dead engine, or any GPU error.
  * gpuMapOverworldSurfaceBiome() is the Generator-facing form of the same
  * dispatch and shares this guard.
@@ -104,13 +108,15 @@ int gpuTrySurfaceBiomeHook(int *out, const BiomeNoise *bn, uint64_t sha,
     int scale, int x, int z, int w, int h);
 
 /*
- * GPU equivalent of mapOverworldSurfaceBiome(out, &g->bn, sha, scale, x, z,
- * w, h). Returns 0 on success; nonzero when the GPU engine is disabled,
+ * GPU approximation of mapOverworldSurfaceBiome(out, &g->bn, sha, scale, x,
+ * z, w, h) in float precision (see the header comment for the drift
+ * contract). Returns 0 on success; nonzero when the GPU engine is disabled,
  * dead, or the arguments are unsupported (mirrors the wrapper's error
  * convention so callers fall back to the CPU path). When `np` is non-NULL it
  * receives NP_MAX climate noise parameters per point (int64_t[np? w*h :
- * ...][6]), which the CPU wrapper does not expose; values match
- * sampleBiomeNoise()'s `np` output for the same point.
+ * ...][6]), which the CPU wrapper does not expose; values are the GPU's own
+ * quantized parameters for the same point, close to but not identical to
+ * sampleBiomeNoise()'s `np` output.
  */
 int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
     int scale, int x, int z, int w, int h, int64_t *np);
@@ -119,14 +125,14 @@ int gpuMapOverworldSurfaceBiome(int *out, const Generator *g, uint64_t sha,
  * The guarded GPU dispatch behind mapOverworldTerrainHeight() when compiled
  * with CUBIOMES_ENABLE_GPU, the height-path twin of
  * gpuTrySurfaceBiomeHook(). Returns 0 only when the GPU served the whole
- * area (identical to the CPU result): y[] receives the quart-scale surface
- * heights and, when ids is non-NULL, ids[] the surface-biome ids at the
- * clamped surface, both bit-exact. Returns nonzero whenever the caller must
- * run the CPU path - unsupported arguments (NULL y, non-positive or oversized
- * area, a BiomeNoise not fully initialized by setBiomeSeed(), pre-1.18
- * versions), disabled/dead engine, or any GPU error. Block-scale strided
- * height queries (mapOverworldTerrainHeightBlocks and friends) are not
- * covered and stay on the CPU.
+ * area (float-precision approximation of the CPU heights): y[] receives the
+ * quart-scale surface heights and, when ids is non-NULL, ids[] the
+ * surface-biome ids at the clamped surface. Returns nonzero whenever the
+ * caller must run the CPU path - unsupported arguments (NULL y, non-positive
+ * or oversized area, a BiomeNoise not fully initialized by setBiomeSeed(),
+ * pre-1.18 versions), disabled/dead engine, or any GPU error. Block-scale
+ * strided height queries (mapOverworldTerrainHeightBlocks and friends) are
+ * not covered and stay on the CPU.
  */
 int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int h);

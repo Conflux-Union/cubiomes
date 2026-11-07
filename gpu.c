@@ -60,8 +60,7 @@ _Static_assert(SP_CONTINENTALNESS == 0 && SP_EROSION == 1
 // worst case with the climate-np plane); larger queries take the CPU
 // fallback and stay correct.
 #define GPU_MAX_POINTS (1 << 20)
-#define GPU_CL_OPTS "-cl-std=CL1.2 -DNEED_FP64" \
-    " -cl-fp32-correctly-rounded-divide-sqrt"
+#define GPU_CL_OPTS "-cl-std=CL1.2 -cl-fp32-correctly-rounded-divide-sqrt"
 #define GPU_LOCAL_SIZE_MAX 128
 
 typedef struct
@@ -69,9 +68,9 @@ typedef struct
     int valid;
     int octTotal;
     uint8_t *perm;   // octTotal * 257
-    double *pinfo;   // octTotal * 8
+    float *pinfo;    // octTotal * 8
     int noff[GPU_INST_COUNT * 4];
-    double namp[GPU_INST_COUNT];
+    float namp[GPU_INST_COUNT];
     int sNodeTotal;
     int *styp, *slen, *schild;
     float *sloc, *sder;
@@ -81,7 +80,7 @@ typedef struct
     const uint64_t *btNodes;
     size_t btStepsSize, btParamSize, btNodesSize;
     uint32_t btLen, btOrder;
-    double snXZScale, snYScale, snXZFactor, snYFactor;
+    float snXZScale, snYScale, snXZFactor, snYFactor;
     int octMinOff, octMaxOff, octMainOff;
 } GpuTables;
 
@@ -291,15 +290,15 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
 static void packPerlin(GpuTables *t, const PerlinNoise *p, int slot)
 {
     memcpy(t->perm + (size_t)slot * 257, p->d, 257);
-    double *info = t->pinfo + (size_t)slot * 8;
-    info[0] = p->a;
-    info[1] = p->b;
-    info[2] = p->c;
-    info[3] = p->amplitude;
-    info[4] = p->lacunarity;
-    info[5] = p->d2;
-    info[6] = p->t2;
-    info[7] = 0.0;
+    float *info = t->pinfo + (size_t)slot * 8;
+    info[0] = (float) p->a;
+    info[1] = (float) p->b;
+    info[2] = (float) p->c;
+    info[3] = (float) p->amplitude;
+    info[4] = (float) p->lacunarity;
+    info[5] = (float) p->d2;
+    info[6] = (float) p->t2;
+    info[7] = 0.0f;
 }
 
 static int packDoublePerlin(GpuTables *t, const DoublePerlinNoise *dp,
@@ -317,7 +316,7 @@ static int packDoublePerlin(GpuTables *t, const DoublePerlinNoise *dp,
     for (int i = 0; i < dp->octB.octcnt; i++)
         packPerlin(t, &dp->octB.octaves[i], (*cursor)++);
     t->noff[inst * 4 + 3] = dp->octB.octcnt;
-    t->namp[inst] = dp->amplitude;
+    t->namp[inst] = (float) dp->amplitude;
     return 0;
 }
 
@@ -560,7 +559,7 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     t->sloc = malloc(sizeof(float) * (size_t)sNodes * 12);
     t->sder = malloc(sizeof(float) * (size_t)sNodes * 12);
     t->perm = malloc((size_t)cap * 257);
-    t->pinfo = malloc(sizeof(double) * (size_t)cap * 8);
+    t->pinfo = malloc(sizeof(float) * (size_t)cap * 8);
     if (!t->styp || !t->slen || !t->schild || !t->sloc || !t->sder
         || !t->perm || !t->pinfo)
         return 1;
@@ -697,7 +696,7 @@ static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn)
     e->mPerm = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         (size_t)e->tables.octTotal * 257, e->tables.perm);
     e->mPinfo = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-        sizeof(double) * (size_t)e->tables.octTotal * 8, e->tables.pinfo);
+        sizeof(float) * (size_t)e->tables.octTotal * 8, e->tables.pinfo);
     e->mNoff = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(e->tables.noff), e->tables.noff);
     e->mNamp = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
@@ -776,7 +775,7 @@ static int gpuSurfaceBiomeAvailable(const BiomeNoise *bn)
         gpuEnsureRuntimeLocked(&g_gpu);
     int healthy = g_gpu.clAvail && !g_gpu.dead;
     if (!healthy && mode == GPU_MODE_FORCE)
-        gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
+        gpuForceWarnLocked(&g_gpu, "no usable OpenCL device");
     GPU_UNLOCK;
     return healthy;
 }
@@ -837,13 +836,13 @@ static cl_int gpuSetTableArgsLocked(cl_kernel k, cl_uint *a)
     cl_uint btOrder = g_gpu.tables.btOrder;
     err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btLen);
     err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btOrder);
-    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
         &g_gpu.tables.snXZScale);
-    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
         &g_gpu.tables.snYScale);
-    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
         &g_gpu.tables.snXZFactor);
-    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(double),
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
         &g_gpu.tables.snYFactor);
     cl_int octMinOff = g_gpu.tables.octMinOff;
     cl_int octMaxOff = g_gpu.tables.octMaxOff;
@@ -884,7 +883,7 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
     if (!g_gpu.clAvail || g_gpu.dead)
     {
         if (mode == GPU_MODE_FORCE)
-            gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
+            gpuForceWarnLocked(&g_gpu, "no usable OpenCL device");
         GPU_UNLOCK;
         return 1;
     }
@@ -987,7 +986,7 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
     if (!g_gpu.clAvail || g_gpu.dead)
     {
         if (mode == GPU_MODE_FORCE)
-            gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
+            gpuForceWarnLocked(&g_gpu, "no usable OpenCL device");
         GPU_UNLOCK;
         return 1;
     }
