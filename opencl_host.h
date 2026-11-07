@@ -41,7 +41,6 @@ enum
     CL_DEVICE_TYPE_GPU = (1 << 2),
     CL_DEVICE_NAME = 0x102B,
     CL_DEVICE_MAX_COMPUTE_UNITS = 0x1002,
-    CL_DEVICE_MAX_WORK_GROUP_SIZE = 0x1004,
     CL_DEVICE_DOUBLE_FP_CONFIG = 0x1032,
 
     CL_MEM_READ_WRITE = (1 << 0),
@@ -81,7 +80,6 @@ typedef cl_int (*clEnqueueNDRangeKernel_t)(cl_command_queue, cl_kernel,
     const cl_event *, cl_event *);
 typedef cl_int (*clEnqueueReadBuffer_t)(cl_command_queue, cl_mem, cl_bool,
     size_t, size_t, void *, cl_uint, const cl_event *, cl_event *);
-typedef cl_int (*clFinish_t)(cl_command_queue);
 typedef cl_int (*clGetKernelWorkGroupInfo_t)(cl_kernel, cl_device_id,
     cl_uint, size_t, void *, size_t *);
 
@@ -107,7 +105,6 @@ typedef struct
     clSetKernelArg_t SetKernelArg;
     clEnqueueNDRangeKernel_t EnqueueNDRangeKernel;
     clEnqueueReadBuffer_t EnqueueReadBuffer;
-    clFinish_t Finish;
     clGetKernelWorkGroupInfo_t GetKernelWorkGroupInfo;
 } GpuClFuncs;
 
@@ -139,9 +136,5 @@ int gpuClInit(GpuCl *cl);
  * Returns 0 on success. */
 int gpuClBuild(GpuCl *cl, const char *src, const char *opts,
     const char *kernelName);
-
-/* Releases kernel, program, queue and context. The loader handle stays
- * loaded for the process lifetime. */
-void gpuClShutdown(GpuCl *cl);
 
 #endif

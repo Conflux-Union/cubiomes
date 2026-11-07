@@ -77,7 +77,6 @@ int gpuClInit(GpuCl *cl)
     GPUCL_SYM(SetKernelArg);
     GPUCL_SYM(EnqueueNDRangeKernel);
     GPUCL_SYM(EnqueueReadBuffer);
-    GPUCL_SYM(Finish);
     GPUCL_SYM(GetKernelWorkGroupInfo);
 
     cl_platform_id plats[8];
@@ -181,20 +180,4 @@ int gpuClBuild(GpuCl *cl, const char *src, const char *opts,
         return 1;
     }
     return 0;
-}
-
-void gpuClShutdown(GpuCl *cl)
-{
-    if (cl->kernel)
-        cl->fn.ReleaseKernel(cl->kernel);
-    if (cl->program)
-        cl->fn.ReleaseProgram(cl->program);
-    if (cl->queue)
-        cl->fn.ReleaseCommandQueue(cl->queue);
-    if (cl->context)
-        cl->fn.ReleaseContext(cl->context);
-    cl->kernel = NULL;
-    cl->program = NULL;
-    cl->queue = NULL;
-    cl->context = NULL;
 }

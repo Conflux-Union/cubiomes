@@ -14,20 +14,27 @@
  * Tables are packed from the live Generator/BiomeNoise structs (perm tables,
  * per-octave noise parameters, spline trees, biome tree), so all 1.18+
  * versions come free without per-version hardcoded tables in this layer. One
- * packed table set serves both the biome and the height kernel.
+ * packed table set serves both the biome and the height kernel, keyed on one
+ * generator state at a time: dispatches that alternate between generators
+ * (e.g. two seeds) re-pack the tables on every call - correct, but slow, so
+ * batch per generator before switching.
  *
  * Thread model: one process-global engine with ONE command queue. A mutex
  * serializes submit+read around each dispatch, so concurrent callers queue up
- * but never race. Consumers that link this module need the dynamic loader
+ * but never race. Dispatches hold the mutex through kernel execution and a
+ * blocking readback: a wedged GPU hangs the calling thread (the promise is
+ * that GPU calls never fail or change results, never that they cannot hang).
+ * Consumers that link this module need the dynamic loader
  * (-ldl on older glibc) and threads (-lpthread on older glibc).
  *
  * Mode handling: the environment variable CUBIOMES_GPU (off|auto|force) is
  * parsed at first use; gpuSetMode() overrides it. "auto" (default) uses the
  * GPU when available and silently falls back to the CPU otherwise; "off"
- * never touches the GPU; "force" is a debug aid that reports loudly when the
- * GPU is unavailable. Read-only queries (gpuGetMode/gpuAvailable) never fail
- * because of the GPU; the dispatches below return nonzero on a GPU error and
- * latch the engine dead for the process so later calls fall back too.
+ * never touches the GPU - it does not even load the OpenCL runtime; "force"
+ * is a debug aid that reports loudly when the GPU is unavailable. Read-only
+ * queries (gpuGetMode/gpuAvailable) never fail because of the GPU; the
+ * dispatches below return nonzero on a GPU error and latch the engine dead
+ * for the process so later calls fall back too.
  *
  * Transparent dispatch: when a consumer builds this module together with
  * CUBIOMES_ENABLE_GPU, mapOverworldSurfaceBiome() (biomenoise.c) tries the
@@ -67,6 +74,11 @@ int gpuAvailable(const Generator *g);
 /* Name of the probed OpenCL device, or an empty string before first use /
  * when unavailable. Diagnostic aid, not part of the dispatch contract. */
 const char *gpuDeviceName(void);
+
+/* Returns nonzero once the engine has initialized the OpenCL runtime
+ * (loader load + device probe + program build). Diagnostic aid for tests:
+ * OFF mode must leave this at zero for the whole process lifetime. */
+int gpuRuntimeInitialized(void);
 
 /* Number of surface-biome dispatches the engine has completed successfully
  * (kernel run + results read back), process-global. Diagnostic aid for

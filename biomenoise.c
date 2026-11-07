@@ -2921,6 +2921,9 @@ int get_resulting_node(const uint64_t np[6], const BiomeTree *bt, int idx,
     if (bt->steps[depth] == 0)
         return idx;
     uint32_t step;
+    // Deliberate overread mirror: the GPU kernel's btreeLookupK() in
+    // gpu_cl_kernels.h steps past the steps table the same way, so both
+    // sides stay bit-identical; fix only on both sides.
     do
     {
         step = bt->steps[depth];

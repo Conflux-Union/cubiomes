@@ -56,7 +56,10 @@ _Static_assert(SP_CONTINENTALNESS == 0 && SP_EROSION == 1
     && SP_RIDGES == 2 && SP_WEIRDNESS == 3, "kernel spline parameter ids");
 
 #define GPU_INST_COUNT (NP_MAX + 1 + TN_MAX)
-#define GPU_MAX_POINTS (1 << 24)
+// Dispatch size cap: ~1M points keeps the output buffers bounded (~59 MB
+// worst case with the climate-np plane); larger queries take the CPU
+// fallback and stay correct.
+#define GPU_MAX_POINTS (1 << 20)
 #define GPU_CL_OPTS "-cl-std=CL1.2 -DNEED_FP64" \
     " -cl-fp32-correctly-rounded-divide-sqrt"
 #define GPU_LOCAL_SIZE_MAX 128
@@ -384,6 +387,69 @@ static int packSplineStack(GpuTables *t, const SplineStack *ss,
     return 0;
 }
 
+/*
+ * Longest child chain from a spline root, iteratively: the kernel runs
+ * evalSplineK with a fixed 12-frame stack, so a deeper (malformed) table
+ * would write past it. Node ids are unique and 'seen' also guards against
+ * cyclic child graphs. Returns -1 on allocation failure (rejected).
+ */
+static int packSplineDepth(const GpuTables *t, int root)
+{
+    int maxDepth = -1;
+    int *stack = malloc(sizeof(int) * (size_t) t->sNodeTotal * 2);
+    unsigned char *seen = calloc((size_t) t->sNodeTotal, 1);
+    if (!stack || !seen)
+    {
+        free(stack);
+        free(seen);
+        return -1;
+    }
+    int sp = 0;
+    stack[sp++] = root;
+    stack[sp++] = 1;
+    seen[root] = 1;
+    while (sp)
+    {
+        int depth = stack[--sp];
+        int node = stack[--sp];
+        if (depth > maxDepth)
+            maxDepth = depth;
+        if (depth >= 12)
+            continue;
+        for (int k = 0; k < 12; k++)
+        {
+            int child = t->schild[(size_t) node * 12 + k];
+            if (child >= 0 && !seen[child])
+            {
+                seen[child] = 1;
+                stack[sp++] = child;
+                stack[sp++] = depth + 1;
+            }
+        }
+    }
+    free(stack);
+    free(seen);
+    return maxDepth;
+}
+
+/*
+ * Longest nonzero prefix of the selected btree's steps table: that prefix
+ * bounds get_resulting_node's recursion depth, which the kernel mirrors
+ * with a fixed 6-frame stack.
+ */
+static int packBTreeDepth(const GpuTables *t)
+{
+    size_t count = t->btStepsSize / sizeof(uint32_t);
+    int depth = 0;
+    for (size_t i = 0; i < count; i++)
+    {
+        if (t->btSteps[i] == 0)
+            break;
+        depth++;
+    }
+    return depth;
+}
+
 static void packBTree(GpuTables *t, int mc)
 {
     // Mirrors the table selection of climateToBiome() in biomenoise.c; keep
@@ -534,6 +600,21 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     if (t->btLen == 0 || t->btOrder == 0 || t->btOrder > 63)
         return 1;
 
+    // Depth guards: the kernels' explicit frames cap recursion at 12
+    // spline levels and 6 btree levels; reject deeper (pathological)
+    // tables here so they fall back to the CPU instead of writing past
+    // the frames.
+    for (int i = 0; i < 3; i++)
+    {
+        int root = i == 0 ? t->rootSp
+            : i == 1 ? t->rootFactor : t->rootJagged;
+        int depth = packSplineDepth(t, root);
+        if (depth < 0 || depth > 12)
+            return 1;
+    }
+    if (packBTreeDepth(t) > 6)
+        return 1;
+
     const SurfaceNoise *sn = &bn->terrain;
     t->snXZScale = sn->xzScale;
     t->snYScale = sn->yScale;
@@ -603,6 +684,11 @@ static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn)
     e->haveKey = 1;
     if (packTables(&e->tables, bn))
     {
+        // Free the partially packed set: the failure leaves buffers in
+        // e->tables that only a successful pack or the next release would
+        // otherwise collect.
+        gpuReleasePack(e);
+        e->haveKey = 1;
         e->keyFailed = 1;
         fprintf(stderr, "gpu: unsupported generator state (mc %d), "
             "falling back to CPU\n", bn->mc);
@@ -650,10 +736,20 @@ static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn)
 const char *gpuDeviceName(void)
 {
     GPU_LOCK;
-    gpuEnsureRuntimeLocked(&g_gpu);
+    int mode = gpuResolveModeLocked(&g_gpu);
+    if (mode != GPU_MODE_OFF)
+        gpuEnsureRuntimeLocked(&g_gpu);
     const char *name = g_gpu.clAvail ? g_gpu.cl.devName : "";
     GPU_UNLOCK;
     return name;
+}
+
+int gpuRuntimeInitialized(void)
+{
+    GPU_LOCK;
+    int inited = g_gpu.clInited;
+    GPU_UNLOCK;
+    return inited;
 }
 
 uint64_t gpuDispatchCount(void)
@@ -677,9 +773,11 @@ static int gpuSurfaceBiomeAvailable(const BiomeNoise *bn)
     if (!bn || bn->nptype >= 0 || bn->mc < MC_1_18)
         return 0;
     GPU_LOCK;
-    gpuEnsureRuntimeLocked(&g_gpu);
+    int mode = gpuResolveModeLocked(&g_gpu);
+    if (mode != GPU_MODE_OFF)
+        gpuEnsureRuntimeLocked(&g_gpu);
     int healthy = g_gpu.clAvail && !g_gpu.dead;
-    if (!healthy && gpuResolveModeLocked(&g_gpu) == GPU_MODE_FORCE)
+    if (!healthy && mode == GPU_MODE_FORCE)
         gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
     GPU_UNLOCK;
     return healthy;
@@ -777,16 +875,18 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
 
     GPU_LOCK;
     int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init on purpose: CUBIOMES_GPU=off must not
+    // even dlopen the OpenCL loader, let alone build programs.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
     gpuEnsureRuntimeLocked(&g_gpu);
     if (!g_gpu.clAvail || g_gpu.dead)
     {
         if (mode == GPU_MODE_FORCE)
             gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
-        GPU_UNLOCK;
-        return 1;
-    }
-    if (mode == GPU_MODE_OFF)
-    {
         GPU_UNLOCK;
         return 1;
     }
@@ -879,16 +979,17 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
 
     GPU_LOCK;
     int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init, same as the biome dispatch.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
     gpuEnsureRuntimeLocked(&g_gpu);
     if (!g_gpu.clAvail || g_gpu.dead)
     {
         if (mode == GPU_MODE_FORCE)
             gpuForceWarnLocked(&g_gpu, "no usable OpenCL fp64 device");
-        GPU_UNLOCK;
-        return 1;
-    }
-    if (mode == GPU_MODE_OFF)
-    {
         GPU_UNLOCK;
         return 1;
     }

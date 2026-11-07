@@ -9,13 +9,15 @@
  * exits nonzero and prints a mismatch table in that case. Without a usable
  * OpenCL fp64 device it skips cleanly with exit 0.
  *
- * Matrix: the default run covers one seed over all origins and shapes on the
- * main version, a reduced origin set for every supported biome-tree version,
- * and one large-biomes case. `--full` extends the main-version sweep to all
- * seeds (>= 3 seeds x origins {0, 100k, 1M} quart x world-border extreme
- * (quart 7.5M) x scale {1, 4} dense x scale-4 strided rows). Each case prints
+ * Matrix: the default run covers one seed over all origins (positive,
+ * negative and zero-straddling) and shapes on the main version, a reduced
+ * origin set for every supported biome-tree version, and one large-biomes
+ * case. `--full` extends the main-version sweep to all seeds and both
+ * world-border extremes (quart ±7.5M) on every version. Each case prints
  * its header before it runs and its timing after, so a stall names the case
- * and the phase that caused it.
+ * and the phase that caused it. CUBIOMES_GPU=off exits early, after
+ * asserting through the gpuRuntimeInitialized() accessor that real dispatch
+ * calls leave the OpenCL runtime uninitialized.
  *
  * Height sections exercise the terrain overview heights the same way: the
  * guarded dispatch (gpuTryHeightHook) against the CPU reference over the
@@ -186,7 +188,7 @@ typedef struct
     long long npMismatch;
     long long heightMismatch;
     int64_t maxNpDelta;
-    long long refReplicationMismatch;
+    long long wrapperReplicationMismatch;
     double tWrap, tRef, tGpu;
 } CaseStats;
 
@@ -195,7 +197,7 @@ static void reportCase(const CaseStats *st)
     printf("  -> %s: %lld pts, id mismatch %lld, np mismatch %lld "
         "(max delta %lld) [wrap %.1fs ref %.1fs gpu %.1fs]\n",
         st->idMismatch == 0 && st->npMismatch == 0
-        && st->refReplicationMismatch == 0 ? "ok" : "FAIL",
+        && st->wrapperReplicationMismatch == 0 ? "ok" : "FAIL",
         st->pts, st->idMismatch, st->npMismatch,
         (long long) st->maxNpDelta,
         st->tWrap, st->tRef, st->tGpu);
@@ -242,7 +244,10 @@ static void runCase(int mc, uint32_t flags, uint64_t seed, int ox, int oz,
     {
         const int rowZ = oz + j * stride;
         double t0 = nowSeconds();
-        // CPU golden: the real wrapper over the dense row
+        // The real public wrapper over the dense row: it serves the GPU
+        // path in auto/force and the CPU body in off. The replication
+        // check pins the harness's own CPU reference against whatever the
+        // wrapper serves, so a transparent-hook regression shows up here.
         mapOverworldSurfaceBiome(wrapIds, &g.bn, g.sha, sh->scale,
             ox, rowZ, rawW, 1);
         double t1 = nowSeconds();
@@ -270,8 +275,8 @@ static void runCase(int mc, uint32_t flags, uint64_t seed, int ox, int oz,
             st->pts++;
             if (refIds[idx] != wrapIds[idx])
             {
-                st->refReplicationMismatch++;
-                if (st->refReplicationMismatch <= 3)
+                st->wrapperReplicationMismatch++;
+                if (st->wrapperReplicationMismatch <= 3)
                     printf("  ref-vs-wrapper @(%d,%d): ref=%d wrapper=%d\n",
                         ox + i * stride, rowZ, refIds[idx], wrapIds[idx]);
             }
@@ -314,12 +319,12 @@ static void runAndAccount(int mc, uint32_t flags, uint64_t seed, int ox,
     CaseStats st = {0};
     runCase(mc, flags, seed, ox, oz, shapeIdx, &st);
     reportCase(&st);
-    if (st.idMismatch || st.npMismatch || st.refReplicationMismatch)
+    if (st.idMismatch || st.npMismatch || st.wrapperReplicationMismatch)
         *fail = 1;
     total->pts += st.pts;
     total->idMismatch += st.idMismatch;
     total->npMismatch += st.npMismatch;
-    total->refReplicationMismatch += st.refReplicationMismatch;
+    total->wrapperReplicationMismatch += st.wrapperReplicationMismatch;
     if (st.maxNpDelta > total->maxNpDelta)
         total->maxNpDelta = st.maxNpDelta;
 }
@@ -944,7 +949,24 @@ int main(int argc, char **argv)
     applySeed(&probe, DIM_OVERWORLD, 1ULL);
     if (gpuGetMode() == GPU_MODE_OFF)
     {
-        printf("skip: CUBIOMES_GPU=off\n");
+        // OFF must leave the runtime untouched even through real dispatch
+        // calls (deterministic accessor, not a timing probe).
+        float y[1];
+        int ids[1];
+        if (gpuRuntimeInitialized())
+        {
+            printf("FAIL: runtime initialized before any dispatch in off"
+                " mode\n");
+            return 1;
+        }
+        mapOverworldSurfaceBiome(ids, &probe.bn, probe.sha, 4, 0, 0, 1, 1);
+        gpuTryHeightHook(y, ids, &probe.bn, 0, 0, 1, 1);
+        if (gpuRuntimeInitialized())
+        {
+            printf("FAIL: runtime initialized in off mode\n");
+            return 1;
+        }
+        printf("skip: CUBIOMES_GPU=off (runtime untouched, verified)\n");
         return 0;
     }
     if (!gpuAvailable(&probe))
@@ -970,6 +992,9 @@ int main(int argc, char **argv)
         { 100000,  100000},
         {1000000, 1000000},
         {7500000, 7500000}, // quart = 30M blocks (world-border extreme)
+        {-100000, -100000}, // negative quadrant, far field
+        {   -48,     -48}, // 96-wide shapes straddle the zero coordinate
+        {-7500000, -7500000}, // negative world-border extreme
     };
 
     static const int versions[] =
@@ -1002,7 +1027,9 @@ int main(int argc, char **argv)
             continue;
         for (int oi = 0; oi < (int)(sizeof(origins) / sizeof(origins[0])); oi++)
         {
-            if (origins[oi][0] != 0 && !(full && origins[oi][0] == 7500000))
+            // full sweeps both world-border extremes on every version
+            if (origins[oi][0] != 0 && !(full && (origins[oi][0] == 7500000
+                    || origins[oi][0] == -7500000)))
                 continue;
             const int shapeCnt = full ? SHAPE_CNT : 1;
             for (int shape = 0; shape < shapeCnt; shape++)
@@ -1068,7 +1095,9 @@ int main(int argc, char **argv)
             continue;
         for (int oi = 0; oi < (int)(sizeof(origins) / sizeof(origins[0])); oi++)
         {
-            if (origins[oi][0] != 0 && !(full && origins[oi][0] == 7500000))
+            // full sweeps both world-border extremes on every version
+            if (origins[oi][0] != 0 && !(full && (origins[oi][0] == 7500000
+                    || origins[oi][0] == -7500000)))
                 continue;
             runHeightCase(versions[vi], 0, seeds[0], origins[oi][0],
                 origins[oi][1], 0, &total, &fail);
@@ -1089,10 +1118,10 @@ int main(int argc, char **argv)
         &total, &fail);
 
     printf("\n");
-    if (total.refReplicationMismatch)
+    if (total.wrapperReplicationMismatch)
     {
         printf("HARNESS BROKEN: reference replication mismatches the "
-            "wrapper: %lld\n", total.refReplicationMismatch);
+            "wrapper: %lld\n", total.wrapperReplicationMismatch);
         return 2;
     }
     if (fail)
