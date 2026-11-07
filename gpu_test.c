@@ -1,13 +1,28 @@
 /*
- * CPU-vs-GPU parity harness for the 1.18+ Overworld surface biome and
+ * CPU-vs-GPU drift-budget harness for the 1.18+ Overworld surface biome and
  * terrain-height GPU engine (gpu.c). Build and run via `make gpu-test`.
+ *
+ * The GPU engine evaluates the CPU's double-precision reference chain in
+ * float, so its outputs drift in a coordinate-dependent way (negligible near
+ * the origin, growing toward the world border). The harness therefore gates
+ * two separate things:
+ *
+ * - Determinism contracts, held bit-exact: the harness's CPU replication
+ *   against the real wrapper (pure CPU-vs-CPU), GPU-vs-GPU query-shape
+ *   invariance (row dispatch vs isolated calls compute identical results),
+ *   the CPU body in off mode, public-entry engagement counts, and that
+ *   CUBIOMES_GPU=off never initializes the OpenCL runtime.
+ * - Approximation quality, gated by per-bucket drift budgets: biome-id flip
+ *   rate, per-channel climate |delta| (np units), terrain-height |delta|
+ *   (blocks), and an explicit water/land flip count (height crossing sea
+ *   level 62). Buckets split by |origin|: near-field (<=100k), 1M-class and
+ *   the 30M world border. `--report` runs the matrix without budget
+ *   assertions to re-measure; without it, exceeding any budget exits nonzero.
  *
  * The CPU side is the reference itself: the real mapOverworldSurfaceBiome()
  * wrapper guards the harness's own replication (which additionally exposes
- * the climate np values), and the GPU dispatch must match both bit-exactly.
- * The engine is a pure executor, so any mismatch is a defect; the harness
- * exits nonzero and prints a mismatch table in that case. Without a usable
- * OpenCL fp64 device it skips cleanly with exit 0.
+ * the climate np values), and the GPU dispatch is compared against it.
+ * Without a usable OpenCL device it skips cleanly with exit 0.
  *
  * Matrix: the default run covers one seed over all origins (positive,
  * negative and zero-straddling) and shapes on the main version, a reduced
@@ -15,9 +30,7 @@
  * case. `--full` extends the main-version sweep to all seeds and both
  * world-border extremes (quart ±7.5M) on every version. Each case prints
  * its header before it runs and its timing after, so a stall names the case
- * and the phase that caused it. CUBIOMES_GPU=off exits early, after
- * asserting through the gpuRuntimeInitialized() accessor that real dispatch
- * calls leave the OpenCL runtime uninitialized.
+ * and the phase that caused it.
  *
  * Height sections exercise the terrain overview heights the same way: the
  * guarded dispatch (gpuTryHeightHook) against the CPU reference over the
@@ -25,13 +38,12 @@
  * 4x4 chunk tiles, isolated single columns), the transparent
  * mapOverworldTerrainHeight()/mapApproxHeight() entries in off/auto/force
  * with engagement counting, and a row-vs-isolated shape-invariance case.
- * Heights and the ids at the surface are compared bit-exact.
  *
  * A transparent-path section exercises the public mapOverworldSurfaceBiome()
- * entry (the guarded GPU hook) in off/auto/force modes: every pass must match
- * the CPU reference, auto/force must engage the engine on every public call
- * (dispatch counter, CUBIOMES_ENABLE_GPU builds), and a row-vs-isolated case
- * asserts query-shape invariance through the entry.
+ * entry (the guarded GPU hook) in off/auto/force modes: off must reproduce
+ * the CPU reference exactly, auto/force must engage the engine on every
+ * public call (dispatch counter, CUBIOMES_ENABLE_GPU builds) and their
+ * outputs are budgeted like the guarded dispatch.
  */
 
 #include "gpu.h"
@@ -43,6 +55,7 @@
 #include "rng.h"
 #include "util.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,6 +68,8 @@
 #define STRIDED_STRIDE 16 // quart stride = 64 blocks, as the mod's overview rows
 
 #define NP_CH 6
+
+#define SEA_LEVEL_Y 62.0f // heights below this read as water in the mod
 
 typedef struct
 {
@@ -89,6 +104,201 @@ static int64_t npDelta(int64_t a, int64_t b)
 {
     return a > b ? a - b : b - a;
 }
+
+//----------------------------------------------------------------------
+// Drift accounting: per-distance-bucket accumulators + budgets.
+
+enum { BK_NEAR, BK_MID, BK_BORDER, BK_CNT };
+static const char *bucketNames[BK_CNT] =
+    { "near<=100k", "1M-class", "30M-border" };
+
+static int bucketOf(int ox, int oz)
+{
+    long long ax = ox < 0 ? -(long long) ox : ox;
+    long long az = oz < 0 ? -(long long) oz : oz;
+    long long m = ax > az ? ax : az;
+    if (m <= 100000)
+        return BK_NEAR;
+    if (m <= 1500000)
+        return BK_MID;
+    return BK_BORDER;
+}
+
+typedef struct
+{
+    long long pts;
+    long long idMismatch;
+    long long npMismatch[NP_CH];
+    double npAbsSum[NP_CH];
+    int64_t npMax[NP_CH];
+    long long heightPts;
+    long long heightDeltaPts;
+    double heightAbsSum;
+    float heightMaxDelta;
+    long long waterLandFlips;
+} Bucket;
+
+static Bucket buckets[BK_CNT];
+
+static void accountIds(int bucket, int gpuId, int refId)
+{
+    buckets[bucket].pts++;
+    if (gpuId != refId)
+        buckets[bucket].idMismatch++;
+}
+
+static void accountNp(int bucket, const int64_t *gnp, const int64_t *cnp)
+{
+    Bucket *b = &buckets[bucket];
+    for (int k = 0; k < NP_CH; k++)
+    {
+        if (gnp[k] != cnp[k])
+        {
+            int64_t d = npDelta(gnp[k], cnp[k]);
+            b->npMismatch[k]++;
+            b->npAbsSum[k] += (double) d;
+            if (d > b->npMax[k])
+                b->npMax[k] = d;
+        }
+    }
+}
+
+static void accountHeight(int bucket, float gpuY, float refY)
+{
+    Bucket *b = &buckets[bucket];
+    b->heightPts++;
+    if (gpuY != refY)
+    {
+        float d = fabsf(gpuY - refY);
+        b->heightDeltaPts++;
+        b->heightAbsSum += (double) d;
+        if (d > b->heightMaxDelta)
+            b->heightMaxDelta = d;
+    }
+    if ((gpuY >= SEA_LEVEL_Y) != (refY >= SEA_LEVEL_Y))
+        b->waterLandFlips++;
+}
+
+/*
+ * Drift budgets per bucket. Rates are fractions of compared points; deltas
+ * are maxima (np units for climate channels, blocks for heights). Derived
+ * from the phase-1 measurement (365077 pts, report mode): rates carry an
+ * order of magnitude of headroom; height deltas carry 5x capped by the
+ * physical [-64, 320] output range. A broken structure (wrong channel,
+ * mangled state machine) produces order-of-magnitude rate flips, not
+ * budget-sized drift. Measured values live in task-6-float-report.md.
+ */
+typedef struct
+{
+    double maxIdFlipRate;
+    double maxWaterLandFlipRate;
+    float maxHeightDelta;
+    int64_t maxNpDelta;
+} Budget;
+
+static const Budget BUDGETS[BK_CNT] =
+{
+    /* near <=100k: 0.0171% id flips, 0.0139% wl flips, dY 5, np 625 */
+    { 0.0017, 0.0014, 25.0f, 6500 },
+    /* 1M-class: 0.1849% id flips, 0.2600% wl flips, dY 23, np 935 */
+    { 0.0185, 0.026, 115.0f, 9400 },
+    /* 30M border: 0.8442% id flips, 1.2450% wl flips, dY 77, np 1553 */
+    { 0.085, 0.125, 192.0f, 16000 },
+};
+
+static int reportBudgets(int assert)
+{
+    int fail = 0;
+    printf("\ndrift budgets %s:\n", assert ? "(asserted)" : "(report only)");
+    printf("%-11s %9s %13s %13s %12s %13s %12s %14s\n",
+        "bucket", "pts", "id flips", "id flip rate", "wl flips",
+        "wl flip rate", "max dY", "max np delta");
+    for (int b = 0; b < BK_CNT; b++)
+    {
+        const Bucket *t = &buckets[b];
+        int64_t npMaxAll = 0;
+        for (int k = 0; k < NP_CH; k++)
+            if (t->npMax[k] > npMaxAll)
+                npMaxAll = t->npMax[k];
+        double idRate = t->pts ? (double) t->idMismatch / t->pts : 0.0;
+        double wlRate = t->heightPts
+            ? (double) t->waterLandFlips / t->heightPts : 0.0;
+        printf("%-11s %9lld %13lld %12.4f%% %12lld %12.4f%% %12.1f %14lld\n",
+            bucketNames[b], t->pts, t->idMismatch, idRate * 100.0,
+            t->waterLandFlips, wlRate * 100.0,
+            (double) t->heightMaxDelta, (long long) npMaxAll);
+        if (!assert)
+            continue;
+        if (idRate > BUDGETS[b].maxIdFlipRate)
+        {
+            printf("  BUDGET FAIL: id flip rate %.5f%% > %.5f%%\n",
+                idRate * 100.0, BUDGETS[b].maxIdFlipRate * 100.0);
+            fail = 1;
+        }
+        if (wlRate > BUDGETS[b].maxWaterLandFlipRate)
+        {
+            printf("  BUDGET FAIL: water/land flip rate %.5f%% > %.5f%%\n",
+                wlRate * 100.0, BUDGETS[b].maxWaterLandFlipRate * 100.0);
+            fail = 1;
+        }
+        if (t->heightMaxDelta > BUDGETS[b].maxHeightDelta)
+        {
+            printf("  BUDGET FAIL: max height delta %.1f > %.1f\n",
+                (double) t->heightMaxDelta,
+                (double) BUDGETS[b].maxHeightDelta);
+            fail = 1;
+        }
+        for (int k = 0; k < NP_CH; k++)
+        {
+            if (t->npMax[k] > BUDGETS[b].maxNpDelta)
+            {
+                printf("  BUDGET FAIL: np[%d] max delta %lld > %lld\n",
+                    k, (long long) t->npMax[k],
+                    (long long) BUDGETS[b].maxNpDelta);
+                fail = 1;
+            }
+        }
+    }
+    // per-channel climate deltas (np units), mean over all points + max
+    printf("%-11s", "np |delta|");
+    for (int k = 0; k < NP_CH; k++)
+    {
+        double sum = 0.0;
+        int64_t mx = 0;
+        long long pts = 0;
+        for (int b = 0; b < BK_CNT; b++)
+        {
+            sum += buckets[b].npAbsSum[k];
+            pts += buckets[b].pts;
+            if (buckets[b].npMax[k] > mx)
+                mx = buckets[b].npMax[k];
+        }
+        printf("  np[%d] mean %.2f max %lld%s\n", k,
+            pts ? sum / pts : 0.0, (long long) mx,
+            k == 4 ? " (depth)" : "");
+    }
+    {
+        double sum = 0.0;
+        float mx = 0.0f;
+        long long pts = 0, nonzero = 0;
+        for (int b = 0; b < BK_CNT; b++)
+        {
+            sum += buckets[b].heightAbsSum;
+            pts += buckets[b].heightPts;
+            nonzero += buckets[b].heightDeltaPts;
+            if (buckets[b].heightMaxDelta > mx)
+                mx = buckets[b].heightMaxDelta;
+        }
+        printf("height |delta|: mean %.3f max %.1f over %lld pts "
+            "(%lld nonzero)\n", pts ? sum / pts : 0.0, (double) mx,
+            pts, nonzero);
+    }
+    fflush(stdout);
+    return fail;
+}
+
+//----------------------------------------------------------------------
+// CPU reference paths (both pinned off-GPU; pure CPU-vs-CPU golden).
 
 /*
  * CPU height reference. mapOverworldTerrainHeight() is transparently
@@ -181,25 +391,25 @@ static void cpuSurfaceBiomeRef(int *out, int64_t *np, const BiomeNoise *bn,
     free(height);
 }
 
+//----------------------------------------------------------------------
+// Guarded-dispatch matrix.
+
 typedef struct
 {
     long long pts;
     long long idMismatch;
     long long npMismatch;
-    long long heightMismatch;
-    int64_t maxNpDelta;
     long long wrapperReplicationMismatch;
     double tWrap, tRef, tGpu;
 } CaseStats;
 
 static void reportCase(const CaseStats *st)
 {
-    printf("  -> %s: %lld pts, id mismatch %lld, np mismatch %lld "
-        "(max delta %lld) [wrap %.1fs ref %.1fs gpu %.1fs]\n",
-        st->idMismatch == 0 && st->npMismatch == 0
-        && st->wrapperReplicationMismatch == 0 ? "ok" : "FAIL",
+    printf("  -> %s: %lld pts, id drift %lld, np drift %lld "
+        "[wrap %.1fs ref %.1fs gpu %.1fs]\n",
+        st->wrapperReplicationMismatch ? "FAIL" :
+            (st->idMismatch || st->npMismatch) ? "drift" : "ok",
         st->pts, st->idMismatch, st->npMismatch,
-        (long long) st->maxNpDelta,
         st->tWrap, st->tRef, st->tGpu);
     fflush(stdout);
 }
@@ -207,15 +417,18 @@ static void reportCase(const CaseStats *st)
 /*
  * Runs one (version, seed, origin, shape) case:
  * per row (dense = a single row), compare
- *   - harness reference replication vs the real wrapper (self-check)
- *   - GPU dispatch vs the reference (ids + np)
+ *   - harness reference replication vs the real wrapper (self-check,
+ *     must stay bit-exact: both sides are pure CPU)
+ *   - GPU dispatch vs the reference (ids + np, budgeted)
  */
 static void runCase(int mc, uint32_t flags, uint64_t seed, int ox, int oz,
-    int shapeIdx, CaseStats *st)
+    int shapeIdx, CaseStats *st, int *fail)
 {
     const Shape *sh = &SHAPES[shapeIdx];
-    printf("case mc=%d seed=%llu origin=(%d,%d) %s\n",
-        mc, (unsigned long long) seed, ox, oz, shapeNameByIdx(shapeIdx));
+    const int bucket = bucketOf(ox, oz);
+    printf("case mc=%d seed=%llu origin=(%d,%d) %s [%s]\n",
+        mc, (unsigned long long) seed, ox, oz, shapeNameByIdx(shapeIdx),
+        bucketNames[bucket]);
     fflush(stdout);
 
     Generator g;
@@ -244,14 +457,16 @@ static void runCase(int mc, uint32_t flags, uint64_t seed, int ox, int oz,
     {
         const int rowZ = oz + j * stride;
         double t0 = nowSeconds();
-        // The real public wrapper over the dense row: it serves the GPU
-        // path in auto/force and the CPU body in off. The replication
-        // check pins the harness's own CPU reference against whatever the
-        // wrapper serves, so a transparent-hook regression shows up here.
+        // The real public wrapper over the dense row in off mode: the pure
+        // CPU body. The replication check pins the harness's own CPU
+        // reference against it, so a reference regression shows up here.
+        const int modeBefore = gpuGetMode();
+        gpuSetMode(GPU_MODE_OFF);
         mapOverworldSurfaceBiome(wrapIds, &g.bn, g.sha, sh->scale,
             ox, rowZ, rawW, 1);
+        gpuSetMode(modeBefore);
         double t1 = nowSeconds();
-        // harness reference (ids must match the wrapper bit-exactly)
+        // harness reference (must match the wrapper bit-exactly)
         cpuSurfaceBiomeRef(refIds, refNp, &g.bn, g.sha, sh->scale,
             ox, rowZ, rawW, 1);
         double t2 = nowSeconds();
@@ -280,6 +495,7 @@ static void runCase(int mc, uint32_t flags, uint64_t seed, int ox, int oz,
                     printf("  ref-vs-wrapper @(%d,%d): ref=%d wrapper=%d\n",
                         ox + i * stride, rowZ, refIds[idx], wrapIds[idx]);
             }
+            accountIds(bucket, gpuIds[idx], refIds[idx]);
             if (gpuIds[idx] != refIds[idx])
             {
                 st->idMismatch++;
@@ -287,21 +503,14 @@ static void runCase(int mc, uint32_t flags, uint64_t seed, int ox, int oz,
                     printf("  id @(%d,%d): gpu=%d cpu=%d\n",
                         ox + i * stride, rowZ, gpuIds[idx], refIds[idx]);
             }
-            const int64_t *cnp = refNp + (size_t)idx * NP_CH;
-            const int64_t *gnp = gpuNp + (size_t)idx * NP_CH;
+            accountNp(bucket, gpuNp + (size_t)idx * NP_CH,
+                refNp + (size_t)idx * NP_CH);
             for (int k = 0; k < NP_CH; k++)
             {
+                const int64_t *cnp = refNp + (size_t)idx * NP_CH;
+                const int64_t *gnp = gpuNp + (size_t)idx * NP_CH;
                 if (gnp[k] != cnp[k])
-                {
                     st->npMismatch++;
-                    int64_t d = npDelta(gnp[k], cnp[k]);
-                    if (d > st->maxNpDelta)
-                        st->maxNpDelta = d;
-                    if (st->npMismatch <= 3)
-                        printf("  np[%d] @(%d,%d): gpu=%lld cpu=%lld\n",
-                            k, ox + i * stride, rowZ,
-                            (long long) gnp[k], (long long) cnp[k]);
-                }
             }
         }
     }
@@ -317,25 +526,24 @@ static void runAndAccount(int mc, uint32_t flags, uint64_t seed, int ox,
     int oz, int shapeIdx, CaseStats *total, int *fail)
 {
     CaseStats st = {0};
-    runCase(mc, flags, seed, ox, oz, shapeIdx, &st);
+    runCase(mc, flags, seed, ox, oz, shapeIdx, &st, fail);
     reportCase(&st);
-    if (st.idMismatch || st.npMismatch || st.wrapperReplicationMismatch)
+    if (st.wrapperReplicationMismatch)
         *fail = 1;
     total->pts += st.pts;
     total->idMismatch += st.idMismatch;
     total->npMismatch += st.npMismatch;
     total->wrapperReplicationMismatch += st.wrapperReplicationMismatch;
-    if (st.maxNpDelta > total->maxNpDelta)
-        total->maxNpDelta = st.maxNpDelta;
 }
 
 //----------------------------------------------------------------------
 // Transparent dispatch path: the public mapOverworldSurfaceBiome() entry,
 // which tries the guarded GPU hook before its CPU body when compiled with
-// CUBIOMES_ENABLE_GPU. Every pass must reproduce the CPU reference
-// bit-exactly; auto/force must engage the engine on every public call
-// (dispatch counter), off must not touch it. Points are counted once per
-// case even though all three passes compare them.
+// CUBIOMES_ENABLE_GPU. The off pass runs the CPU body and must reproduce the
+// reference bit-exactly; auto/force run the GPU and are budgeted. auto/force
+// must engage the engine on every public call (dispatch counter), off must
+// not touch it. Points are counted once per case even though all three
+// passes compare them.
 
 static const Shape TSHAPES[] =
 {
@@ -351,23 +559,14 @@ static const char *tshapeNameByIdx(int idx)
     return names[idx];
 }
 
-static void reportTransparent(const char *mode, long long idMismatch,
-    uint64_t engaged, uint64_t expected)
-{
-    printf("  -> %s %s: id mismatch %lld [gpu %llu/%llu]\n",
-        mode,
-        idMismatch == 0 && engaged == expected ? "ok" : "FAIL",
-        idMismatch, (unsigned long long) engaged,
-        (unsigned long long) expected);
-    fflush(stdout);
-}
-
 static void runTransparentCase(int mc, uint32_t flags, uint64_t seed, int ox,
     int oz, int shapeIdx, CaseStats *total, int *fail)
 {
     const Shape *sh = &TSHAPES[shapeIdx];
-    printf("transparent case mc=%d seed=%llu origin=(%d,%d) %s\n",
-        mc, (unsigned long long) seed, ox, oz, tshapeNameByIdx(shapeIdx));
+    const int bucket = bucketOf(ox, oz);
+    printf("transparent case mc=%d seed=%llu origin=(%d,%d) %s [%s]\n",
+        mc, (unsigned long long) seed, ox, oz, tshapeNameByIdx(shapeIdx),
+        bucketNames[bucket]);
     fflush(stdout);
 
     Generator g;
@@ -389,7 +588,7 @@ static void runTransparentCase(int mc, uint32_t flags, uint64_t seed, int ox,
         { GPU_MODE_OFF, GPU_MODE_AUTO, GPU_MODE_FORCE };
     static const char *modeNames[] = { "off", "auto", "force" };
     const int modeBefore = gpuGetMode();
-    long long idMismatch = 0;
+    long long idDrift = 0, idHard = 0;
     int shapeFail = 0;
 
     for (int p = 0; p < 3; p++)
@@ -407,11 +606,22 @@ static void runTransparentCase(int mc, uint32_t flags, uint64_t seed, int ox,
             {
                 if (pubIds[i] != refIds[i])
                 {
-                    idMismatch++;
-                    if (idMismatch <= 3)
-                        printf("  %s id @(%d,%d): pub=%d ref=%d\n",
-                            modeNames[p], ox + i, rowZ, pubIds[i], refIds[i]);
+                    if (modes[p] == GPU_MODE_OFF)
+                    {
+                        // CPU body: regression, never drift
+                        idHard++;
+                        if (idHard <= 3)
+                            printf("  %s id @(%d,%d): pub=%d ref=%d\n",
+                                modeNames[p], ox + i, rowZ, pubIds[i],
+                                refIds[i]);
+                    }
+                    else
+                    {
+                        idDrift++;
+                    }
                 }
+                if (modes[p] != GPU_MODE_OFF)
+                    accountIds(bucket, pubIds[i], refIds[i]);
             }
         }
         uint64_t engaged = gpuDispatchCount() - before;
@@ -428,7 +638,11 @@ static void runTransparentCase(int mc, uint32_t flags, uint64_t seed, int ox,
             shapeFail = 1;
         }
 #endif
-        reportTransparent(modeNames[p], idMismatch, engaged, expected);
+        printf("  -> %s: hard mismatch %lld, drift %lld [gpu %llu/%llu]\n",
+            modeNames[p], idHard, idDrift,
+            (unsigned long long) (modes[p] != GPU_MODE_OFF ? engaged : 0),
+            (unsigned long long) (modes[p] != GPU_MODE_OFF ? expected : 0));
+        fflush(stdout);
     }
     gpuSetMode(modeBefore);
 
@@ -436,21 +650,24 @@ static void runTransparentCase(int mc, uint32_t flags, uint64_t seed, int ox,
     free(pubIds);
     free(refNp);
     total->pts += (long long) sh->w * sh->h;
-    total->idMismatch += idMismatch;
-    if (idMismatch || shapeFail)
+    if (idHard || shapeFail)
         *fail = 1;
 }
 
 /*
  * Query-shape invariance through the public entry: one strided/dense row
  * computed by a single GPU dispatch must equal isolated single-point public
- * queries (each its own dispatch) and the CPU reference row.
+ * queries (each its own dispatch) bit-exactly - the kernel's per-point work
+ * is independent of the query shape. Against the CPU reference the row is
+ * budgeted like any other GPU output.
  */
 static void runTransparentShapeCase(int mc, uint32_t flags, uint64_t seed,
     int ox, int oz, CaseStats *total, int *fail)
 {
+    const int bucket = bucketOf(ox, oz);
     printf("transparent shape case mc=%d seed=%llu origin=(%d,%d) "
-        "row-vs-isolated\n", mc, (unsigned long long) seed, ox, oz);
+        "row-vs-isolated [%s]\n",
+        mc, (unsigned long long) seed, ox, oz, bucketNames[bucket]);
     fflush(stdout);
 
     Generator g;
@@ -461,7 +678,8 @@ static void runTransparentShapeCase(int mc, uint32_t flags, uint64_t seed,
     gpuSetMode(GPU_MODE_AUTO);
     const uint64_t countBefore = gpuDispatchCount();
     uint64_t calls = 0;
-    long long idMismatch = 0;
+    long long invarianceMismatch = 0;
+    long long refDrift = 0;
     int shapeFail = 0;
     long long pts = 0;
 
@@ -483,33 +701,31 @@ static void runTransparentShapeCase(int mc, uint32_t flags, uint64_t seed,
         cpuSurfaceBiomeRef(refIds, refNp, &g.bn, g.sha, scale, ox, oz, w, 1);
         mapOverworldSurfaceBiome(row, &g.bn, g.sha, scale, ox, oz, w, 1);
         calls++;
-        long long scaleMismatch = 0;
+        long long scaleInvariance = 0;
         for (int i = 0; i < w; i += step)
         {
             int one;
             mapOverworldSurfaceBiome(&one, &g.bn, g.sha, scale,
                 ox + i, oz, 1, 1);
             calls++;
+            // GPU-vs-GPU: identical by construction, any difference is a
+            // determinism defect, not drift
             if (one != row[i])
             {
-                scaleMismatch++;
-                if (scaleMismatch <= 3)
+                scaleInvariance++;
+                if (scaleInvariance <= 3)
                     printf("  scale%d isolated @(%d,%d): one=%d row=%d\n",
                         scale, ox + i, oz, one, row[i]);
             }
+            accountIds(bucket, row[i], refIds[i]);
             if (row[i] != refIds[i])
-            {
-                scaleMismatch++;
-                if (scaleMismatch <= 3)
-                    printf("  scale%d ref @(%d,%d): row=%d ref=%d\n",
-                        scale, ox + i, oz, row[i], refIds[i]);
-            }
+                refDrift++;
             pts++;
         }
-        printf("  -> scale%d: %lld sampled pts, id mismatch %lld\n",
-            scale, pts, scaleMismatch);
+        printf("  -> scale%d: %lld sampled pts, invariance mismatch %lld, "
+            "ref drift %lld\n", scale, pts, scaleInvariance, refDrift);
         fflush(stdout);
-        idMismatch += scaleMismatch;
+        invarianceMismatch += scaleInvariance;
         free(row);
         free(refIds);
         free(refNp);
@@ -531,8 +747,7 @@ static void runTransparentShapeCase(int mc, uint32_t flags, uint64_t seed,
     gpuSetMode(modeBefore);
 
     total->pts += pts;
-    total->idMismatch += idMismatch;
-    if (idMismatch || shapeFail)
+    if (invarianceMismatch || shapeFail)
         *fail = 1;
 }
 
@@ -541,8 +756,8 @@ static void runTransparentShapeCase(int mc, uint32_t flags, uint64_t seed,
  * on a fingerprint of the seed-derived state, because setBiomeSeed()
  * re-derives the tables in place and pointer identity cannot see a reseed.
  * Public-entry calls on the SAME BiomeNoise across a reseed and across a
- * large-biomes flip (same seed, same sha) must each match the CPU reference;
- * a stale cache would repeat the first configuration's tables.
+ * large-biomes flip (same seed, same sha) must each match the CPU reference
+ * (budgeted); a stale cache would repeat the first configuration's tables.
  */
 static void runTransparentReseedCase(int mc, uint32_t flags, uint64_t seedA,
     uint64_t seedB, CaseStats *total, int *fail)
@@ -554,6 +769,7 @@ static void runTransparentReseedCase(int mc, uint32_t flags, uint64_t seedA,
 
     Generator g;
     const int w = 64;
+    const int bucket = BK_NEAR;
     int *pubIds = malloc(sizeof(int) * (size_t)w);
     int *refIds = malloc(sizeof(int) * (size_t)w);
     int64_t *refNp = malloc(sizeof(int64_t) * (size_t)w * NP_CH);
@@ -572,7 +788,7 @@ static void runTransparentReseedCase(int mc, uint32_t flags, uint64_t seedA,
         { seedB, flags },
         { seedA, flags | LARGE_BIOMES },
     };
-    long long idMismatch = 0;
+    long long idDrift = 0;
     for (int p = 0; p < 3; p++)
     {
         setupGenerator(&g, mc, passes[p].flags);
@@ -581,13 +797,9 @@ static void runTransparentReseedCase(int mc, uint32_t flags, uint64_t seedA,
         mapOverworldSurfaceBiome(pubIds, &g.bn, g.sha, 4, 0, 0, w, 1);
         for (int i = 0; i < w; i++)
         {
+            accountIds(bucket, pubIds[i], refIds[i]);
             if (pubIds[i] != refIds[i])
-            {
-                idMismatch++;
-                if (idMismatch <= 3)
-                    printf("  pass %d id @(%d,0): pub=%d ref=%d\n",
-                        p, i, pubIds[i], refIds[i]);
-            }
+                idDrift++;
         }
     }
     int shapeFail = 0;
@@ -603,23 +815,22 @@ static void runTransparentReseedCase(int mc, uint32_t flags, uint64_t seedA,
 #endif
     gpuSetMode(modeBefore);
 
-    printf("  -> %s: id mismatch %lld\n",
-        idMismatch == 0 && !shapeFail ? "ok" : "FAIL", idMismatch);
+    printf("  -> %s: id drift %lld\n", shapeFail ? "FAIL" : "ok", idDrift);
     fflush(stdout);
     free(pubIds);
     free(refIds);
     free(refNp);
     total->pts += 3 * w;
-    total->idMismatch += idMismatch;
-    if (idMismatch || shapeFail)
+    if (shapeFail)
         *fail = 1;
 }
 
 //----------------------------------------------------------------------
 // Terrain overview heights: the guarded dispatch (gpuTryHeightHook) and the
 // transparent mapOverworldTerrainHeight()/mapApproxHeight() entries, against
-// the pure-CPU reference (cpuHeightRef pins the engine off), bit-exact on
-// the heights and on the ids at the clamped surface.
+// the pure-CPU reference (cpuHeightRef pins the engine off). Heights and
+// surface ids are budgeted; shape invariance and off-mode equality stay
+// bit-exact.
 
 typedef struct
 {
@@ -644,15 +855,6 @@ static const char *hshapeNameByIdx(int idx)
     return names[idx];
 }
 
-static void reportHeightCase(const CaseStats *st)
-{
-    printf("  -> %s: %lld pts, height mismatch %lld, id mismatch %lld "
-        "[cpu %.1fs gpu %.1fs]\n",
-        st->heightMismatch == 0 && st->idMismatch == 0 ? "ok" : "FAIL",
-        st->pts, st->heightMismatch, st->idMismatch, st->tRef, st->tGpu);
-    fflush(stdout);
-}
-
 /*
  * One (version, seed, origin, shape) height case: the guarded GPU dispatch
  * vs the CPU reference. Dense shapes go through a single 2D call per side
@@ -663,8 +865,10 @@ static void runHeightCase(int mc, uint32_t flags, uint64_t seed, int ox,
     int oz, int shapeIdx, CaseStats *total, int *fail)
 {
     const HShape *sh = &HSHAPES[shapeIdx];
-    printf("height case mc=%d seed=%llu origin=(%d,%d) %s\n",
-        mc, (unsigned long long) seed, ox, oz, hshapeNameByIdx(shapeIdx));
+    const int bucket = bucketOf(ox, oz);
+    printf("height case mc=%d seed=%llu origin=(%d,%d) %s [%s]\n",
+        mc, (unsigned long long) seed, ox, oz, hshapeNameByIdx(shapeIdx),
+        bucketNames[bucket]);
     fflush(stdout);
 
     Generator g;
@@ -683,14 +887,15 @@ static void runHeightCase(int mc, uint32_t flags, uint64_t seed, int ox,
         exit(2);
     }
 
-    CaseStats st = {0};
+    long long pts = 0, idDrift = 0, heightDrift = 0;
+    double tRef = 0.0, tGpu = 0.0;
     const int calls = stride == 1 ? 1 : sh->h;
     for (int c = 0; c < calls; c++)
     {
         const int rowZ = oz + c * stride;
         const int rw = stride == 1 ? sh->w : rawW;
         const int rh = stride == 1 ? sh->h : 1;
-        st.tRef += cpuHeightRef(refY, refIds, &g.bn, ox, rowZ, rw, rh);
+        tRef += cpuHeightRef(refY, refIds, &g.bn, ox, rowZ, rw, rh);
         double t0 = nowSeconds();
         if (gpuTryHeightHook(gpuY, gpuIds, &g.bn, ox, rowZ, rw, rh))
         {
@@ -700,61 +905,70 @@ static void runHeightCase(int mc, uint32_t flags, uint64_t seed, int ox,
             exit(2);
         }
         double t1 = nowSeconds();
-        st.tGpu += t1 - t0;
+        tGpu += t1 - t0;
 
         for (int j = 0; j < rh; j++)
         {
             for (int i = 0; i < rw; i += stride)
             {
                 const int idx = j * rw + i;
-                st.pts++;
+                pts++;
+                accountHeight(bucket, gpuY[idx], refY[idx]);
                 if (gpuY[idx] != refY[idx])
                 {
-                    st.heightMismatch++;
-                    if (st.heightMismatch <= 3)
+                    heightDrift++;
+                    if (heightDrift <= 3)
                         printf("  height @(%d,%d): gpu=%f cpu=%f\n",
                             ox + i, rowZ + j, (double) gpuY[idx],
                             (double) refY[idx]);
                 }
-                if (sh->ids && gpuIds[idx] != refIds[idx])
+                if (sh->ids)
                 {
-                    st.idMismatch++;
-                    if (st.idMismatch <= 3)
-                        printf("  id @(%d,%d): gpu=%d cpu=%d\n",
-                            ox + i, rowZ + j, gpuIds[idx], refIds[idx]);
+                    accountIds(bucket, gpuIds[idx], refIds[idx]);
+                    if (gpuIds[idx] != refIds[idx])
+                    {
+                        idDrift++;
+                        if (idDrift <= 3)
+                            printf("  id @(%d,%d): gpu=%d cpu=%d\n",
+                                ox + i, rowZ + j, gpuIds[idx], refIds[idx]);
+                    }
                 }
             }
         }
     }
 
-    reportHeightCase(&st);
+    printf("  -> %s: %lld pts, height drift %lld, id drift %lld "
+        "[cpu %.1fs gpu %.1fs]\n",
+        heightDrift || idDrift ? "drift" : "ok",
+        pts, heightDrift, idDrift, tRef, tGpu);
+    fflush(stdout);
     free(refY);
     free(gpuY);
     free(refIds);
     free(gpuIds);
-    total->pts += st.pts;
-    total->heightMismatch += st.heightMismatch;
-    total->idMismatch += st.idMismatch;
-    if (st.heightMismatch || st.idMismatch)
-        *fail = 1;
+    total->pts += pts;
 }
 
 /*
  * Transparent height dispatch through the public mapOverworldTerrainHeight()
- * entry in off/auto/force: every pass must match the pure-CPU reference,
+ * entry in off/auto/force: the off pass runs the CPU body and must match the
+ * pure-CPU reference bit-exactly; auto/force run the GPU and are budgeted.
  * auto/force must engage the engine on every public call
  * (gpuHeightDispatchCount, CUBIOMES_ENABLE_GPU builds), off must not touch
  * it. The auto pass also re-queries sampled points as isolated single
- * columns: one strided/dense row dispatch must equal the isolated calls.
+ * columns: one strided/dense row dispatch must equal the isolated calls
+ * bit-exactly (GPU-vs-GPU determinism).
  */
 static void runTransparentHeightCase(int mc, uint32_t flags, uint64_t seed,
     int ox, int oz, CaseStats *total, int *fail)
 {
     const int w = 64;
     const int rows = 2;
+    const int bucket = bucketOf(ox, oz);
     printf("transparent height case mc=%d seed=%llu origin=(%d,%d) "
-        "w=%d rows=%d + isolated\n",
-        mc, (unsigned long long) seed, ox, oz, w, rows);
+        "w=%d rows=%d + isolated [%s]\n",
+        mc, (unsigned long long) seed, ox, oz, w, rows,
+        bucketNames[bucket]);
     fflush(stdout);
 
     Generator g;
@@ -775,7 +989,7 @@ static void runTransparentHeightCase(int mc, uint32_t flags, uint64_t seed,
         { GPU_MODE_OFF, GPU_MODE_AUTO, GPU_MODE_FORCE };
     static const char *modeNames[] = { "off", "auto", "force" };
     const int modeBefore = gpuGetMode();
-    long long heightMismatch = 0, idMismatch = 0;
+    long long heightHard = 0, idHard = 0, heightDrift = 0, idDrift = 0;
     int shapeFail = 0;
 
     for (int p = 0; p < 3; p++)
@@ -808,32 +1022,48 @@ static void runTransparentHeightCase(int mc, uint32_t flags, uint64_t seed,
             for (int i = 0; i < w; i++)
             {
                 const int idx = j * w + i;
-                if (pubY[idx] != refY[idx])
+                const int yDiff = pubY[idx] != refY[idx];
+                const int idDiff = pubIds[idx] != refIds[idx];
+                if (modes[p] == GPU_MODE_OFF)
                 {
-                    heightMismatch++;
-                    if (heightMismatch <= 3)
-                        printf("  %s height @(%d,%d): pub=%f ref=%f\n",
-                            modeNames[p], ox + i, oz + j,
-                            (double) pubY[idx], (double) refY[idx]);
+                    // CPU body: regression, never drift
+                    if (yDiff)
+                    {
+                        heightHard++;
+                        if (heightHard <= 3)
+                            printf("  %s height @(%d,%d): pub=%f ref=%f\n",
+                                modeNames[p], ox + i, oz + j,
+                                (double) pubY[idx], (double) refY[idx]);
+                    }
+                    if (idDiff)
+                    {
+                        idHard++;
+                        if (idHard <= 3)
+                            printf("  %s id @(%d,%d): pub=%d ref=%d\n",
+                                modeNames[p], ox + i, oz + j,
+                                pubIds[idx], refIds[idx]);
+                    }
                 }
-                if (pubIds[idx] != refIds[idx])
+                else
                 {
-                    idMismatch++;
-                    if (idMismatch <= 3)
-                        printf("  %s id @(%d,%d): pub=%d ref=%d\n",
-                            modeNames[p], ox + i, oz + j,
-                            pubIds[idx], refIds[idx]);
+                    accountHeight(bucket, pubY[idx], refY[idx]);
+                    accountIds(bucket, pubIds[idx], refIds[idx]);
+                    heightDrift += yDiff;
+                    idDrift += idDiff;
                 }
             }
         }
-        printf("  -> %s: height mismatch %lld, id mismatch %lld "
-            "[gpu %llu/%llu]\n", modeNames[p], heightMismatch, idMismatch,
-            (unsigned long long) engaged, (unsigned long long) expected);
+        printf("  -> %s: hard mismatch %lld, height drift %lld, id drift %lld"
+            " [gpu %llu/%llu]\n", modeNames[p], heightHard + idHard,
+            heightDrift, idDrift,
+            (unsigned long long) (modes[p] != GPU_MODE_OFF ? engaged : 0),
+            (unsigned long long) (modes[p] != GPU_MODE_OFF ? expected : 0));
         fflush(stdout);
     }
 
     // Shape invariance: isolated single-column queries through the same
-    // public entry must reproduce the row dispatch's heights and ids.
+    // public entry must reproduce the row dispatch's heights and ids
+    // bit-exactly (GPU-vs-GPU determinism, not drift).
     gpuSetMode(GPU_MODE_AUTO);
     for (int i = 0; i < w; i += 7)
     {
@@ -842,8 +1072,8 @@ static void runTransparentHeightCase(int mc, uint32_t flags, uint64_t seed,
         mapOverworldTerrainHeight(&oneY, &oneId, &g.bn, ox + i, oz, 1, 1);
         if (oneY != pubY[i] || oneId != pubIds[i])
         {
-            heightMismatch++;
-            if (heightMismatch <= 3)
+            heightHard++;
+            if (heightHard <= 3)
                 printf("  isolated @(%d,%d): one=(%f,%d) row=(%f,%d)\n",
                     ox + i, oz, (double) oneY, oneId,
                     (double) pubY[i], pubIds[i]);
@@ -856,9 +1086,7 @@ static void runTransparentHeightCase(int mc, uint32_t flags, uint64_t seed,
     free(pubY);
     free(pubIds);
     total->pts += (long long) w * rows;
-    total->heightMismatch += heightMismatch;
-    total->idMismatch += idMismatch;
-    if (heightMismatch || idMismatch || shapeFail)
+    if (heightHard || idHard || shapeFail)
         *fail = 1;
 }
 
@@ -866,13 +1094,15 @@ static void runTransparentHeightCase(int mc, uint32_t flags, uint64_t seed,
  * The Generator-facing consumer entry mapApproxHeight(): on 1.18+ Overworld
  * it gates nptype and delegates to mapOverworldTerrainHeight(). The tile and
  * single-column shapes real consumers use, in auto mode, against the
- * mode-off CPU reference.
+ * mode-off CPU reference (budgeted).
  */
 static void runApproxHeightCase(int mc, uint32_t flags, uint64_t seed,
     int ox, int oz, CaseStats *total, int *fail)
 {
+    const int bucket = bucketOf(ox, oz);
     printf("transparent mapApproxHeight case mc=%d seed=%llu origin=(%d,%d) "
-        "tile4x4 + single\n", mc, (unsigned long long) seed, ox, oz);
+        "tile4x4 + single [%s]\n",
+        mc, (unsigned long long) seed, ox, oz, bucketNames[bucket]);
     fflush(stdout);
 
     Generator g;
@@ -884,62 +1114,50 @@ static void runApproxHeightCase(int mc, uint32_t flags, uint64_t seed,
     const int w = 4, h = 4;
     float refY[16], pubY[16];
     int refIds[16], pubIds[16];
-    long long heightMismatch = 0, idMismatch = 0;
+    long long heightDrift = 0, idDrift = 0;
 
     cpuHeightRef(refY, refIds, &g.bn, ox, oz, w, h);
     mapApproxHeight(pubY, pubIds, &g, &sn, ox, oz, w, h);
     for (int i = 0; i < w * h; i++)
     {
+        accountHeight(bucket, pubY[i], refY[i]);
+        accountIds(bucket, pubIds[i], refIds[i]);
         if (pubY[i] != refY[i])
-        {
-            heightMismatch++;
-            if (heightMismatch <= 3)
-                printf("  tile height @(%d,%d): pub=%f ref=%f\n",
-                    ox + i % w, oz + i / w, (double) pubY[i],
-                    (double) refY[i]);
-        }
+            heightDrift++;
         if (pubIds[i] != refIds[i])
-        {
-            idMismatch++;
-            if (idMismatch <= 3)
-                printf("  tile id @(%d,%d): pub=%d ref=%d\n",
-                    ox + i % w, oz + i / w, pubIds[i], refIds[i]);
-        }
+            idDrift++;
     }
 
     float oneRefY, onePubY;
     int oneRefId, onePubId;
     cpuHeightRef(&oneRefY, &oneRefId, &g.bn, ox + 2, oz + 2, 1, 1);
     mapApproxHeight(&onePubY, &onePubId, &g, &sn, ox + 2, oz + 2, 1, 1);
-    if (onePubY != oneRefY || onePubId != oneRefId)
-    {
-        heightMismatch++;
-        printf("  single @(%d,%d): pub=(%f,%d) ref=(%f,%d)\n",
-            ox + 2, oz + 2, (double) onePubY, onePubId,
-            (double) oneRefY, oneRefId);
-    }
+    accountHeight(bucket, onePubY, oneRefY);
+    accountIds(bucket, onePubId, oneRefId);
+    if (onePubY != oneRefY)
+        heightDrift++;
+    if (onePubId != oneRefId)
+        idDrift++;
 
-    printf("  -> %s: height mismatch %lld, id mismatch %lld\n",
-        heightMismatch == 0 && idMismatch == 0 ? "ok" : "FAIL",
-        heightMismatch, idMismatch);
+    printf("  -> %s: height drift %lld, id drift %lld\n",
+        heightDrift || idDrift ? "drift" : "ok", heightDrift, idDrift);
     fflush(stdout);
     total->pts += (long long) w * h + 1;
-    total->heightMismatch += heightMismatch;
-    total->idMismatch += idMismatch;
-    if (heightMismatch || idMismatch)
-        *fail = 1;
 }
 
 int main(int argc, char **argv)
 {
     int full = 0;
+    int reportOnly = 0;
     for (int i = 1; i < argc; i++)
     {
         if (!strcmp(argv[i], "--full"))
             full = 1;
+        else if (!strcmp(argv[i], "--report"))
+            reportOnly = 1;
         else
         {
-            fprintf(stderr, "usage: gpu_test [--full]\n");
+            fprintf(stderr, "usage: gpu_test [--full] [--report]\n");
             return 2;
         }
     }
@@ -971,13 +1189,14 @@ int main(int argc, char **argv)
     }
     if (!gpuAvailable(&probe))
     {
-        printf("skip: no usable OpenCL fp64 device (CUBIOMES_GPU=%s)\n",
+        printf("skip: no usable OpenCL device (CUBIOMES_GPU=%s)\n",
             gpuGetMode() == GPU_MODE_FORCE ? "force" : "auto");
         return 0;
     }
     printf("OpenCL device: %s\n", gpuDeviceName());
-    printf("parity matrix: %s (deterministic flags CPU reference vs GPU, "
-        "bit-exact required)\n\n", full ? "FULL" : "default (--full extends)");
+    printf("drift matrix: %s (CPU double reference vs GPU float; determinism"
+        " contracts bit-exact, drift per budget)\n\n",
+        full ? "FULL" : "default (--full extends)");
     fflush(stdout);
 
     static const uint64_t seeds[] =
@@ -1126,13 +1345,16 @@ int main(int argc, char **argv)
     }
     if (fail)
     {
-        printf("PARITY FAIL: %lld / %lld points mismatched "
-            "(id %lld, np %lld, height %lld, max np delta %lld)\n",
-            total.idMismatch + total.npMismatch + total.heightMismatch,
-            total.pts, total.idMismatch, total.npMismatch,
-            total.heightMismatch, (long long) total.maxNpDelta);
+        printf("CONTRACT FAIL: %lld points compared; determinism contract "
+            "violated (see FAIL lines above)\n", total.pts);
         return 1;
     }
-    printf("PARITY OK: %lld points, 0 mismatches\n", total.pts);
+    if (reportBudgets(!reportOnly))
+    {
+        printf("BUDGET FAIL: drift exceeded the accepted budgets\n");
+        return 1;
+    }
+    printf("BUDGET OK: %lld points%s\n", total.pts,
+        reportOnly ? " (report mode, budgets not asserted)" : "");
     return 0;
 }
