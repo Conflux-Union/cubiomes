@@ -414,8 +414,6 @@ static int packSplineDepth(const GpuTables *t, int root)
         int node = stack[--sp];
         if (depth > maxDepth)
             maxDepth = depth;
-        if (depth >= 12)
-            continue;
         for (int k = 0; k < 12; k++)
         {
             int child = t->schild[(size_t) node * 12 + k];
