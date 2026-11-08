@@ -244,4 +244,33 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
     int blockX, int blockZ, int w, int rows, int stride,
     const int *terrainY);
 
+/*
+ * Batch variant of gpuCfxSurfaceBiomes(): `n` independent caller-Y blocks
+ * in ONE submission, so a wave of tiles pays one lock acquisition, one
+ * table pack, one terrainY upload and one readback wait instead of n.
+ * Block i resolves the ids gpuCfxSurfaceBiomes() would for (blockX[i],
+ * blockZ[i], w[i] x rows[i], stride[i]) and writes w[i]*rows[i] ints at
+ * ids[flatOffsets[i]]: ids is caller-provided flat storage, flatOffsets[i]
+ * is its int index for block i (non-overlapping; the caller owns the
+ * layout). terrainY is the matching flat input: block i's row-major plane
+ * of w[i]*rows[i] ints at flatOffsets[i], uploaded as ONE write into the
+ * batch slab's input buffer before the first kernel enqueues. sha and the
+ * packed tables are shared by every block. n must not exceed 32 (*failMask
+ * is an int bitmask) and the sum of w[i]*rows[i] is capped like the single
+ * entry. Returns 0 when the batch was attempted: blocks whose enqueue
+ * failed host-side carry bit i in *failMask, their output range is left
+ * untouched and the rest is filled bit-exactly, so the caller CPU-repairs
+ * exactly those blocks. Nonzero means the whole batch was refused before
+ * any GPU work or output write (bad arguments incl. the n cap, a negative
+ * flatOffsets entry or the points cap; mode off; disabled/dead engine or
+ * no fp64 device; table-pack failure; slab-growth/allocation failure; the
+ * terrainY upload failing to enqueue), *failMask is untouched, and the
+ * caller falls back per block. Bit-exact against dispatching the same
+ * blocks one by one.
+ */
+int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
+    const BiomeNoise *bn, uint64_t sha,
+    const int *blockX, const int *blockZ, const int *w, const int *rows,
+    const int *stride, const int *terrainY, int n);
+
 #endif

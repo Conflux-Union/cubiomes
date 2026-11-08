@@ -1995,6 +1995,158 @@ static void runCfxHeightsBatchRefusalCase(uint64_t seed, CaseStats *total,
     }
 }
 
+// The biome batch must fill every block's range of the caller's flat ids
+// layout bit-exactly the way n per-block gpuCfxSurfaceBiomes() calls do,
+// with the concatenated terrainY planes uploading as one packed write.
+// Mixed shapes, strides and origins make the per-block geometry (and the
+// kernel arg re-set between same-kernel enqueues) actually vary; comparing
+// each block's output range independently also catches the flat terrainY
+// write bleeding across blocks. The blocks pack the flat offsets with no
+// gaps, derived from the shapes; interleaving the reference calls with the
+// batch call walks the slab rotation across both entry kinds.
+static void runCfxBiomesBatchCase(uint64_t seed, CaseStats *total, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    enum { CNT = 3 };
+    static const int w[CNT] = { 129, 130, 65 };
+    static const int rows[CNT] = { 129, 65, 130 };
+    static const int stride[CNT] = { 2, 8, 16 };
+    static const int bx[CNT] = { 0, 800000, -300000 };
+    static const int bz[CNT] = { 0, -400000, 500000 };
+
+    long offs[CNT];
+    int totalPts = 0;
+    for (int i = 0; i < CNT; i++)
+    {
+        offs[i] = totalPts;
+        totalPts += w[i] * rows[i];
+    }
+
+    int *terrainY = malloc(sizeof(int) * (size_t)totalPts);
+    int *ref = malloc(sizeof(int) * (size_t)totalPts);
+    int *batch = malloc(sizeof(int) * (size_t)totalPts);
+    if (!terrainY || !ref || !batch)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+    // One flat terrainY input shared by both entry kinds: block i's
+    // row-major plane sits at offs[i], solver heights exactly like the
+    // product feeds them (detail scalars are per stride).
+    for (int i = 0; i < CNT; i++)
+    {
+        int mf, mmf, tr;
+        cfxNoiseDetailForStrideRef(&g.bn.terrain, stride[i], &mf, &mmf, &tr);
+        for (int j = 0; j < rows[i]; j++)
+            for (int c = 0; c < w[i]; c++)
+                terrainY[offs[i] + j * w[i] + c] =
+                    cfxModernOverviewHeightRef(&g.bn,
+                        floordiv(bx[i] + c * stride[i], 4),
+                        floordiv(bz[i] + j * stride[i], 4), mf, mmf, tr);
+    }
+
+    int rcRef = 0;
+    for (int i = 0; i < CNT; i++)
+        rcRef |= gpuCfxSurfaceBiomes(ref + offs[i], &g.bn, g.sha, bx[i],
+            bz[i], w[i], rows[i], stride[i], terrainY + offs[i]);
+    int failMask = (int) 0x5A5A5A5A;
+    int rcBatch = gpuCfxSurfaceBiomesBatch(&failMask, batch, offs, &g.bn,
+        g.sha, bx, bz, w, rows, stride, terrainY, CNT);
+
+    if (rcRef != 0 || rcBatch != 0)
+    {
+        printf("  FAIL: biomes batch or per-block dispatch refused"
+            " (%d %d)\n", rcRef, rcBatch);
+        *fail = 1;
+    }
+    else if (failMask != 0)
+    {
+        printf("  FAIL: biomes batch reported per-block failures"
+            " (failMask %#x)\n", failMask);
+        *fail = 1;
+    }
+    else
+    {
+        int mismatches = 0;
+        for (int i = 0; i < CNT; i++)
+        {
+            const int pts = w[i] * rows[i];
+            const int *refBlk = ref + offs[i];
+            const int *batchBlk = batch + offs[i];
+            for (int p = 0; p < pts; p++)
+                if (batchBlk[p] != refBlk[p])
+                {
+                    if (mismatches < 3)
+                        printf("    block %d @%d: batch=%d ref=%d\n",
+                            i, p, batchBlk[p], refBlk[p]);
+                    mismatches++;
+                }
+        }
+        if (mismatches)
+        {
+            printf("  FAIL: biomes batch drifted from per-block dispatches:"
+                " %d mismatches\n", mismatches);
+            *fail = 1;
+        }
+        else
+        {
+            printf("  biomes batch: %d blocks (%d pts) bit-identical to"
+                " per-block dispatches\n", CNT, totalPts);
+            total->pts += totalPts;
+        }
+    }
+    free(terrainY);
+    free(ref);
+    free(batch);
+}
+
+// Whole-batch refusal must fire before any lock, upload, enqueue or output
+// write: the first block is exactly the dispatch cap and a second block
+// pushes the sum over it, while the ids target is deliberately one int -
+// any premature write corrupts visibly here. failMask must stay untouched
+// on refusal (the caller keys its fallback off the return value).
+static void runCfxBiomesBatchRefusalCase(uint64_t seed, CaseStats *total,
+    int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    // gpu.c's GPU_MAX_POINTS dispatch cap (kept private there).
+    enum { CAP_POINTS = 1 << 20 };
+    const int bx[2] = { 0, 16 };
+    const int bz[2] = { 0, 16 };
+    const int w[2] = { CAP_POINTS, 1 };
+    const int rows[2] = { 1, 1 };
+    const int st[2] = { 4, 4 };
+    const long offs[2] = { 0, 1 };
+    const int y = 64;
+
+    int failMask = (int) 0x5A5A5A5A;
+    int tiny = 0;
+    int rc = gpuCfxSurfaceBiomesBatch(&failMask, &tiny, offs, &g.bn, g.sha,
+        bx, bz, w, rows, st, &y, 2);
+    if (rc == 0)
+    {
+        printf("  FAIL: over-cap biomes batch was attempted\n");
+        *fail = 1;
+    }
+    else if (failMask != (int) 0x5A5A5A5A)
+    {
+        printf("  FAIL: over-cap biomes refusal touched failMask (%#x)\n",
+            failMask);
+        *fail = 1;
+    }
+    else
+    {
+        printf("  biomes batch refusal: cap+1 points rejected before any"
+            " write\n");
+    }
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -2244,6 +2396,8 @@ int main(int argc, char **argv)
     runCfxSlabRotationCase(seeds[0], &total, &fail);
     runCfxHeightsBatchCase(seeds[0], &total, &fail);
     runCfxHeightsBatchRefusalCase(seeds[0], &total, &fail);
+    runCfxBiomesBatchCase(seeds[0], &total, &fail);
+    runCfxBiomesBatchRefusalCase(seeds[0], &total, &fail);
     runCfxModeCase(seeds[0], &total, &fail);
 
     printf("\n");

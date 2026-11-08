@@ -1604,6 +1604,150 @@ int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
 }
 
 /*
+ * One submission of gpuCfxSurfaceBiomes() for n independent caller-Y
+ * blocks: one lock acquisition, one table pack, one slab, one readback
+ * wait for the whole set. Block i resolves the same voronoi/climate chain
+ * the single entry would and its ids land at ids[flatOffsets[i]] in the
+ * caller's flat layout; its w[i]*rows[i]-int terrainY plane sits at the
+ * same offset in the caller's flat terrainY, which uploads as ONE write
+ * into the slab's input buffer before the kernels enqueue - the in-order
+ * queue runs the write ahead of every kernel, so no event tracking is
+ * needed beyond the reads. Each kernel resolves its plane through its
+ * per-block inYBase input offset, the flat layout's counterpart of the
+ * interleaved output reads. Per-block host-side enqueue failures set bit i
+ * and skip that block's kernel, read or both; the caller repairs exactly
+ * those blocks on the CPU. Everything that refuses the whole batch (bad
+ * arguments, caps, engine state, table pack, slab growth, the input
+ * upload itself) returns nonzero before any output write and leaves
+ * *failMask alone.
+ *
+ * The kernel takes no output-base argument, so every block writes
+ * outId[0..points): block i's read must be enqueued before block i+1's
+ * kernel, and the in-order queue runs them in exactly that order. That is
+ * also why the reads stay inside the lock with the kernels - hoisting them
+ * past the unlock would let another dispatcher reuse this slab first and
+ * corrupt block i's results.
+ */
+int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
+    const BiomeNoise *bn, uint64_t sha,
+    const int *blockX, const int *blockZ, const int *w, const int *rows,
+    const int *stride, const int *terrainY, int n)
+{
+    if (!failMask || !ids || !flatOffsets || !bn
+        || !blockX || !blockZ || !w || !rows || !stride || !terrainY
+        || n <= 0 || n > GPU_BATCH_MAX)
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+    int64_t total = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (w[i] <= 0 || rows[i] <= 0 || stride[i] <= 0 || flatOffsets[i] < 0)
+            return 1;
+        total += (int64_t) w[i] * rows[i];
+    }
+    if (total > GPU_MAX_POINTS)
+        return 1;
+
+    GPU_LOCK;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init on purpose, same as the float paths.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    gpuEnsureRuntimeLocked(&g_gpu);
+    const int cfxReady = gpuEnsureCfxLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead || !cfxReady)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu,
+                !g_gpu.clAvail || g_gpu.dead
+                    ? "no usable OpenCL device"
+                    : "no fp64 OpenCL device for the cfx kernels");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, (int) total))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = g_gpu.kCfxBiome;
+    cl_uint a = 0;
+    cl_int err = gpuSetCfxTableArgsLocked(k, &a);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        GPU_UNLOCK;
+        return 1;
+    }
+    const cl_uint geomArg = a;
+
+    err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inY, CL_FALSE,
+        0, sizeof(int) * (size_t)total, terrainY, 0, NULL, NULL);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clEnqueueWriteBuffer");
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    *failMask = 0;
+    cl_event reads[GPU_BATCH_MAX];
+    cl_uint nReads = 0;
+    for (int i = 0; i < n; i++)
+    {
+        a = geomArg;
+        err = CL_SUCCESS;
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &blockX[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &blockZ[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &w[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &rows[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stride[i]);
+        cl_ulong shaArg = sha;
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &shaArg);
+        cl_int inYBase = (cl_int) flatOffsets[i];
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &inYBase);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inY);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outId);
+        if (err == CL_SUCCESS)
+        {
+            size_t ls = g_gpu.localSize;
+            size_t global[2] =
+            {
+                ((size_t) w[i] + ls - 1) / ls * ls,
+                (size_t) rows[i]
+            };
+            size_t local[2] = { ls, 1 };
+            err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
+                global, local, 0, NULL, NULL);
+        }
+        if (err == CL_SUCCESS)
+            err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
+                CL_FALSE, 0,
+                sizeof(int) * ((size_t) w[i] * (size_t) rows[i]),
+                ids + flatOffsets[i], 0, NULL, &reads[nReads]);
+        if (err != CL_SUCCESS)
+            *failMask |= (int) (1u << i);
+        else
+            nReads++;
+    }
+    GPU_UNLOCK;
+    return gpuFinishDispatchN(CL_SUCCESS, reads, nReads,
+        "gpu cfx biome batch dispatch", &g_gpu.dispatchCount);
+}
+
+/*
  * One guarded dispatch of the shim's cfxSurfaceBiomes() inner loop: for
  * each point (blockX + col*stride, blockZ + row*stride) the caller's
  * terrain height (clamped at 62) picks the voronoi nucleus, and the
@@ -1670,6 +1814,8 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stride);
     cl_ulong shaArg = sha;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &shaArg);
+    cl_int inYBase = 0;
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &inYBase);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inY);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outId);
     if (err != CL_SUCCESS)
