@@ -273,4 +273,44 @@ int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
     const int *blockX, const int *blockZ, const int *w, const int *rows,
     const int *stride, const int *terrainY, int n);
 
+/*
+ * Engine metrics: a fixed uint64 slot array accumulated by the two cfx
+ * batch entries, snapshot by gpuQueryMetrics(). The layout is mirrored by
+ * the mod's Java reader, so the slot indices below are API, not internals.
+ * The plain counters (slots 1-8, 13) accumulate on every attempted batch;
+ * the four event timers (slots 9-12) stay zero unless the process opts in
+ * with CUBIOMES_GPU_PROFILING=1, which creates the OpenCL queue with
+ * CL_QUEUE_PROFILING_ENABLE so device timestamps become available. A
+ * loader/driver stack that accepts the flag and then drops it degrades the
+ * timers back to zero instead of reporting garbage.
+ */
+#define GPU_METRICS_SLOTS 68
+#define GPU_METRICS_PROFILING 0     /* 1 when the queue really profiles events */
+#define GPU_METRICS_BATCH_MEMBERS 1 /* sum of n over attempted batch entries */
+#define GPU_METRICS_BATCH_POINTS 2  /* sum of per-block w*h over them */
+#define GPU_METRICS_KERNEL_LAUNCHES 3   /* successful kernel enqueues */
+#define GPU_METRICS_H2D_WRITES 4        /* successful input-buffer writes */
+#define GPU_METRICS_D2H_READS 5         /* successful readback enqueues */
+#define GPU_METRICS_MUTEX_WAIT_NANOS 6  /* blocked acquiring the engine lock */
+#define GPU_METRICS_HOST_SUBMIT_NANOS 7 /* lock acquired -> last enqueue */
+#define GPU_METRICS_HOST_WAIT_NANOS 8   /* readback wait wall */
+#define GPU_METRICS_H2D_NANOS 9     /* write event END-START sums */
+#define GPU_METRICS_KERNEL_NANOS 10 /* kernel event END-START sums */
+#define GPU_METRICS_D2H_NANOS 11    /* read event END-START sums */
+#define GPU_METRICS_QUEUE_DELAY_NANOS 12 /* event SUBMIT-QUEUED sums */
+/* Slot 13 is shim-owned (confluxnative.c): the JNI array-marshal wall of
+ * the two batch entries, which the engine never sees. */
+#define GPU_METRICS_ARRAY_COPY_NANOS 13
+/* Slot 14 + min(n, 32) counts batch entries with n blocks (33 slots, the
+ * engine's batch-entry cap). */
+#define GPU_METRICS_MEMBER_HIST 14
+/* Slot 47 + k counts batch entries whose total points sit in (2^(k-1),
+ * 2^k] - slot 0 is a single point, the last slot (k = 20) is the dispatch
+ * cap (21 slots). */
+#define GPU_METRICS_POINT_HIST 47
+
+/* Copies the current metrics into caller storage of GPU_METRICS_SLOTS
+ * uint64. Measurement aid, like the dispatch counters above. */
+void gpuQueryMetrics(uint64_t *out);
+
 #endif

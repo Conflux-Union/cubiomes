@@ -2147,6 +2147,195 @@ static void runCfxBiomesBatchRefusalCase(uint64_t seed, CaseStats *total,
     }
 }
 
+// The batch entries own the engine metrics slots (gpu.h layout): one height
+// batch plus one biome batch with the same member count must move exactly
+// the counters the layout pins, and the four event-timer slots must stay
+// zero unless the process was started with CUBIOMES_GPU_PROFILING=1 - any
+// nonzero value there means the engine profiled events it was never asked
+// for. Deltas around the two calls isolate them from the rest of the matrix
+// (the single entries and the float paths carry no metrics).
+static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    enum { CNT = 2 };
+    // Both batches total 2689 points, so both land in the same point
+    // histogram bucket and the counters assert as clean sums.
+    static const int gw[CNT] = { 33, 40 };
+    static const int gh[CNT] = { 33, 40 };
+    static const int step[CNT] = { 4, 4 };
+    static const int x4[CNT] = { 0, 500 };
+    static const int z4[CNT] = { 0, -200 };
+    static const int bw[CNT] = { 33, 40 };
+    static const int brows[CNT] = { 33, 40 };
+    static const int bstride[CNT] = { 4, 8 };
+    static const int bx[CNT] = { 0, 800 };
+    static const int bz[CNT] = { 0, -400 };
+    const int mf = 0, mmf = 0, tr = 0;
+
+    long offs[CNT];
+    int totalPts = 0;
+    for (int i = 0; i < CNT; i++)
+    {
+        offs[i] = totalPts;
+        totalPts += bw[i] * brows[i];
+    }
+
+    uint64_t before[GPU_METRICS_SLOTS], after[GPU_METRICS_SLOTS];
+    int *heights = malloc(sizeof(int) * (size_t) totalPts);
+    int *ids = malloc(sizeof(int) * (size_t) totalPts);
+    int *terrainY = malloc(sizeof(int) * (size_t) totalPts);
+    if (!heights || !ids || !terrainY)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+    // terrainY values are irrelevant here: this case gates counters, not
+    // results - bit-exactness is the batch parity cases' job.
+    for (int p = 0; p < totalPts; p++)
+        terrainY[p] = 64;
+
+    gpuQueryMetrics(before);
+    int failMaskH = (int) 0x5A5A5A5A;
+    int rcH = gpuCfxOverviewHeightsBatch(&failMaskH, heights, offs, &g.bn,
+        x4, z4, gw, gh, step, step, CNT, mf, mmf, tr);
+    int failMaskB = (int) 0x5A5A5A5A;
+    int rcB = gpuCfxSurfaceBiomesBatch(&failMaskB, ids, offs, &g.bn, g.sha,
+        bx, bz, bw, brows, bstride, terrainY, CNT);
+    gpuQueryMetrics(after);
+
+    // gpu.h: slot 14 + min(n, 32) counts batch entries with n blocks; slot
+    // 47 + k counts entries whose total points sit in (2^(k-1), 2^k].
+    const int memberSlot = GPU_METRICS_MEMBER_HIST + CNT;
+    int pointSlot = 0;
+    while (pointSlot < 20 && (1LL << pointSlot) < totalPts)
+        pointSlot++;
+    const int pointSlotIdx = GPU_METRICS_POINT_HIST + pointSlot;
+
+    if (rcH != 0 || rcB != 0)
+    {
+        printf("  FAIL: metrics case batches refused (%d %d)\n", rcH, rcB);
+        *fail = 1;
+    }
+    else if (failMaskH != 0 || failMaskB != 0)
+    {
+        printf("  FAIL: metrics case batches reported block failures"
+            " (%#x %#x)\n", failMaskH, failMaskB);
+        *fail = 1;
+    }
+    else
+    {
+        const struct
+        {
+            int slot;
+            long long want;
+            const char *name;
+        } counters[] =
+        {
+            { GPU_METRICS_BATCH_MEMBERS, 2 * CNT, "batch members" },
+            { GPU_METRICS_BATCH_POINTS, 2 * (long long) totalPts,
+                "batch points" },
+            { GPU_METRICS_KERNEL_LAUNCHES, 2 * CNT, "kernel launches" },
+            { GPU_METRICS_D2H_READS, 2 * CNT, "d2h reads" },
+            { GPU_METRICS_H2D_WRITES, 1, "h2d writes" },
+            { memberSlot, 2, "member histogram" },
+            { pointSlotIdx, 2, "point histogram" },
+        };
+        int bad = 0;
+        for (size_t c = 0; c < sizeof(counters) / sizeof(counters[0]); c++)
+        {
+            const long long got = (long long) (after[counters[c].slot]
+                - before[counters[c].slot]);
+            if (got != counters[c].want)
+            {
+                printf("  FAIL: %s slot %d moved by %lld, want %lld\n",
+                    counters[c].name, counters[c].slot, got,
+                    counters[c].want);
+                bad = 1;
+            }
+        }
+        if (after[GPU_METRICS_HOST_WAIT_NANOS]
+            == before[GPU_METRICS_HOST_WAIT_NANOS])
+        {
+            printf("  FAIL: host wait timer did not advance\n");
+            bad = 1;
+        }
+        if (after[GPU_METRICS_HOST_SUBMIT_NANOS]
+            == before[GPU_METRICS_HOST_SUBMIT_NANOS])
+        {
+            printf("  FAIL: host submit timer did not advance\n");
+            bad = 1;
+        }
+        // The queue carries event profiling only under the env opt-in
+        // (opencl_host.c reads it once at engine init), and only when the
+        // OpenCL stack honors the queue flag: stacks that accept and drop
+        // it degrade the profiling slot back to 0 with the timers.
+        const char *profEnv = getenv("CUBIOMES_GPU_PROFILING");
+        const int profiling = profEnv && !strcmp(profEnv, "1");
+        if (after[GPU_METRICS_PROFILING] > 1)
+        {
+            printf("  FAIL: profiling slot is not a flag (%llu)\n",
+                (unsigned long long) after[GPU_METRICS_PROFILING]);
+            bad = 1;
+        }
+        if (after[GPU_METRICS_PROFILING] != 0 && !profiling)
+        {
+            printf("  FAIL: profiling set without the env opt-in\n");
+            bad = 1;
+        }
+        if (profiling && after[GPU_METRICS_PROFILING] == 0)
+            printf("  metrics note: profiling requested but the OpenCL"
+                " stack dropped the queue flag; event timers degraded\n");
+        if (after[GPU_METRICS_PROFILING] == 0)
+        {
+            static const int timerSlots[] =
+            {
+                GPU_METRICS_H2D_NANOS, GPU_METRICS_KERNEL_NANOS,
+                GPU_METRICS_D2H_NANOS, GPU_METRICS_QUEUE_DELAY_NANOS,
+            };
+            static const char *timerNames[] =
+                { "h2d", "kernel", "d2h", "queue delay" };
+            for (size_t t = 0; t < sizeof(timerSlots) / sizeof(timerSlots[0]);
+                    t++)
+            {
+                if (after[timerSlots[t]] != 0)
+                {
+                    printf("  FAIL: %s event timer nonzero without"
+                        " profiling (%llu)\n", timerNames[t],
+                        (unsigned long long) after[timerSlots[t]]);
+                    bad = 1;
+                }
+            }
+        }
+        else
+        {
+            // The device must report at least one execution span for the
+            // collected events; queue delay can legitimately collapse to
+            // zero on an idle queue, so it is not asserted.
+            if (after[GPU_METRICS_H2D_NANOS] + after[GPU_METRICS_KERNEL_NANOS]
+                + after[GPU_METRICS_D2H_NANOS] == 0)
+            {
+                printf("  FAIL: no event timestamps collected under"
+                    " profiling\n");
+                bad = 1;
+            }
+        }
+        if (bad)
+            *fail = 1;
+        else
+        {
+            printf("  metrics: counters moved exactly as pinned"
+                " (profiling %s)\n", profiling ? "on" : "off");
+            total->pts += totalPts;
+        }
+    }
+    free(heights);
+    free(ids);
+    free(terrainY);
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -2398,6 +2587,7 @@ int main(int argc, char **argv)
     runCfxHeightsBatchRefusalCase(seeds[0], &total, &fail);
     runCfxBiomesBatchCase(seeds[0], &total, &fail);
     runCfxBiomesBatchRefusalCase(seeds[0], &total, &fail);
+    runCfxMetricsCase(seeds[0], &total, &fail);
     runCfxModeCase(seeds[0], &total, &fail);
 
     printf("\n");

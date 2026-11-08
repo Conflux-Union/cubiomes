@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -65,6 +66,17 @@ _Static_assert(SP_CONTINENTALNESS == 0 && SP_EROSION == 1
 #define GPU_BATCH_MAX 32
 #define GPU_CL_OPTS "-cl-std=CL1.2 -cl-fp32-correctly-rounded-divide-sqrt"
 #define GPU_LOCAL_SIZE_MAX 128
+
+/*
+ * The engine metrics accumulators, one uint64 per gpu.h slot (the layout is
+ * API there, mirrored by the mod's Java reader). Written under the engine
+ * lock; gpuQueryMetrics() copies them out under the same lock. The event
+ * timers stay zero unless the queue was created with profiling enabled.
+ */
+typedef struct
+{
+    uint64_t slots[GPU_METRICS_SLOTS];
+} GpuMetrics;
 
 typedef struct
 {
@@ -138,6 +150,7 @@ typedef struct
     int keyFailed;
     uint64_t dispatchCount;
     uint64_t heightCount;
+    GpuMetrics metrics;  // gpu.h slot layout
     cl_mem mPerm, mPinfo, mNoff, mNamp;
     cl_mem mPinfoD, mNampD;
     cl_mem mStyp, mSlen, mSloc, mSder, mSchild;
@@ -165,6 +178,39 @@ static void gpuClErr(GpuEngine *e, cl_int err, const char *what)
     fprintf(stderr, "gpu: %s failed (OpenCL error %d); engine disabled\n",
         what, (int) err);
     e->dead = 1;
+}
+
+/* Monotonic host clock for the metrics wall spans (mutex wait, submit,
+ * readback wait). Failure leaves zero: metrics only, never a dispatch
+ * error. */
+static uint64_t nowNanos(void)
+{
+#if defined(_WIN32)
+    LARGE_INTEGER freq, ctr;
+    if (!QueryPerformanceFrequency(&freq) || freq.QuadPart <= 0
+        || !QueryPerformanceCounter(&ctr))
+        return 0;
+    uint64_t secs = (uint64_t) ctr.QuadPart / (uint64_t) freq.QuadPart;
+    uint64_t rem = (uint64_t) ctr.QuadPart % (uint64_t) freq.QuadPart;
+    return secs * 1000000000ULL
+        + rem * 1000000000ULL / (uint64_t) freq.QuadPart;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        return 0;
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+#endif
+}
+
+/* Metrics histogram slot of a batch's total point count: ceil(log2(points)),
+ * capped at the histogram's top slot (the dispatch cap). Slot 0 is a single
+ * point; slot k covers (2^(k-1), 2^k] points. */
+static int gpuPointHistSlot(uint64_t points)
+{
+    int slot = 0;
+    while (slot < 20 && (1ULL << slot) < points)
+        slot++;
+    return slot;
 }
 
 static cl_mem gpuBuf(GpuEngine *e, cl_ulong flags, size_t size, void *host)
@@ -946,6 +992,16 @@ uint64_t gpuHeightDispatchCount(void)
     return count;
 }
 
+void gpuQueryMetrics(uint64_t *out)
+{
+    GPU_LOCK;
+    memcpy(out, g_gpu.metrics.slots, sizeof(g_gpu.metrics.slots));
+    // Slot 0 is not an accumulator: it reports the live queue state the
+    // event timers are meaningful under.
+    out[GPU_METRICS_PROFILING] = (uint64_t) (g_gpu.cl.profiling != 0);
+    GPU_UNLOCK;
+}
+
 static int gpuSurfaceBiomeAvailable(const BiomeNoise *bn)
 {
     if (!bn || bn->nptype >= 0 || bn->mc < MC_1_18)
@@ -994,6 +1050,43 @@ static int gpuEnsureOutLocked(GpuEngine *e, GpuSlab *slab, int points)
 }
 
 /*
+ * Profiling sink for gpuFinishDispatchN(): a dispatch that collected events
+ * passes a sink with `on` set, and the read events' device timings are
+ * summed into the two accumulators between the successful wait and their
+ * release (the caller then adds them to the metrics under the lock).
+ */
+typedef struct
+{
+    int on;
+    uint64_t execNanos;   // sum of END-START over the profiled events
+    uint64_t queueNanos;  // sum of SUBMIT-QUEUED over them
+} GpuReadProfile;
+
+/*
+ * Sum one completed event's device timings into the profiling accumulators:
+ * END-START is the device execution span, SUBMIT-QUEUED the queue delay
+ * ahead of it. A missing timestamp skips that event - metrics only, never a
+ * dispatch error.
+ */
+static void gpuProfileEvent(cl_event ev, uint64_t *execNanos,
+    uint64_t *queueNanos)
+{
+    cl_ulong queued = 0, submit = 0, start = 0, end = 0;
+    cl_int err = g_gpu.cl.fn.GetEventProfilingInfo(ev,
+        CL_PROFILING_COMMAND_QUEUED, sizeof(queued), &queued, NULL);
+    err |= g_gpu.cl.fn.GetEventProfilingInfo(ev,
+        CL_PROFILING_COMMAND_SUBMIT, sizeof(submit), &submit, NULL);
+    err |= g_gpu.cl.fn.GetEventProfilingInfo(ev,
+        CL_PROFILING_COMMAND_START, sizeof(start), &start, NULL);
+    err |= g_gpu.cl.fn.GetEventProfilingInfo(ev,
+        CL_PROFILING_COMMAND_END, sizeof(end), &end, NULL);
+    if (err != CL_SUCCESS)
+        return;
+    *execNanos += (uint64_t) (end - start);
+    *queueNanos += (uint64_t) (submit - queued);
+}
+
+/*
  * Dispatch tail shared by every family and dispatch shape. `reads` carries
  * the readbacks that did enqueue in enqueue order (a batch passes one per
  * served block). Every enqueued readback is waited before its handle is
@@ -1004,17 +1097,26 @@ static int gpuEnsureOutLocked(GpuEngine *e, GpuSlab *slab, int points)
  * completion proves earlier ones finished, not that they finished
  * successfully), keeping a mid-queue execution failure visible like the
  * blocking reads this replaces. Any enqueue or wait error latches the
- * engine dead; the dispatch counts only once every result drained.
+ * engine dead; the dispatch counts only once every result drained. A
+ * non-NULL profiling sink collects the read events' device timings between
+ * a successful wait and their release; on any error the events are only
+ * released (never profiled), and NULL keeps the plain wait+release tail.
  */
 static int gpuFinishDispatchN(cl_int enqErr, const cl_event *reads,
-    cl_uint n, const char *what, uint64_t *counter)
+    cl_uint n, const char *what, uint64_t *counter, GpuReadProfile *prof)
 {
     cl_int err = enqErr;
+    cl_int waitErr = CL_SUCCESS;
     if (n)
     {
-        cl_int waitErr = g_gpu.cl.fn.WaitForEvents(n, reads);
+        waitErr = g_gpu.cl.fn.WaitForEvents(n, reads);
         if (err == CL_SUCCESS)
             err = waitErr;
+    }
+    if (prof && prof->on && waitErr == CL_SUCCESS)
+    {
+        for (cl_uint i = 0; i < n; i++)
+            gpuProfileEvent(reads[i], &prof->execNanos, &prof->queueNanos);
     }
     for (cl_uint i = 0; i < n; i++)
         g_gpu.cl.fn.ReleaseEvent(reads[i]);
@@ -1038,7 +1140,7 @@ static int gpuFinishDispatch(cl_int enqErr, cl_event firstRead,
         pending[n++] = firstRead;
     if (lastRead)
         pending[n++] = lastRead;
-    return gpuFinishDispatchN(enqErr, pending, n, what, counter);
+    return gpuFinishDispatchN(enqErr, pending, n, what, counter, NULL);
 }
 
 /*
@@ -1514,7 +1616,13 @@ int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
     if (total > GPU_MAX_POINTS)
         return 1;
 
+    // Metrics walls: the mutex wait spans the lock acquisition, the submit
+    // span the guarded section up to the last enqueue. Both accumulate
+    // unconditionally (counters, not event timers).
+    const uint64_t mutexT0 = nowNanos();
     GPU_LOCK;
+    const uint64_t submitT0 = nowNanos();
+    g_gpu.metrics.slots[GPU_METRICS_MUTEX_WAIT_NANOS] += submitT0 - mutexT0;
     int mode = gpuResolveModeLocked(&g_gpu);
     // OFF precedes the runtime init on purpose, same as the float paths.
     if (mode == GPU_MODE_OFF)
@@ -1563,7 +1671,12 @@ int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
 
     *failMask = 0;
     cl_event reads[GPU_BATCH_MAX];
+    // Kernel events exist only under the profiling opt-in (the queue
+    // carries timestamps just then); the batch owns and releases them
+    // itself, since the dispatch tail never sees them.
+    cl_event kernels[GPU_BATCH_MAX];
     cl_uint nReads = 0;
+    cl_uint nKernels = 0;
     for (int i = 0; i < n; i++)
     {
         a = geomArg;
@@ -1586,7 +1699,13 @@ int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
             };
             size_t local[2] = { ls, 1 };
             err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
-                global, local, 0, NULL, NULL);
+                global, local, 0, NULL,
+                g_gpu.cl.profiling ? &kernels[nKernels] : NULL);
+        }
+        if (err == CL_SUCCESS)
+        {
+            nKernels += g_gpu.cl.profiling ? 1u : 0u;
+            g_gpu.metrics.slots[GPU_METRICS_KERNEL_LAUNCHES]++;
         }
         if (err == CL_SUCCESS)
             err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outYi,
@@ -1596,11 +1715,48 @@ int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
         if (err != CL_SUCCESS)
             *failMask |= (int) (1u << i);
         else
+        {
             nReads++;
+            g_gpu.metrics.slots[GPU_METRICS_D2H_READS]++;
+        }
+    }
+    g_gpu.metrics.slots[GPU_METRICS_BATCH_MEMBERS] += (uint64_t) n;
+    g_gpu.metrics.slots[GPU_METRICS_BATCH_POINTS] += (uint64_t) total;
+    g_gpu.metrics.slots[GPU_METRICS_MEMBER_HIST
+        + (n < GPU_BATCH_MAX ? n : GPU_BATCH_MAX)]++;
+    g_gpu.metrics.slots[GPU_METRICS_POINT_HIST
+        + gpuPointHistSlot((uint64_t) total)]++;
+    g_gpu.metrics.slots[GPU_METRICS_HOST_SUBMIT_NANOS]
+        += nowNanos() - submitT0;
+    GPU_UNLOCK;
+
+    // The reads completing (in-order queue) proves every kernel completed,
+    // so their events are profiled exactly then and released either way;
+    // on a failed dispatch nothing is profiled, per gpuFinishDispatchN.
+    GpuReadProfile prof = { g_gpu.cl.profiling, 0, 0 };
+    const uint64_t waitT0 = nowNanos();
+    const int rc = gpuFinishDispatchN(CL_SUCCESS, reads, nReads,
+        "gpu cfx height batch dispatch", &g_gpu.heightCount, &prof);
+    const uint64_t waited = nowNanos() - waitT0;
+    uint64_t kernNanos = 0, kernQueueNanos = 0;
+    if (rc == 0 && nReads > 0)
+    {
+        for (cl_uint i = 0; i < nKernels; i++)
+            gpuProfileEvent(kernels[i], &kernNanos, &kernQueueNanos);
+    }
+    GPU_LOCK;
+    g_gpu.metrics.slots[GPU_METRICS_HOST_WAIT_NANOS] += waited;
+    if (rc == 0 && nReads > 0)
+    {
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_NANOS] += kernNanos;
+        g_gpu.metrics.slots[GPU_METRICS_D2H_NANOS] += prof.execNanos;
+        g_gpu.metrics.slots[GPU_METRICS_QUEUE_DELAY_NANOS]
+            += kernQueueNanos + prof.queueNanos;
     }
     GPU_UNLOCK;
-    return gpuFinishDispatchN(CL_SUCCESS, reads, nReads,
-        "gpu cfx height batch dispatch", &g_gpu.heightCount);
+    for (cl_uint i = 0; i < nKernels; i++)
+        g_gpu.cl.fn.ReleaseEvent(kernels[i]);
+    return rc;
 }
 
 /*
@@ -1612,7 +1768,9 @@ int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
  * same offset in the caller's flat terrainY, which uploads as ONE write
  * into the slab's input buffer before the kernels enqueue - the in-order
  * queue runs the write ahead of every kernel, so no event tracking is
- * needed beyond the reads. Each kernel resolves its plane through its
+ * needed beyond the reads (the metrics opt-in attaches a profiling event
+ * to the write, owned like the kernel events). Each kernel resolves its
+ * plane through its
  * per-block inYBase input offset, the flat layout's counterpart of the
  * interleaved output reads. Per-block host-side enqueue failures set bit i
  * and skip that block's kernel, read or both; the caller repairs exactly
@@ -1649,7 +1807,11 @@ int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
     if (total > GPU_MAX_POINTS)
         return 1;
 
+    // Metrics walls, same contract as the height batch above.
+    const uint64_t mutexT0 = nowNanos();
     GPU_LOCK;
+    const uint64_t submitT0 = nowNanos();
+    g_gpu.metrics.slots[GPU_METRICS_MUTEX_WAIT_NANOS] += submitT0 - mutexT0;
     int mode = gpuResolveModeLocked(&g_gpu);
     // OFF precedes the runtime init on purpose, same as the float paths.
     if (mode == GPU_MODE_OFF)
@@ -1693,18 +1855,25 @@ int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
     }
     const cl_uint geomArg = a;
 
+    // The one packed terrainY upload; its event is the batch's only H2D
+    // measurement and, like the kernel events, is owned and released here.
+    cl_event write = NULL;
     err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inY, CL_FALSE,
-        0, sizeof(int) * (size_t)total, terrainY, 0, NULL, NULL);
+        0, sizeof(int) * (size_t)total, terrainY, 0, NULL,
+        g_gpu.cl.profiling ? &write : NULL);
     if (err != CL_SUCCESS)
     {
         gpuClErr(&g_gpu, err, "clEnqueueWriteBuffer");
         GPU_UNLOCK;
         return 1;
     }
+    g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
 
     *failMask = 0;
     cl_event reads[GPU_BATCH_MAX];
+    cl_event kernels[GPU_BATCH_MAX];  // profiling only, see the height batch
     cl_uint nReads = 0;
+    cl_uint nKernels = 0;
     for (int i = 0; i < n; i++)
     {
         a = geomArg;
@@ -1730,7 +1899,13 @@ int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
             };
             size_t local[2] = { ls, 1 };
             err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
-                global, local, 0, NULL, NULL);
+                global, local, 0, NULL,
+                g_gpu.cl.profiling ? &kernels[nKernels] : NULL);
+        }
+        if (err == CL_SUCCESS)
+        {
+            nKernels += g_gpu.cl.profiling ? 1u : 0u;
+            g_gpu.metrics.slots[GPU_METRICS_KERNEL_LAUNCHES]++;
         }
         if (err == CL_SUCCESS)
             err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
@@ -1740,11 +1915,54 @@ int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
         if (err != CL_SUCCESS)
             *failMask |= (int) (1u << i);
         else
+        {
             nReads++;
+            g_gpu.metrics.slots[GPU_METRICS_D2H_READS]++;
+        }
+    }
+    g_gpu.metrics.slots[GPU_METRICS_BATCH_MEMBERS] += (uint64_t) n;
+    g_gpu.metrics.slots[GPU_METRICS_BATCH_POINTS] += (uint64_t) total;
+    g_gpu.metrics.slots[GPU_METRICS_MEMBER_HIST
+        + (n < GPU_BATCH_MAX ? n : GPU_BATCH_MAX)]++;
+    g_gpu.metrics.slots[GPU_METRICS_POINT_HIST
+        + gpuPointHistSlot((uint64_t) total)]++;
+    g_gpu.metrics.slots[GPU_METRICS_HOST_SUBMIT_NANOS]
+        += nowNanos() - submitT0;
+    GPU_UNLOCK;
+
+    // Kernel/write events are profiled after the reads completed (the
+    // in-order queue ran the write ahead of every kernel), see the height
+    // batch.
+    GpuReadProfile prof = { g_gpu.cl.profiling, 0, 0 };
+    const uint64_t waitT0 = nowNanos();
+    const int rc = gpuFinishDispatchN(CL_SUCCESS, reads, nReads,
+        "gpu cfx biome batch dispatch", &g_gpu.dispatchCount, &prof);
+    const uint64_t waited = nowNanos() - waitT0;
+    uint64_t kernNanos = 0, kernQueueNanos = 0, writeNanos = 0,
+        writeQueueNanos = 0;
+    if (rc == 0 && nReads > 0)
+    {
+        for (cl_uint i = 0; i < nKernels; i++)
+            gpuProfileEvent(kernels[i], &kernNanos, &kernQueueNanos);
+        if (write)
+            gpuProfileEvent(write, &writeNanos, &writeQueueNanos);
+    }
+    GPU_LOCK;
+    g_gpu.metrics.slots[GPU_METRICS_HOST_WAIT_NANOS] += waited;
+    if (rc == 0 && nReads > 0)
+    {
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_NANOS] += kernNanos;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_NANOS] += writeNanos;
+        g_gpu.metrics.slots[GPU_METRICS_D2H_NANOS] += prof.execNanos;
+        g_gpu.metrics.slots[GPU_METRICS_QUEUE_DELAY_NANOS]
+            += kernQueueNanos + writeQueueNanos + prof.queueNanos;
     }
     GPU_UNLOCK;
-    return gpuFinishDispatchN(CL_SUCCESS, reads, nReads,
-        "gpu cfx biome batch dispatch", &g_gpu.dispatchCount);
+    for (cl_uint i = 0; i < nKernels; i++)
+        g_gpu.cl.fn.ReleaseEvent(kernels[i]);
+    if (write)
+        g_gpu.cl.fn.ReleaseEvent(write);
+    return rc;
 }
 
 /*

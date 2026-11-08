@@ -80,6 +80,9 @@ int gpuClInit(GpuCl *cl)
     GPUCL_SYM(EnqueueWriteBuffer);
     GPUCL_SYM(WaitForEvents);
     GPUCL_SYM(ReleaseEvent);
+    GPUCL_SYM(GetEventProfilingInfo);
+    cl->fn.EnqueueMarkerWithWaitList = (clEnqueueMarkerWithWaitList_t)
+        (intptr_t) gpuClSym(lib, "clEnqueueMarkerWithWaitList");
     GPUCL_SYM(GetKernelWorkGroupInfo);
 
     cl_platform_id plats[8];
@@ -113,12 +116,46 @@ int gpuClInit(GpuCl *cl)
     cl->context = cl->fn.CreateContext(NULL, 1, &cl->device, NULL, NULL, &err);
     if (!cl->context || err != CL_SUCCESS)
         return 1;
-    cl->queue = cl->fn.CreateCommandQueue(cl->context, cl->device, 0, &err);
+    /* Event-profiling opt-in for the metrics timers (gpu.h slots 9-12):
+     * CUBIOMES_GPU_PROFILING=1 creates the queue with
+     * CL_QUEUE_PROFILING_ENABLE so clGetEventProfilingInfo reports device
+     * timestamps. Anything else keeps the plain queue. */
+    const char *profEnv = getenv("CUBIOMES_GPU_PROFILING");
+    cl->profiling = profEnv && !strcmp(profEnv, "1");
+    cl->queue = cl->fn.CreateCommandQueue(cl->context, cl->device,
+        cl->profiling ? (cl_ulong) CL_QUEUE_PROFILING_ENABLE : 0, &err);
     if (!cl->queue || err != CL_SUCCESS)
     {
         cl->fn.ReleaseContext(cl->context);
         cl->context = NULL;
         return 1;
+    }
+    /* Some loader/driver stacks accept the profiling flag yet still answer
+     * every clGetEventProfilingInfo with CL_PROFILING_INFO_NOT_AVAILABLE
+     * (observed: NVIDIA 580.119.02's own libOpenCL loader on Deepin, where
+     * the flag even reads back set through clCreateCommandQueue). Probe the
+     * actual capability with a marker command and degrade to unprofiled
+     * when the queue cannot deliver device timestamps. */
+    if (cl->profiling)
+    {
+        cl_event probe = NULL;
+        cl_int perr = -1;  /* sentinel: no marker entry in this loader */
+        if (cl->fn.EnqueueMarkerWithWaitList)
+            perr = cl->fn.EnqueueMarkerWithWaitList(cl->queue, 0, NULL,
+                &probe);
+        if (perr == CL_SUCCESS && probe)
+        {
+            cl_ulong end = 0;
+            if (cl->fn.WaitForEvents(1, &probe) == CL_SUCCESS)
+                cl->profiling = cl->fn.GetEventProfilingInfo(probe,
+                    CL_PROFILING_COMMAND_END, sizeof(end), &end,
+                    NULL) == CL_SUCCESS;
+            else
+                cl->profiling = 0;
+            cl->fn.ReleaseEvent(probe);
+        }
+        else
+            cl->profiling = 0;
     }
     return 0;
 }

@@ -47,8 +47,15 @@ enum
     CL_MEM_READ_ONLY = (1 << 2),
     CL_MEM_COPY_HOST_PTR = (1 << 5),
 
+    CL_QUEUE_PROFILING_ENABLE = (1 << 0),
+
     CL_PROGRAM_BUILD_LOG = 0x1183,
     CL_KERNEL_WORK_GROUP_SIZE = 0x11B0,
+
+    CL_PROFILING_COMMAND_QUEUED = 0x1280,
+    CL_PROFILING_COMMAND_SUBMIT = 0x1281,
+    CL_PROFILING_COMMAND_START = 0x1282,
+    CL_PROFILING_COMMAND_END = 0x1283,
 };
 
 typedef cl_int (*clGetPlatformIDs_t)(cl_uint, cl_platform_id *, cl_uint *);
@@ -84,6 +91,10 @@ typedef cl_int (*clEnqueueWriteBuffer_t)(cl_command_queue, cl_mem, cl_bool,
     size_t, size_t, const void *, cl_uint, const cl_event *, cl_event *);
 typedef cl_int (*clWaitForEvents_t)(cl_uint, const cl_event *);
 typedef cl_int (*clReleaseEvent_t)(cl_event);
+typedef cl_int (*clGetEventProfilingInfo_t)(cl_event, cl_uint, size_t, void *,
+    size_t *);
+typedef cl_int (*clEnqueueMarkerWithWaitList_t)(cl_command_queue, cl_uint,
+    const cl_event *, cl_event *);
 typedef cl_int (*clGetKernelWorkGroupInfo_t)(cl_kernel, cl_device_id,
     cl_uint, size_t, void *, size_t *);
 
@@ -112,6 +123,10 @@ typedef struct
     clEnqueueWriteBuffer_t EnqueueWriteBuffer;
     clWaitForEvents_t WaitForEvents;
     clReleaseEvent_t ReleaseEvent;
+    clGetEventProfilingInfo_t GetEventProfilingInfo;
+    /* NULL-tolerant: only the profiling canary uses it, and a loader
+     * without the CL 1.2 marker entry must not lose the whole engine. */
+    clEnqueueMarkerWithWaitList_t EnqueueMarkerWithWaitList;
     clGetKernelWorkGroupInfo_t GetKernelWorkGroupInfo;
 } GpuClFuncs;
 
@@ -130,6 +145,7 @@ typedef struct
     cl_kernel kernel;
     char devName[256];
     cl_uint cus;
+    int profiling;  // queue verified to actually profile events
 } GpuCl;
 
 /* Resolves the OpenCL loader, probes the first GPU device (name,
