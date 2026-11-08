@@ -991,25 +991,39 @@ static int gpuEnsureOutLocked(GpuEngine *e, GpuSlab *slab, int points)
 }
 
 /*
- * Dispatch tail shared by all four families: the readbacks enqueue
- * (CL_FALSE) inside the locked section, so the in-order queue has completed
- * every earlier command by the time the last readback finishes; waiting
- * that one event outside the mutex drains the whole dispatch. `firstRead`
- * is the earlier readback's event when a dispatch has two (NULL otherwise);
- * both event handles are released here. A wait error latches the engine
- * dead like any GPU error; the dispatch counts only once its results are
- * actually read back.
+ * Dispatch tail shared by all four families. `enqErr` carries any enqueue
+ * failure; the events are the readbacks that did enqueue (the last one is
+ * set whenever all enqueues succeeded). Every enqueued readback is waited
+ * before its handle is released, failure paths included: a CL_FALSE read
+ * drains into the caller's buffer even after a later enqueue fails, so
+ * releasing it alone would let the device write race the CPU fallback the
+ * caller runs on a nonzero return. The earlier readback is waited
+ * explicitly (the last event's completion proves it finished, not that it
+ * finished successfully), keeping a mid-queue execution failure visible
+ * like the blocking reads this replaces. Any enqueue or wait error latches
+ * the engine dead; the dispatch counts only once every result drained.
  */
-static int gpuFinishDispatch(cl_event firstRead, cl_event lastRead,
-    uint64_t *counter)
+static int gpuFinishDispatch(cl_int enqErr, cl_event firstRead,
+    cl_event lastRead, const char *what, uint64_t *counter)
 {
-    cl_int err = g_gpu.cl.fn.WaitForEvents(1, &lastRead);
+    cl_event pending[2];
+    cl_uint n = 0;
     if (firstRead)
-        g_gpu.cl.fn.ReleaseEvent(firstRead);
-    g_gpu.cl.fn.ReleaseEvent(lastRead);
+        pending[n++] = firstRead;
+    if (lastRead)
+        pending[n++] = lastRead;
+    cl_int err = enqErr;
+    if (n)
+    {
+        cl_int waitErr = g_gpu.cl.fn.WaitForEvents(n, pending);
+        if (err == CL_SUCCESS)
+            err = waitErr;
+    }
+    for (cl_uint i = 0; i < n; i++)
+        g_gpu.cl.fn.ReleaseEvent(pending[i]);
     if (err != CL_SUCCESS)
     {
-        gpuClErr(&g_gpu, err, "gpu readback");
+        gpuClErr(&g_gpu, err, what);
         return 1;
     }
     GPU_LOCK;
@@ -1165,17 +1179,8 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
             CL_FALSE, 0, sizeof(int64_t) * (size_t)points * 6, np, 0, NULL,
             &evNp);
     GPU_UNLOCK;
-    if (err != CL_SUCCESS)
-    {
-        if (evId)
-            g_gpu.cl.fn.ReleaseEvent(evId);
-        if (evNp)
-            g_gpu.cl.fn.ReleaseEvent(evNp);
-        gpuClErr(&g_gpu, err, "gpu dispatch");
-        return 1;
-    }
-    return gpuFinishDispatch(evNp ? evId : NULL, evNp ? evNp : evId,
-        &g_gpu.dispatchCount);
+    return gpuFinishDispatch(err, evNp ? evId : NULL, evNp ? evNp : evId,
+        "gpu dispatch", &g_gpu.dispatchCount);
 }
 
 int gpuTrySurfaceBiomeHook(int *out, const BiomeNoise *bn, uint64_t sha,
@@ -1288,17 +1293,8 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
         err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
             CL_FALSE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, &evId);
     GPU_UNLOCK;
-    if (err != CL_SUCCESS)
-    {
-        if (evY)
-            g_gpu.cl.fn.ReleaseEvent(evY);
-        if (evId)
-            g_gpu.cl.fn.ReleaseEvent(evId);
-        gpuClErr(&g_gpu, err, "gpu height dispatch");
-        return 1;
-    }
-    return gpuFinishDispatch(evId ? evY : NULL, evId ? evId : evY,
-        &g_gpu.heightCount);
+    return gpuFinishDispatch(err, evId ? evY : NULL, evId ? evId : evY,
+        "gpu height dispatch", &g_gpu.heightCount);
 }
 
 int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
@@ -1462,14 +1458,8 @@ int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
             CL_FALSE, 0, sizeof(int) * (size_t)points, heights, 0, NULL,
             &ev);
     GPU_UNLOCK;
-    if (err != CL_SUCCESS)
-    {
-        if (ev)
-            g_gpu.cl.fn.ReleaseEvent(ev);
-        gpuClErr(&g_gpu, err, "gpu cfx height dispatch");
-        return 1;
-    }
-    return gpuFinishDispatch(NULL, ev, &g_gpu.heightCount);
+    return gpuFinishDispatch(err, NULL, ev, "gpu cfx height dispatch",
+        &g_gpu.heightCount);
 }
 
 /*
@@ -1567,12 +1557,6 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
         err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
             CL_FALSE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, &ev);
     GPU_UNLOCK;
-    if (err != CL_SUCCESS)
-    {
-        if (ev)
-            g_gpu.cl.fn.ReleaseEvent(ev);
-        gpuClErr(&g_gpu, err, "gpu cfx biome dispatch");
-        return 1;
-    }
-    return gpuFinishDispatch(NULL, ev, &g_gpu.dispatchCount);
+    return gpuFinishDispatch(err, NULL, ev, "gpu cfx biome dispatch",
+        &g_gpu.dispatchCount);
 }
