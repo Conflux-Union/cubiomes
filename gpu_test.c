@@ -1801,6 +1801,64 @@ static void runCfxModeCase(uint64_t seed, CaseStats *total, int *fail)
     }
 }
 
+// Slab rotation regression: the engine rotates its output slabs per
+// dispatch, so two back-to-back lattices land on different slabs. Both runs
+// must match each other and the CPU reference bit-for-bit; cross-slab
+// contamination flips this.
+static void runCfxSlabRotationCase(uint64_t seed, CaseStats *total, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    const CfxLShape *sh = &CFX_LSHAPES[1]; // the 130x130 LOD1 macro lattice
+    const int w = sh->w, h = sh->h, points = w * h;
+    int mf, mmf, tr;
+    cfxNoiseDetailForStrideRef(&g.bn.terrain, sh->stride, &mf, &mmf, &tr);
+
+    int *ref = malloc(sizeof(int) * (size_t)points);
+    int *runA = malloc(sizeof(int) * (size_t)points);
+    int *runB = malloc(sizeof(int) * (size_t)points);
+    if (!ref || !runA || !runB)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+    for (int j = 0; j < h; j++)
+        for (int i = 0; i < w; i++)
+            ref[j * w + i] = cfxModernOverviewHeightRef(&g.bn,
+                i * sh->step4, j * sh->step4, mf, mmf, tr);
+
+    int rcA = gpuCfxOverviewHeights(runA, &g.bn, 0, 0, w, h,
+        sh->step4, sh->step4, mf, mmf, tr);
+    int rcB = gpuCfxOverviewHeights(runB, &g.bn, 0, 0, w, h,
+        sh->step4, sh->step4, mf, mmf, tr);
+    if (rcA != 0 || rcB != 0)
+    {
+        printf("  FAIL: slab rotation dispatch refused (%d %d)\n", rcA, rcB);
+        *fail = 1;
+    }
+    else if (memcmp(runA, runB, sizeof(int) * (size_t)points) != 0)
+    {
+        printf("  FAIL: slab rotation changed results between dispatches\n");
+        *fail = 1;
+    }
+    else if (memcmp(runA, ref, sizeof(int) * (size_t)points) != 0)
+    {
+        printf("  FAIL: slab rotation drifted from the CPU reference\n");
+        *fail = 1;
+    }
+    else
+    {
+        printf("  slab rotation: %dx%d twice back-to-back bit-identical\n",
+            w, h);
+        total->pts += points;
+    }
+    free(ref);
+    free(runA);
+    free(runB);
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -2047,6 +2105,7 @@ int main(int argc, char **argv)
         runCfxCase(mainMc, LARGE_BIOMES, seeds[0], 100000, 100000, 1,
             &total, &fail);
     }
+    runCfxSlabRotationCase(seeds[0], &total, &fail);
     runCfxModeCase(seeds[0], &total, &fail);
 
     printf("\n");

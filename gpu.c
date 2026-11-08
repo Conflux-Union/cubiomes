@@ -56,9 +56,9 @@ _Static_assert(SP_CONTINENTALNESS == 0 && SP_EROSION == 1
     && SP_RIDGES == 2 && SP_WEIRDNESS == 3, "kernel spline parameter ids");
 
 #define GPU_INST_COUNT (NP_MAX + 1 + TN_MAX)
-// Dispatch size cap: ~1M points keeps the output buffers bounded (~59 MB
-// worst case with the climate-np plane); larger queries take the CPU
-// fallback and stay correct.
+// Dispatch size cap: ~1M points keeps one output slab bounded (~59 MB worst
+// case with the climate-np plane; two rotating slabs ~120 MB); larger
+// queries take the CPU fallback and stay correct.
 #define GPU_MAX_POINTS (1 << 20)
 #define GPU_CL_OPTS "-cl-std=CL1.2 -cl-fp32-correctly-rounded-divide-sqrt"
 #define GPU_LOCAL_SIZE_MAX 128
@@ -89,6 +89,23 @@ typedef struct
     double snXZScaleD, snYScaleD, snXZFactorD, snYFactorD;
     int octMinOff, octMaxOff, octMainOff;
 } GpuTables;
+
+/*
+ * One output/input slab: the device buffers a dispatch family reads results
+ * from (and, for the cfx biome kernel, uploads its caller heights into),
+ * all grown together. Two slabs rotate per dispatch under the engine mutex,
+ * so while one dispatch waits its readback outside the lock the next one
+ * enqueues against the other slab.
+ */
+typedef struct
+{
+    cl_mem outNp;  // climate np plane (float biome path)
+    cl_mem outId;  // surface biome ids (float + cfx biome paths)
+    cl_mem outY;   // float terrain heights
+    cl_mem inY;    // cfx biome caller heights
+    cl_mem outYi;  // cfx int height output
+    int cap;       // points all five buffers are sized for
+} GpuSlab;
 
 typedef struct
 {
@@ -122,9 +139,8 @@ typedef struct
     cl_mem mPinfoD, mNampD;
     cl_mem mStyp, mSlen, mSloc, mSder, mSchild;
     cl_mem mSteps, mParam, mNodes;
-    cl_mem mOutNp, mOutId, mOutY;
-    cl_mem mInY, mOutYi;  // cfx biome input heights, cfx height int output
-    int outCap;
+    GpuSlab slabs[2];
+    int activeSlab;  // slab the next dispatch grows/uses, toggled under lock
 } GpuEngine;
 
 static GpuEngine g_gpu =
@@ -138,7 +154,7 @@ static GpuEngine g_gpu =
     // Everything after modeUser/modeEnv is zero-initialized: modeEnvParsed,
     // clInited, clAvail, dead, forceWarned, cl, kHeight, cfxAvail,
     // localSize (re-set at first init), tables, cache key, counters,
-    // buffers, outCap.
+    // slabs.
 };
 
 static void gpuClErr(GpuEngine *e, cl_int err, const char *what)
@@ -188,24 +204,19 @@ static void gpuReleasePack(GpuEngine *e)
     e->keyFailed = 0;
 }
 
-static void gpuReleaseOut(GpuEngine *e)
+static void gpuReleaseSlab(GpuEngine *e, GpuSlab *slab)
 {
-    if (e->mOutNp)
-        e->cl.fn.ReleaseMemObject(e->mOutNp);
-    if (e->mOutId)
-        e->cl.fn.ReleaseMemObject(e->mOutId);
-    if (e->mOutY)
-        e->cl.fn.ReleaseMemObject(e->mOutY);
-    if (e->mInY)
-        e->cl.fn.ReleaseMemObject(e->mInY);
-    if (e->mOutYi)
-        e->cl.fn.ReleaseMemObject(e->mOutYi);
-    e->mOutNp = NULL;
-    e->mOutId = NULL;
-    e->mOutY = NULL;
-    e->mInY = NULL;
-    e->mOutYi = NULL;
-    e->outCap = 0;
+    if (slab->outNp)
+        e->cl.fn.ReleaseMemObject(slab->outNp);
+    if (slab->outId)
+        e->cl.fn.ReleaseMemObject(slab->outId);
+    if (slab->outY)
+        e->cl.fn.ReleaseMemObject(slab->outY);
+    if (slab->inY)
+        e->cl.fn.ReleaseMemObject(slab->inY);
+    if (slab->outYi)
+        e->cl.fn.ReleaseMemObject(slab->outYi);
+    memset(slab, 0, sizeof(*slab));
 }
 
 //----------------------------------------------------------------------
@@ -954,28 +965,56 @@ int gpuAvailable(const Generator *g)
     return gpuSurfaceBiomeAvailable(&g->bn);
 }
 
-static int gpuEnsureOutLocked(GpuEngine *e, int points)
+static int gpuEnsureOutLocked(GpuEngine *e, GpuSlab *slab, int points)
 {
-    if (points <= e->outCap)
+    if (points <= slab->cap)
         return 0;
-    gpuReleaseOut(e);
-    e->mOutNp = gpuBuf(e, CL_MEM_READ_WRITE,
+    gpuReleaseSlab(e, slab);
+    slab->outNp = gpuBuf(e, CL_MEM_READ_WRITE,
         sizeof(int64_t) * (size_t)points * 6, NULL);
-    if (e->mOutNp)
-        e->mOutId = gpuBuf(e, CL_MEM_READ_WRITE,
+    if (slab->outNp)
+        slab->outId = gpuBuf(e, CL_MEM_READ_WRITE,
             sizeof(int) * (size_t)points, NULL);
-    if (e->mOutId)
-        e->mOutY = gpuBuf(e, CL_MEM_READ_WRITE,
+    if (slab->outId)
+        slab->outY = gpuBuf(e, CL_MEM_READ_WRITE,
             sizeof(float) * (size_t)points, NULL);
-    if (e->mOutY)
-        e->mInY = gpuBuf(e, CL_MEM_READ_ONLY,
+    if (slab->outY)
+        slab->inY = gpuBuf(e, CL_MEM_READ_ONLY,
             sizeof(int) * (size_t)points, NULL);
-    if (e->mInY)
-        e->mOutYi = gpuBuf(e, CL_MEM_READ_WRITE,
+    if (slab->inY)
+        slab->outYi = gpuBuf(e, CL_MEM_READ_WRITE,
             sizeof(int) * (size_t)points, NULL);
-    if (!e->mOutYi)
+    if (!slab->outYi)
         return 1;
-    e->outCap = points;
+    slab->cap = points;
+    return 0;
+}
+
+/*
+ * Dispatch tail shared by all four families: the readbacks enqueue
+ * (CL_FALSE) inside the locked section, so the in-order queue has completed
+ * every earlier command by the time the last readback finishes; waiting
+ * that one event outside the mutex drains the whole dispatch. `firstRead`
+ * is the earlier readback's event when a dispatch has two (NULL otherwise);
+ * both event handles are released here. A wait error latches the engine
+ * dead like any GPU error; the dispatch counts only once its results are
+ * actually read back.
+ */
+static int gpuFinishDispatch(cl_event firstRead, cl_event lastRead,
+    uint64_t *counter)
+{
+    cl_int err = g_gpu.cl.fn.WaitForEvents(1, &lastRead);
+    if (firstRead)
+        g_gpu.cl.fn.ReleaseEvent(firstRead);
+    g_gpu.cl.fn.ReleaseEvent(lastRead);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "gpu readback");
+        return 1;
+    }
+    GPU_LOCK;
+    (*counter)++;
+    GPU_UNLOCK;
     return 0;
 }
 
@@ -1074,7 +1113,9 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
         return 1;
     }
     int points = w * rows;
-    if (gpuEnsureOutLocked(&g_gpu, points))
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, points))
     {
         GPU_UNLOCK;
         return 1;
@@ -1094,8 +1135,8 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &zStride);
     cl_ulong shaArg = sha;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &shaArg);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutNp);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutId);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outNp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outId);
     if (err != CL_SUCCESS)
     {
         gpuClErr(&g_gpu, err, "clSetKernelArg");
@@ -1113,26 +1154,28 @@ static int gpuSurfaceBiomeDispatch(int *out, const BiomeNoise *bn,
         (size_t) rows
     };
     size_t local[2] = { ls, 1 };
+    cl_event evId = NULL, evNp = NULL;
     err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
         global, local, 0, NULL, NULL);
     if (err == CL_SUCCESS)
-    {
-        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutId,
-            CL_TRUE, 0, sizeof(int) * (size_t)points, out, 0, NULL, NULL);
-        if (err == CL_SUCCESS && np)
-            err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutNp,
-                CL_TRUE, 0, sizeof(int64_t) * (size_t)points * 6, np,
-                0, NULL, NULL);
-    }
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
+            CL_FALSE, 0, sizeof(int) * (size_t)points, out, 0, NULL, &evId);
+    if (err == CL_SUCCESS && np)
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outNp,
+            CL_FALSE, 0, sizeof(int64_t) * (size_t)points * 6, np, 0, NULL,
+            &evNp);
+    GPU_UNLOCK;
     if (err != CL_SUCCESS)
     {
+        if (evId)
+            g_gpu.cl.fn.ReleaseEvent(evId);
+        if (evNp)
+            g_gpu.cl.fn.ReleaseEvent(evNp);
         gpuClErr(&g_gpu, err, "gpu dispatch");
-        GPU_UNLOCK;
         return 1;
     }
-    g_gpu.dispatchCount++;
-    GPU_UNLOCK;
-    return 0;
+    return gpuFinishDispatch(evNp ? evId : NULL, evNp ? evNp : evId,
+        &g_gpu.dispatchCount);
 }
 
 int gpuTrySurfaceBiomeHook(int *out, const BiomeNoise *bn, uint64_t sha,
@@ -1199,7 +1242,9 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
         return 1;
     }
     int points = w * rows;
-    if (gpuEnsureOutLocked(&g_gpu, points))
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, points))
     {
         GPU_UNLOCK;
         return 1;
@@ -1217,8 +1262,8 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &width);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &height);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &zStride);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutY);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutId);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outY);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outId);
     if (err != CL_SUCCESS)
     {
         gpuClErr(&g_gpu, err, "clSetKernelArg");
@@ -1233,23 +1278,27 @@ static int gpuHeightDispatch(float *y, int *ids, const BiomeNoise *bn,
         (size_t) rows
     };
     size_t local[2] = { ls, 1 };
+    cl_event evY = NULL, evId = NULL;
     err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
         global, local, 0, NULL, NULL);
     if (err == CL_SUCCESS)
-        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutY,
-            CL_TRUE, 0, sizeof(float) * (size_t)points, y, 0, NULL, NULL);
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outY,
+            CL_FALSE, 0, sizeof(float) * (size_t)points, y, 0, NULL, &evY);
     if (err == CL_SUCCESS && ids)
-        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutId,
-            CL_TRUE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, NULL);
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
+            CL_FALSE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, &evId);
+    GPU_UNLOCK;
     if (err != CL_SUCCESS)
     {
+        if (evY)
+            g_gpu.cl.fn.ReleaseEvent(evY);
+        if (evId)
+            g_gpu.cl.fn.ReleaseEvent(evId);
         gpuClErr(&g_gpu, err, "gpu height dispatch");
-        GPU_UNLOCK;
         return 1;
     }
-    g_gpu.heightCount++;
-    GPU_UNLOCK;
-    return 0;
+    return gpuFinishDispatch(evId ? evY : NULL, evId ? evId : evY,
+        &g_gpu.heightCount);
 }
 
 int gpuTryHeightHook(float *y, int *ids, const BiomeNoise *bn,
@@ -1369,7 +1418,9 @@ int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
         return 1;
     }
     const int points = gridW * gridH;
-    if (gpuEnsureOutLocked(&g_gpu, points))
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, points))
     {
         GPU_UNLOCK;
         return 1;
@@ -1388,7 +1439,7 @@ int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stepZ4);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &gridW);
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &gridH);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutYi);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outYi);
     if (err != CL_SUCCESS)
     {
         gpuClErr(&g_gpu, err, "clSetKernelArg");
@@ -1403,20 +1454,22 @@ int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
         (size_t) gridH
     };
     size_t local[2] = { ls, 1 };
+    cl_event ev = NULL;
     err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
         global, local, 0, NULL, NULL);
     if (err == CL_SUCCESS)
-        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutYi,
-            CL_TRUE, 0, sizeof(int) * (size_t)points, heights, 0, NULL, NULL);
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outYi,
+            CL_FALSE, 0, sizeof(int) * (size_t)points, heights, 0, NULL,
+            &ev);
+    GPU_UNLOCK;
     if (err != CL_SUCCESS)
     {
+        if (ev)
+            g_gpu.cl.fn.ReleaseEvent(ev);
         gpuClErr(&g_gpu, err, "gpu cfx height dispatch");
-        GPU_UNLOCK;
         return 1;
     }
-    g_gpu.heightCount++;
-    GPU_UNLOCK;
-    return 0;
+    return gpuFinishDispatch(NULL, ev, &g_gpu.heightCount);
 }
 
 /*
@@ -1467,7 +1520,9 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
         return 1;
     }
     const int points = w * rows;
-    if (gpuEnsureOutLocked(&g_gpu, points))
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, points))
     {
         GPU_UNLOCK;
         return 1;
@@ -1484,8 +1539,8 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stride);
     cl_ulong shaArg = sha;
     err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &shaArg);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mInY);
-    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &g_gpu.mOutId);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inY);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outId);
     if (err != CL_SUCCESS)
     {
         gpuClErr(&g_gpu, err, "clSetKernelArg");
@@ -1493,8 +1548,9 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
         return 1;
     }
 
-    err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, g_gpu.mInY, CL_TRUE,
+    err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inY, CL_TRUE,
         0, sizeof(int) * (size_t)points, terrainY, 0, NULL, NULL);
+    cl_event ev = NULL;
     if (err == CL_SUCCESS)
     {
         size_t ls = g_gpu.localSize;
@@ -1508,15 +1564,15 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
             global, local, 0, NULL, NULL);
     }
     if (err == CL_SUCCESS)
-        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, g_gpu.mOutId,
-            CL_TRUE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, NULL);
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
+            CL_FALSE, 0, sizeof(int) * (size_t)points, ids, 0, NULL, &ev);
+    GPU_UNLOCK;
     if (err != CL_SUCCESS)
     {
+        if (ev)
+            g_gpu.cl.fn.ReleaseEvent(ev);
         gpuClErr(&g_gpu, err, "gpu cfx biome dispatch");
-        GPU_UNLOCK;
         return 1;
     }
-    g_gpu.dispatchCount++;
-    GPU_UNLOCK;
-    return 0;
+    return gpuFinishDispatch(NULL, ev, &g_gpu.dispatchCount);
 }

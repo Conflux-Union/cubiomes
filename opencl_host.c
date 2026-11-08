@@ -78,6 +78,8 @@ int gpuClInit(GpuCl *cl)
     GPUCL_SYM(EnqueueNDRangeKernel);
     GPUCL_SYM(EnqueueReadBuffer);
     GPUCL_SYM(EnqueueWriteBuffer);
+    GPUCL_SYM(WaitForEvents);
+    GPUCL_SYM(ReleaseEvent);
     GPUCL_SYM(GetKernelWorkGroupInfo);
 
     cl_platform_id plats[8];

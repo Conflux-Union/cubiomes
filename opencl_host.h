@@ -82,6 +82,8 @@ typedef cl_int (*clEnqueueReadBuffer_t)(cl_command_queue, cl_mem, cl_bool,
     size_t, size_t, void *, cl_uint, const cl_event *, cl_event *);
 typedef cl_int (*clEnqueueWriteBuffer_t)(cl_command_queue, cl_mem, cl_bool,
     size_t, size_t, const void *, cl_uint, const cl_event *, cl_event *);
+typedef cl_int (*clWaitForEvents_t)(cl_uint, const cl_event *);
+typedef cl_int (*clReleaseEvent_t)(cl_event);
 typedef cl_int (*clGetKernelWorkGroupInfo_t)(cl_kernel, cl_device_id,
     cl_uint, size_t, void *, size_t *);
 
@@ -108,6 +110,8 @@ typedef struct
     clEnqueueNDRangeKernel_t EnqueueNDRangeKernel;
     clEnqueueReadBuffer_t EnqueueReadBuffer;
     clEnqueueWriteBuffer_t EnqueueWriteBuffer;
+    clWaitForEvents_t WaitForEvents;
+    clReleaseEvent_t ReleaseEvent;
     clGetKernelWorkGroupInfo_t GetKernelWorkGroupInfo;
 } GpuClFuncs;
 
