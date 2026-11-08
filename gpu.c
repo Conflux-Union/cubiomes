@@ -60,6 +60,9 @@ _Static_assert(SP_CONTINENTALNESS == 0 && SP_EROSION == 1
 // case with the climate-np plane; two rotating slabs ~120 MB); larger
 // queries take the CPU fallback and stay correct.
 #define GPU_MAX_POINTS (1 << 20)
+// Batch-entry block count bound: the per-block failure mask is an int
+// bitmask, so n beyond this cannot report failures.
+#define GPU_BATCH_MAX 32
 #define GPU_CL_OPTS "-cl-std=CL1.2 -cl-fp32-correctly-rounded-divide-sqrt"
 #define GPU_LOCAL_SIZE_MAX 128
 
@@ -991,36 +994,30 @@ static int gpuEnsureOutLocked(GpuEngine *e, GpuSlab *slab, int points)
 }
 
 /*
- * Dispatch tail shared by all four families. `enqErr` carries any enqueue
- * failure; the events are the readbacks that did enqueue (the last one is
- * set whenever all enqueues succeeded). Every enqueued readback is waited
- * before its handle is released, failure paths included: a CL_FALSE read
- * drains into the caller's buffer even after a later enqueue fails, so
- * releasing it alone would let the device write race the CPU fallback the
- * caller runs on a nonzero return. The earlier readback is waited
- * explicitly (the last event's completion proves it finished, not that it
- * finished successfully), keeping a mid-queue execution failure visible
- * like the blocking reads this replaces. Any enqueue or wait error latches
- * the engine dead; the dispatch counts only once every result drained.
+ * Dispatch tail shared by every family and dispatch shape. `reads` carries
+ * the readbacks that did enqueue in enqueue order (a batch passes one per
+ * served block). Every enqueued readback is waited before its handle is
+ * released, failure paths included: a CL_FALSE read drains into the
+ * caller's buffer even after a later enqueue failed, so releasing it alone
+ * would let the device write race the CPU fallback the caller runs on a
+ * nonzero return. Each read is waited explicitly (a later event's
+ * completion proves earlier ones finished, not that they finished
+ * successfully), keeping a mid-queue execution failure visible like the
+ * blocking reads this replaces. Any enqueue or wait error latches the
+ * engine dead; the dispatch counts only once every result drained.
  */
-static int gpuFinishDispatch(cl_int enqErr, cl_event firstRead,
-    cl_event lastRead, const char *what, uint64_t *counter)
+static int gpuFinishDispatchN(cl_int enqErr, const cl_event *reads,
+    cl_uint n, const char *what, uint64_t *counter)
 {
-    cl_event pending[2];
-    cl_uint n = 0;
-    if (firstRead)
-        pending[n++] = firstRead;
-    if (lastRead)
-        pending[n++] = lastRead;
     cl_int err = enqErr;
     if (n)
     {
-        cl_int waitErr = g_gpu.cl.fn.WaitForEvents(n, pending);
+        cl_int waitErr = g_gpu.cl.fn.WaitForEvents(n, reads);
         if (err == CL_SUCCESS)
             err = waitErr;
     }
     for (cl_uint i = 0; i < n; i++)
-        g_gpu.cl.fn.ReleaseEvent(pending[i]);
+        g_gpu.cl.fn.ReleaseEvent(reads[i]);
     if (err != CL_SUCCESS)
     {
         gpuClErr(&g_gpu, err, what);
@@ -1030,6 +1027,18 @@ static int gpuFinishDispatch(cl_int enqErr, cl_event firstRead,
     (*counter)++;
     GPU_UNLOCK;
     return 0;
+}
+
+static int gpuFinishDispatch(cl_int enqErr, cl_event firstRead,
+    cl_event lastRead, const char *what, uint64_t *counter)
+{
+    cl_event pending[2];
+    cl_uint n = 0;
+    if (firstRead)
+        pending[n++] = firstRead;
+    if (lastRead)
+        pending[n++] = lastRead;
+    return gpuFinishDispatchN(enqErr, pending, n, what, counter);
 }
 
 /*
@@ -1460,6 +1469,138 @@ int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
     GPU_UNLOCK;
     return gpuFinishDispatch(err, NULL, ev, "gpu cfx height dispatch",
         &g_gpu.heightCount);
+}
+
+/*
+ * One submission of gpuCfxOverviewHeights() for n independent blocks: one
+ * lock acquisition, one table pack, one slab, one readback wait for the
+ * whole set. Block i solves the same lattice the single entry would and
+ * its heights land at heights[flatOffsets[i]] in the caller's flat layout.
+ * Per-block host-side enqueue failures set bit i and skip that block's
+ * kernel, read or both; the caller repairs exactly those blocks on the CPU.
+ * Everything that refuses the whole batch (bad arguments, caps, engine
+ * state, table pack) returns nonzero before any output write and leaves
+ * *failMask alone.
+ *
+ * The kernel takes no output-base argument, so every block writes
+ * outYi[0..points): block i's read must be enqueued before block i+1's
+ * kernel, and the in-order queue runs them in exactly that order. That is
+ * also why the reads stay inside the lock with the kernels - hoisting them
+ * past the unlock would let another dispatcher reuse this slab first and
+ * corrupt block i's results.
+ */
+int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
+    const long *flatOffsets, const BiomeNoise *bn, const int *x4,
+    const int *z4, const int *gridW, const int *gridH, const int *stepX4,
+    const int *stepZ4, int n, int mainFirst, int minMaxFirst, int truncated)
+{
+    if (!failMask || !heights || !flatOffsets || !bn
+        || !x4 || !z4 || !gridW || !gridH || !stepX4 || !stepZ4
+        || n <= 0 || n > GPU_BATCH_MAX
+        || mainFirst < 0 || mainFirst > 7
+        || minMaxFirst < 0 || minMaxFirst > 15
+        || (truncated != 0 && truncated != 1))
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+    int64_t total = 0;
+    for (int i = 0; i < n; i++)
+    {
+        if (gridW[i] <= 0 || gridH[i] <= 0
+            || stepX4[i] <= 0 || stepZ4[i] <= 0 || flatOffsets[i] < 0)
+            return 1;
+        total += (int64_t) gridW[i] * gridH[i];
+    }
+    if (total > GPU_MAX_POINTS)
+        return 1;
+
+    GPU_LOCK;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init on purpose, same as the float paths.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    gpuEnsureRuntimeLocked(&g_gpu);
+    const int cfxReady = gpuEnsureCfxLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead || !cfxReady)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu,
+                !g_gpu.clAvail || g_gpu.dead
+                    ? "no usable OpenCL device"
+                    : "no fp64 OpenCL device for the cfx kernels");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, (int) total))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = g_gpu.kCfxHeight;
+    cl_uint a = 0;
+    cl_int err = gpuSetCfxTableArgsLocked(k, &a);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &mainFirst);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &minMaxFirst);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &truncated);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        GPU_UNLOCK;
+        return 1;
+    }
+    const cl_uint geomArg = a;
+
+    *failMask = 0;
+    cl_event reads[GPU_BATCH_MAX];
+    cl_uint nReads = 0;
+    for (int i = 0; i < n; i++)
+    {
+        a = geomArg;
+        err = CL_SUCCESS;
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &x4[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &z4[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stepX4[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stepZ4[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &gridW[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &gridH[i]);
+        err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem),
+            &slab->outYi);
+        if (err == CL_SUCCESS)
+        {
+            size_t ls = g_gpu.localSize;
+            size_t global[2] =
+            {
+                ((size_t) gridW[i] + ls - 1) / ls * ls,
+                (size_t) gridH[i]
+            };
+            size_t local[2] = { ls, 1 };
+            err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 2, NULL,
+                global, local, 0, NULL, NULL);
+        }
+        if (err == CL_SUCCESS)
+            err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outYi,
+                CL_FALSE, 0,
+                sizeof(int) * ((size_t) gridW[i] * (size_t) gridH[i]),
+                heights + flatOffsets[i], 0, NULL, &reads[nReads]);
+        if (err != CL_SUCCESS)
+            *failMask |= (int) (1u << i);
+        else
+            nReads++;
+    }
+    GPU_UNLOCK;
+    return gpuFinishDispatchN(CL_SUCCESS, reads, nReads,
+        "gpu cfx height batch dispatch", &g_gpu.heightCount);
 }
 
 /*

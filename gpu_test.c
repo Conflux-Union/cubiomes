@@ -1859,6 +1859,142 @@ static void runCfxSlabRotationCase(uint64_t seed, CaseStats *total, int *fail)
     free(runB);
 }
 
+// The batch entry must fill every block's range of the caller's flat layout
+// bit-exactly the way n per-block dispatches do. Mixed grid shapes, strides
+// and origins make the per-block geometry (and kernel arg re-set between
+// same-kernel enqueues) actually vary; the blocks pack the flat offsets
+// with no gaps, derived from the shapes. Interleaving the reference calls
+// with the batch call also walks the slab rotation across both entry kinds.
+static void runCfxHeightsBatchCase(uint64_t seed, CaseStats *total, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    enum { CNT = 3 };
+    static const int w[CNT] = { 130, 65, 130 };
+    static const int h[CNT] = { 130, 65, 65 };
+    static const int step[CNT] = { 4, 8, 4 };
+    static const int x4[CNT] = { 0, 500, -300 };
+    static const int z4[CNT] = { 0, -200, 400 };
+    // Full detail scalars for every block: the batch shares one set by
+    // contract, and step/detail pairing policy belongs to the shim, not
+    // this mechanism test.
+    const int mf = 0, mmf = 0, tr = 0;
+
+    long offs[CNT];
+    int totalPts = 0;
+    for (int i = 0; i < CNT; i++)
+    {
+        offs[i] = totalPts;
+        totalPts += w[i] * h[i];
+    }
+
+    int *ref = malloc(sizeof(int) * (size_t)totalPts);
+    int *batch = malloc(sizeof(int) * (size_t)totalPts);
+    if (!ref || !batch)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    int rcRef = 0;
+    for (int i = 0; i < CNT; i++)
+        rcRef |= gpuCfxOverviewHeights(ref + offs[i], &g.bn, x4[i], z4[i],
+            w[i], h[i], step[i], step[i], mf, mmf, tr);
+    int failMask = (int) 0x5A5A5A5A;
+    int rcBatch = gpuCfxOverviewHeightsBatch(&failMask, batch, offs, &g.bn,
+        x4, z4, w, h, step, step, CNT, mf, mmf, tr);
+
+    if (rcRef != 0 || rcBatch != 0)
+    {
+        printf("  FAIL: heights batch or per-block dispatch refused"
+            " (%d %d)\n", rcRef, rcBatch);
+        *fail = 1;
+    }
+    else if (failMask != 0)
+    {
+        printf("  FAIL: heights batch reported per-block failures"
+            " (failMask %#x)\n", failMask);
+        *fail = 1;
+    }
+    else
+    {
+        int mismatches = 0;
+        for (int i = 0; i < CNT; i++)
+        {
+            const int pts = w[i] * h[i];
+            const int *refBlk = ref + offs[i];
+            const int *batchBlk = batch + offs[i];
+            for (int p = 0; p < pts; p++)
+                if (batchBlk[p] != refBlk[p])
+                {
+                    if (mismatches < 3)
+                        printf("    block %d @%d: batch=%d ref=%d\n",
+                            i, p, batchBlk[p], refBlk[p]);
+                    mismatches++;
+                }
+        }
+        if (mismatches)
+        {
+            printf("  FAIL: heights batch drifted from per-block dispatches:"
+                " %d mismatches\n", mismatches);
+            *fail = 1;
+        }
+        else
+        {
+            printf("  heights batch: %d blocks (%d pts) bit-identical to"
+                " per-block dispatches\n", CNT, totalPts);
+            total->pts += totalPts;
+        }
+    }
+    free(ref);
+    free(batch);
+}
+
+// Whole-batch refusal must fire before any lock, enqueue or output write:
+// the first block is exactly the dispatch cap and a second block pushes the
+// sum over it, while the heights target is deliberately tiny - any write
+// before the cap check corrupts the stack here. failMask must stay
+// untouched on refusal (the caller keys its fallback off the return value).
+static void runCfxHeightsBatchRefusalCase(uint64_t seed, CaseStats *total,
+    int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    // gpu.c's GPU_MAX_POINTS dispatch cap (kept private there).
+    enum { CAP_POINTS = 1 << 20 };
+    const int x4[2] = { 0, 16 };
+    const int z4[2] = { 0, 16 };
+    const int gw[2] = { CAP_POINTS, 1 };
+    const int gh[2] = { 1, 1 };
+    const int st[2] = { 4, 4 };
+    const long offs[2] = { 0, 1 };
+
+    int failMask = (int) 0x5A5A5A5A;
+    int tiny = 0;
+    int rc = gpuCfxOverviewHeightsBatch(&failMask, &tiny, offs, &g.bn, x4,
+        z4, gw, gh, st, st, 2, 0, 0, 0);
+    if (rc == 0)
+    {
+        printf("  FAIL: over-cap heights batch was attempted\n");
+        *fail = 1;
+    }
+    else if (failMask != (int) 0x5A5A5A5A)
+    {
+        printf("  FAIL: over-cap refusal touched failMask (%#x)\n",
+            failMask);
+        *fail = 1;
+    }
+    else
+    {
+        printf("  heights batch refusal: cap+1 points rejected before any"
+            " write\n");
+    }
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -2106,6 +2242,8 @@ int main(int argc, char **argv)
             &total, &fail);
     }
     runCfxSlabRotationCase(seeds[0], &total, &fail);
+    runCfxHeightsBatchCase(seeds[0], &total, &fail);
+    runCfxHeightsBatchRefusalCase(seeds[0], &total, &fail);
     runCfxModeCase(seeds[0], &total, &fail);
 
     printf("\n");

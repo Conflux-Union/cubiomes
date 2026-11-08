@@ -23,10 +23,13 @@
  * batch per generator before switching.
  *
  * Thread model: one process-global engine with ONE command queue. A mutex
- * serializes submit+read around each dispatch, so concurrent callers queue up
- * but never race. Dispatches hold the mutex through kernel execution and a
- * blocking readback: a wedged GPU hangs the calling thread (the promise is
- * that GPU calls never fail or change results, never that they cannot hang).
+ * serializes submission (table readiness, buffer growth, kernel and
+ * readback enqueues); the readback wait happens outside the lock against
+ * one of two rotating output slabs, so the next dispatch enqueues into the
+ * other slab while the previous one drains - concurrent callers overlap
+ * instead of queueing up, but never race. A wedged GPU hangs the calling
+ * thread (the promise is that GPU calls never fail or change results,
+ * never that they cannot hang).
  * Consumers that link this module need the dynamic loader
  * (-ldl on older glibc) and threads (-lpthread on older glibc).
  *
@@ -200,6 +203,31 @@ int gpuMapOverworldTerrainHeightRows(float *y, int *ids, const BiomeNoise *bn,
 int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
     int x4, int z4, int gridW, int gridH, int stepX4, int stepZ4,
     int mainFirst, int minMaxFirst, int truncated);
+
+/*
+ * Batch variant of gpuCfxOverviewHeights(): `n` independent lattices in ONE
+ * submission, so a wave of tiles pays one lock acquisition and one readback
+ * wait instead of n. Block i solves the lattice gpuCfxOverviewHeights()
+ * would for (x4[i], z4[i], gridW[i] x gridH[i], stepX4[i], stepZ4[i]) and
+ * writes gridW[i]*gridH[i] ints at heights[flatOffsets[i]]: heights is
+ * caller-provided flat storage, flatOffsets[i] is its int index for block i
+ * (non-overlapping; the caller owns the layout). The detail scalars are one
+ * set shared by every block. n must not exceed 32 (*failMask is an int
+ * bitmask) and the sum of gridW[i]*gridH[i] is capped like the single
+ * entry. Returns 0 when the batch was attempted: blocks whose enqueue
+ * failed host-side carry bit i in *failMask, their output range is left
+ * untouched and the rest is filled bit-exactly, so the caller CPU-repairs
+ * exactly those blocks. Nonzero means the whole batch was refused before
+ * any GPU work or output write (bad arguments incl. the caps, disabled/
+ * dead engine, no fp64 device), *failMask is untouched, and the caller
+ * falls back per block. Bit-exact against dispatching the same blocks
+ * one by one.
+ */
+int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
+    const long *flatOffsets, const BiomeNoise *bn, const int *x4,
+    const int *z4, const int *gridW, const int *gridH, const int *stepX4,
+    const int *stepZ4, int n, int mainFirst, int minMaxFirst,
+    int truncated);
 
 /*
  * The shim's cfxSurfaceBiomes() inner loop: for each point (blockX +
