@@ -274,9 +274,51 @@ int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
     const int *stride, const int *terrainY, int n);
 
 /*
- * Engine metrics: a fixed uint64 slot array accumulated by the two cfx
- * batch entries, snapshot by gpuQueryMetrics(). The layout is mirrored by
- * the mod's Java reader, so the slot indices below are API, not internals.
+ * Sparse-point form of gpuCfxOverviewHeights(): `n` arbitrary quart points
+ * (x4[i], z4[i]) - not a rectangular lattice - solved in ONE kernel launch
+ * and read back in ONE read, outY[i] receiving the point's height. The
+ * detail scalars are one set shared by every point of the chunk. There is
+ * no failMask: a sparse chunk is rejected whole-or-nothing, and rejection
+ * fires before ANY GPU work or caller-output write. Returns 0 when the GPU
+ * filled all n heights bit-exactly; nonzero means the whole chunk was
+ * refused and the caller runs the CPU path per point (NULL pointers, n
+ * outside [1, ~1M], detail scalars out of range - mainFirst 0..7,
+ * minMaxFirst 0..15, truncated 0/1 - a BiomeNoise not fully initialized by
+ * setBiomeSeed() or pre-1.18, mode off, disabled/dead engine, no fp64
+ * device, table-pack failure, slab-growth/allocation failure, or an
+ * enqueue failure). Bit-exact against the rect entry over the same points.
+ */
+int gpuCfxOverviewHeightsSparse(int *outY, const BiomeNoise *bn,
+    const int *x4, const int *z4, int n,
+    int mainFirst, int minMaxFirst, int truncated);
+
+/*
+ * Sparse-point form of gpuCfxSurfaceBiomes(): nCells cells, cell j covering
+ * edge*edge points spaced `stride` apart starting at (cellX[j], cellZ[j]),
+ * resolved in ONE kernel launch and read back in ONE read. The caller's
+ * output is one contiguous chunk-local span [0..nCells*edge*edge):
+ * outIds[cell*(edge*edge) + row*edge + col] resolves the point
+ * (cellX[cell] + col*stride, cellZ[cell] + row*stride), and terrainY packs
+ * the caller heights at the same flat index (clamped at 62 by the kernel,
+ * exactly like the shim). sha is shared by every point. Like the heights
+ * entry there is no failMask: rejection is whole-or-nothing and fires
+ * before ANY GPU work or output write. Returns 0 when the GPU filled all
+ * nCells*edge*edge ids bit-exactly; nonzero means the whole chunk was
+ * refused and the caller runs the CPU path per point (NULL pointers,
+ * edge/stride/nCells below 1, the points total over ~1M, a BiomeNoise not
+ * fully initialized by setBiomeSeed() or pre-1.18, mode off, disabled/
+ * dead engine, no fp64 device, table-pack failure, slab-growth/allocation
+ * failure, or an enqueue failure). Bit-exact against the rect entry over
+ * the same points.
+ */
+int gpuCfxSurfaceBiomesSparse(int *outIds, const BiomeNoise *bn, uint64_t sha,
+    const int *cellX, const int *cellZ,
+    const int *terrainY, int edge, int stride, int nCells);
+
+/*
+ * Engine metrics: a fixed uint64 slot array accumulated by the cfx batch
+ * and sparse entries, snapshot by gpuQueryMetrics(). The layout is mirrored
+ * by the mod's Java reader, so the slot indices below are API, not internals.
  * The plain counters (slots 1-8, 13) accumulate on every attempted batch;
  * the four event timers (slots 9-12) stay zero unless the process opts in
  * with CUBIOMES_GPU_PROFILING=1, which creates the OpenCL queue with
