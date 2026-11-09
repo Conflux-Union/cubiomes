@@ -3546,6 +3546,828 @@ static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
     free(terrainY);
 }
 
+//----------------------------------------------------------------------
+// Surface-columns point kernels (the col stage's exact GPU seam).
+
+/*
+ * Documented edge-path probes, each verified against
+ * mapOverworldSurfaceColumns() on MC_1_18 and MC_1_21_4 (values in the
+ * comments; found by a CPU scan over wide anchor grids). longPath anchors
+ * are columns whose fluid scan left y=62 without water, so the deep
+ * aquifer machinery (12-center search, floodedness/spread/barrier noises)
+ * runs; longpath-deep additionally descends ~106 blocks through the
+ * lava-capable aquifer zone (centers below y=-12 can carry the lava
+ * state). deepwater anchors found water below 62 (fluidY in the solid/
+ * fluid gap); deep anchors sit under carved surfaces; clamphigh anchors
+ * carry a noise-free crossing of 248 whose band start (cell 47) clamps at
+ * the search band's top (cell 39). Clamp-low (crossing below the band's
+ * bottom clamp) never appeared in the scans: the deepest observed crossing
+ * is -48 (band start cell 10), so that edge has no natural probe.
+ */
+typedef struct { uint64_t seed; int x, z; } ColProbe;
+
+static const ColProbe COL_PROBES[] =
+{
+    // seed 146008555
+    { 146008555ULL,        296,       16 },   // longPath: solid 61, no fluid
+    { 146008555ULL,    -131040,    98424 },   // deepwater: solid 48, fluid 53
+    { 146008555ULL,     65744,    -65184 },   // deep: solid -43, fluid 62
+    { 146008555ULL,  -4029392,  1579051 },   // clamphigh: solid 250, no fluid
+    // seed 12345678901234567
+    { 12345678901234567ULL,     8320,     8248 }, // longPath: solid 60, no fluid
+    { 12345678901234567ULL, 29000312, 29000144 }, // longPath deep: solid -43, no fluid
+    { 12345678901234567ULL,     8592,     8512 }, // deepwater: solid 36, fluid 53
+    { 12345678901234567ULL,  -524200,  -261936 }, // deep: solid -44, fluid 62
+    { 12345678901234567ULL, -3640038, -2716701 }, // clamphigh: solid 246, no fluid
+};
+#define COL_PROBE_CNT (int)(sizeof(COL_PROBES) / sizeof(COL_PROBES[0]))
+
+static int colProbeList(uint64_t seed, int *px, int *pz)
+{
+    int n = 0;
+    for (int i = 0; i < COL_PROBE_CNT; i++)
+    {
+        if (COL_PROBES[i].seed == seed)
+        {
+            px[n] = COL_PROBES[i].x;
+            pz[n] = COL_PROBES[i].z;
+            n++;
+        }
+    }
+    return n;
+}
+
+/* Anchor list for the col cases: a stride-8 grid at the origin,
+ * LCG-scattered points within +-4k blocks, then deliberate duplicates of
+ * earlier anchors in the tail. */
+static void colAnchorList(int *bx, int *bz, int ox, int oz, int n)
+{
+    const int grid = n < 64 ? n : 64;
+    uint32_t rng = 0xC0FFEEu ^ (uint32_t) (ox * 31 + oz * 17);
+    int emitted = 0;
+    for (; emitted < grid; emitted++)
+    {
+        bx[emitted] = ox + (emitted % 8) * 8;
+        bz[emitted] = oz + (emitted / 8) * 8;
+    }
+    const int dupFrom = n > 8 ? n - 8 : n;
+    for (; emitted < dupFrom; emitted++)
+    {
+        rng = rng * 1664525u + 1013904223u;
+        const int a = (int) (rng >> 8) % 8192 - 4096;
+        rng = rng * 1664525u + 1013904223u;
+        const int b = (int) (rng >> 8) % 8192 - 4096;
+        bx[emitted] = ox + a;
+        bz[emitted] = oz + b;
+    }
+    int src = 0;
+    for (; emitted < n; emitted++)
+    {
+        bx[emitted] = bx[src];
+        bz[emitted] = bz[src];
+        src += 7;
+    }
+}
+
+/* Plane-by-plane bit-exact comparison of a col dispatch against the CPU
+ * reference arrays; FAILs name the plane and the first differing anchor. */
+static int colComparePlanes(const char *what, int n,
+    const int *rSolid, const int *rFluid, const int *rSurface,
+    const int *rFlags, const int *gSolid, const int *gFluid,
+    const int *gSurface, const int *gFlags, int *fail)
+{
+    static const char *names[] = { "solidY", "fluidY", "surfaceY", "flags" };
+    const int *refs[4] = { rSolid, rFluid, rSurface, rFlags };
+    const int *gpus[4] = { gSolid, gFluid, gSurface, gFlags };
+    int bad = 0;
+    for (int plane = 0; plane < 4; plane++)
+    {
+        int mismatches = 0, first = -1;
+        for (int p = 0; p < n; p++)
+        {
+            if (refs[plane][p] != gpus[plane][p])
+            {
+                if (first < 0)
+                    first = p;
+                mismatches++;
+            }
+        }
+        if (mismatches)
+        {
+            printf("  FAIL: %s plane %s: %d/%d mismatches (first at %d:"
+                " ref %d gpu %d)\n", what, names[plane], mismatches, n,
+                first, refs[plane][first], gpus[plane][first]);
+            bad = 1;
+        }
+    }
+    if (bad)
+        *fail = 1;
+    return bad;
+}
+
+/*
+ * fp64 exact parity of the surface-columns point kernel against
+ * mapOverworldSurfaceColumns(): one whole-list dispatch plus the size
+ * boundaries 1/2/33, compared plane-by-plane bit-exactly. The list mixes
+ * a stride-8 grid, LCG-scattered points, deliberate duplicates and the
+ * documented edge-path probes for the case's seed. The back-to-back pass
+ * reseeds the generator between dispatches, so the per-seed aquifer hash
+ * arguments ride the same re-key path the packed tables do.
+ */
+static void runCfxColumnsParityCase(int mc, uint32_t flags, uint64_t seed,
+    int ox, int oz, long long *colPts, int *fail)
+{
+    printf("cfx surface columns mc=%d seed=%llu origin=(%d,%d)\n",
+        mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    if (g.bn.nptype >= 0)
+    {
+        fprintf(stderr, "gpu-test: generator for mc %d not initialized\n", mc);
+        exit(2);
+    }
+
+    enum { BASE_N = 357, MAXN = 384 };
+
+    int *bx = malloc(sizeof(int) * (size_t) MAXN);
+    int *bz = malloc(sizeof(int) * (size_t) MAXN);
+    int *rSolid = malloc(sizeof(int) * (size_t) MAXN);
+    int *rFluid = malloc(sizeof(int) * (size_t) MAXN);
+    int *rSurface = malloc(sizeof(int) * (size_t) MAXN);
+    int *rFlags = malloc(sizeof(int) * (size_t) MAXN);
+    int *gSolid = malloc(sizeof(int) * (size_t) MAXN);
+    int *gFluid = malloc(sizeof(int) * (size_t) MAXN);
+    int *gSurface = malloc(sizeof(int) * (size_t) MAXN);
+    int *gFlags = malloc(sizeof(int) * (size_t) MAXN);
+    if (!bx || !bz || !rSolid || !rFluid || !rSurface || !rFlags
+        || !gSolid || !gFluid || !gSurface || !gFlags)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    // whole list: CPU reference per anchor, then one dispatch
+    const int probeCnt = colProbeList(seed, bx + BASE_N, bz + BASE_N);
+    const int n = BASE_N + probeCnt;
+    colAnchorList(bx, bz, ox, oz, BASE_N);
+    colProbeList(seed, bx + BASE_N, bz + BASE_N);
+    for (int p = 0; p < n; p++)
+    {
+        if (mapOverworldSurfaceColumns(&rSolid[p], &rFluid[p], &rSurface[p],
+                &rFlags[p], &g, &g.bn.terrain, bx[p], bz[p], 1, 1, 1))
+        {
+            fprintf(stderr, "gpu-test: mapOverworldSurfaceColumns failed\n");
+            exit(2);
+        }
+    }
+    int rc = gpuCfxSurfaceColumnsPoints(gSolid, gFluid, gSurface, gFlags,
+        &g.bn, bx, bz, n);
+    if (rc != 0)
+    {
+        printf("  FAIL: surface columns whole list rejected (rc %d)\n", rc);
+        *fail = 1;
+    }
+    else
+    {
+        colComparePlanes("surface columns whole list", n,
+            rSolid, rFluid, rSurface, rFlags,
+            gSolid, gFluid, gSurface, gFlags, fail);
+        *colPts += n;
+    }
+
+    // size boundaries through the same reference values
+    static const int sizes[] = { 1, 2, 33 };
+    for (size_t si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++)
+    {
+        const int k = sizes[si];
+        rc = gpuCfxSurfaceColumnsPoints(gSolid, gFluid, gSurface, gFlags,
+            &g.bn, bx, bz, k);
+        if (rc != 0)
+        {
+            printf("  FAIL: surface columns size %d rejected (rc %d)\n", k,
+                rc);
+            *fail = 1;
+            continue;
+        }
+        colComparePlanes("surface columns size boundary", k,
+            rSolid, rFluid, rSurface, rFlags,
+            gSolid, gFluid, gSurface, gFlags, fail);
+        *colPts += k;
+    }
+
+    // back-to-back origins with a seed change: shifted grid, new seed,
+    // fresh reference, one dispatch - then the original seed again
+    for (int pass = 0; pass < 2; pass++)
+    {
+        const uint64_t s = pass ? seed ^ 0x9E3779B97F4A7C15ULL : seed;
+        applySeed(&g, DIM_OVERWORLD, s);
+        colAnchorList(bx, bz, ox + 65536, oz - 65536, BASE_N);
+        for (int p = 0; p < BASE_N; p++)
+        {
+            if (mapOverworldSurfaceColumns(&rSolid[p], &rFluid[p],
+                    &rSurface[p], &rFlags[p], &g, &g.bn.terrain, bx[p],
+                    bz[p], 1, 1, 1))
+            {
+                fprintf(stderr,
+                    "gpu-test: mapOverworldSurfaceColumns failed\n");
+                exit(2);
+            }
+        }
+        rc = gpuCfxSurfaceColumnsPoints(gSolid, gFluid, gSurface, gFlags,
+            &g.bn, bx, bz, BASE_N);
+        if (rc != 0)
+        {
+            printf("  FAIL: surface columns reseed pass %d rejected"
+                " (rc %d)\n", pass, rc);
+            *fail = 1;
+            continue;
+        }
+        colComparePlanes("surface columns reseed pass", BASE_N,
+            rSolid, rFluid, rSurface, rFlags,
+            gSolid, gFluid, gSurface, gFlags, fail);
+        *colPts += BASE_N;
+    }
+
+    free(bx);
+    free(bz);
+    free(rSolid);
+    free(rFluid);
+    free(rSurface);
+    free(rFlags);
+    free(gSolid);
+    free(gFluid);
+    free(gSurface);
+    free(gFlags);
+}
+
+/*
+ * Whole-chunk refusal contract of the col entries, fp64 and fp32: every
+ * rejection must fire before any lock, upload, enqueue or output write.
+ */
+static void runCfxColumnsRefusalCase(uint64_t seed, int *fail)
+{
+    printf("cfx surface columns refusals\n");
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    // gpu.c's GPU_MAX_POINTS dispatch cap (kept private there).
+    enum { CAP_POINTS = 1 << 20 };
+    const int one[1] = { 0 };
+    int canS = (int) 0x5A5A5A5A, canF = (int) 0x5A5A5A5A;
+    int canV = (int) 0x5A5A5A5A, canL = (int) 0x5A5A5A5A;
+    const struct
+    {
+        const char *what;
+        int *outSolidY, *outFluidY, *outSurfaceY, *outFlags;
+        const int *blockX, *blockZ;
+        int n;
+    } rejects[] =
+    {
+        { "n=0",              &canS, &canF, &canV, &canL, one,  one,  0 },
+        { "n over cap",       &canS, &canF, &canV, &canL, one,  one,
+          CAP_POINTS + 1 },
+        { "NULL outSolidY",   NULL,  &canF, &canV, &canL, one,  one,  1 },
+        { "NULL outFluidY",   &canS, NULL,  &canV, &canL, one,  one,  1 },
+        { "NULL outSurfaceY", &canS, &canF, NULL,  &canL, one,  one,  1 },
+        { "NULL outFlags",    &canS, &canF, &canV, NULL,  one,  one,  1 },
+        { "NULL blockX",      &canS, &canF, &canV, &canL, NULL, one,  1 },
+        { "NULL blockZ",      &canS, &canF, &canV, &canL, one,  NULL, 1 },
+    };
+    int bad = 0;
+    for (int twin = 0; twin < 2; twin++)
+    {
+        for (size_t i = 0; i < sizeof(rejects) / sizeof(rejects[0]); i++)
+        {
+            int rc = twin
+                ? gpuCfxSurfaceColumnsPointsFloat(rejects[i].outSolidY,
+                    rejects[i].outFluidY, rejects[i].outSurfaceY,
+                    rejects[i].outFlags, &g.bn, rejects[i].blockX,
+                    rejects[i].blockZ, rejects[i].n)
+                : gpuCfxSurfaceColumnsPoints(rejects[i].outSolidY,
+                    rejects[i].outFluidY, rejects[i].outSurfaceY,
+                    rejects[i].outFlags, &g.bn, rejects[i].blockX,
+                    rejects[i].blockZ, rejects[i].n);
+            if (rc == 0)
+            {
+                printf("  FAIL: surface columns %s accepted %s\n",
+                    twin ? "float" : "fp64", rejects[i].what);
+                bad = 1;
+            }
+            const int cans[4] = { canS, canF, canV, canL };
+            for (int p = 0; p < 4; p++)
+            {
+                if (cans[p] != (int) 0x5A5A5A5A)
+                {
+                    printf("  FAIL: surface columns %s %s wrote outputs"
+                        " before rejecting\n", twin ? "float" : "fp64",
+                        rejects[i].what);
+                    bad = 1;
+                    canS = canF = canV = canL = (int) 0x5A5A5A5A;
+                    break;
+                }
+            }
+        }
+    }
+    if (!bad)
+        printf("  surface columns refusal: n=0, over-cap and NULL"
+            " pointers rejected before any write (both twins)\n");
+    if (bad)
+        *fail = 1;
+}
+
+/*
+ * fp32 shape invariance of the float column twin: whole-chunk vs split
+ * dispatches must produce identical arrays within the float build,
+ * duplicate anchors must resolve identically inside one dispatch, and the
+ * invariance must hold at negative and far-field origins too.
+ */
+static void runCfxColumnsFloatShapeCase(uint64_t seed, long long *colPts,
+    int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    enum { N = 257 };
+    static const int origins[][2] =
+    {
+        {      0,       0},
+        {   -48,     -48},
+        { 1000000, 1000000},
+        {-29000000, -29000000},
+    };
+    int *bx = malloc(sizeof(int) * (size_t) N);
+    int *bz = malloc(sizeof(int) * (size_t) N);
+    int *wSolid = malloc(sizeof(int) * (size_t) N);
+    int *wFluid = malloc(sizeof(int) * (size_t) N);
+    int *wSurface = malloc(sizeof(int) * (size_t) N);
+    int *wFlags = malloc(sizeof(int) * (size_t) N);
+    int *pSolid = malloc(sizeof(int) * (size_t) N);
+    int *pFluid = malloc(sizeof(int) * (size_t) N);
+    int *pSurface = malloc(sizeof(int) * (size_t) N);
+    int *pFlags = malloc(sizeof(int) * (size_t) N);
+    if (!bx || !bz || !wSolid || !wFluid || !wSurface || !wFlags
+        || !pSolid || !pFluid || !pSurface || !pFlags)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    int bad = 0;
+    for (size_t oi = 0; oi < sizeof(origins) / sizeof(origins[0]); oi++)
+    {
+        const int ox = origins[oi][0], oz = origins[oi][1];
+        colAnchorList(bx, bz, ox, oz, N);
+        if (gpuCfxSurfaceColumnsPointsFloat(wSolid, wFluid, wSurface, wFlags,
+                &g.bn, bx, bz, N) != 0)
+        {
+            printf("  FAIL: float columns whole chunk rejected at (%d,%d)\n",
+                ox, oz);
+            bad = 1;
+            continue;
+        }
+        // split: three chunk dispatches covering [0..100), [100..200),
+        // [200..N) - the union must equal the whole-chunk arrays
+        static const int splits[] = { 0, 100, 200, N };
+        for (int si = 0; si < 3; si++)
+        {
+            const int off = splits[si];
+            const int len = splits[si + 1] - off;
+            if (gpuCfxSurfaceColumnsPointsFloat(pSolid + off, pFluid + off,
+                    pSurface + off, pFlags + off, &g.bn, bx + off, bz + off,
+                    len) != 0)
+            {
+                printf("  FAIL: float columns split chunk rejected at"
+                    " (%d,%d) off %d\n", ox, oz, off);
+                bad = 1;
+            }
+        }
+        if (memcmp(wSolid, pSolid, sizeof(int) * (size_t) N)
+            || memcmp(wFluid, pFluid, sizeof(int) * (size_t) N)
+            || memcmp(wSurface, pSurface, sizeof(int) * (size_t) N)
+            || memcmp(wFlags, pFlags, sizeof(int) * (size_t) N))
+        {
+            printf("  FAIL: float columns split != whole at (%d,%d)\n",
+                ox, oz);
+            bad = 1;
+        }
+        // duplicate anchors resolve identically inside one dispatch
+        for (int p = N - 8; p < N; p++)
+        {
+            const int src = (p - (N - 8)) * 7;
+            if (wSolid[p] != wSolid[src] || wFluid[p] != wFluid[src]
+                || wSurface[p] != wSurface[src] || wFlags[p] != wFlags[src])
+            {
+                printf("  FAIL: float columns duplicate anchor %d (of %d)"
+                    " diverged at (%d,%d)\n", p, src, ox, oz);
+                bad = 1;
+                break;
+            }
+        }
+        if (!bad)
+            *colPts += N;
+    }
+    if (!bad)
+        printf("  float columns shape invariance: split == whole,"
+            " duplicates consistent over 4 origins\n");
+    if (bad)
+        *fail = 1;
+    free(bx);
+    free(bz);
+    free(wSolid);
+    free(wFluid);
+    free(wSurface);
+    free(wFlags);
+    free(pSolid);
+    free(pFluid);
+    free(pSurface);
+    free(pFlags);
+}
+
+// Drift accumulators of the fp32 col planes, per distance bucket; printed
+// by colDriftSummary() after the drift cases.
+static long long colDriftFlagsMismatch[BK_CNT];
+static long long colDriftFlagsPts[BK_CNT];
+static int colDriftDYMax[BK_CNT];
+static long long colDriftDYHist[BK_CNT][7];
+
+/*
+ * fp32 drift print of the col planes: categorical mismatch rate on flags
+ * and the solidY dY distribution, per case. The cave-mouth probes are
+ * documented regions whose CPU columns show carved surface
+ * discontinuities (the known gate-breaking class: fp32 drift near the
+ * density-zero boundary can pick a different carved block), and the world
+ * border rides the same coordinate-quantization regime as the pre-existing
+ * float overview kernels (whose border budgets already accept ~77-block
+ * deltas). Those cases PRINT ONLY; the near and 1M-class buckets carry the
+ * Phase 5 smoke bounds (2% categorical, |dY| <= 8) - the printed numbers
+ * feed the budget decision.
+ */
+static void runCfxColumnsFloatDriftCase(int mc, uint32_t flags, uint64_t seed,
+    int ox, int oz, int assertBounds, long long *colPts, int *fail)
+{
+    printf("cfx float columns drift mc=%d seed=%llu origin=(%d,%d)\n",
+        mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    if (g.bn.nptype >= 0)
+    {
+        fprintf(stderr, "gpu-test: generator for mc %d not initialized\n", mc);
+        exit(2);
+    }
+
+    enum { SIDE = 48, STRIDE = 8 };
+    const int n = SIDE * SIDE;
+    int *bx = malloc(sizeof(int) * (size_t) n);
+    int *bz = malloc(sizeof(int) * (size_t) n);
+    int *rSolid = malloc(sizeof(int) * (size_t) n);
+    int *rFluid = malloc(sizeof(int) * (size_t) n);
+    int *rSurface = malloc(sizeof(int) * (size_t) n);
+    int *rFlags = malloc(sizeof(int) * (size_t) n);
+    int *gSolid = malloc(sizeof(int) * (size_t) n);
+    int *gFluid = malloc(sizeof(int) * (size_t) n);
+    int *gSurface = malloc(sizeof(int) * (size_t) n);
+    int *gFlags = malloc(sizeof(int) * (size_t) n);
+    if (!bx || !bz || !rSolid || !rFluid || !rSurface || !rFlags
+        || !gSolid || !gFluid || !gSurface || !gFlags)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+    for (int p = 0; p < n; p++)
+    {
+        bx[p] = ox + (p % SIDE) * STRIDE;
+        bz[p] = oz + (p / SIDE) * STRIDE;
+    }
+    for (int p = 0; p < n; p++)
+    {
+        if (mapOverworldSurfaceColumns(&rSolid[p], &rFluid[p], &rSurface[p],
+                &rFlags[p], &g, &g.bn.terrain, bx[p], bz[p], 1, 1, 1))
+        {
+            fprintf(stderr, "gpu-test: mapOverworldSurfaceColumns failed\n");
+            exit(2);
+        }
+    }
+    if (gpuCfxSurfaceColumnsPointsFloat(gSolid, gFluid, gSurface, gFlags,
+            &g.bn, bx, bz, n) != 0)
+    {
+        printf("  FAIL: float columns drift dispatch rejected\n");
+        *fail = 1;
+        free(bx); free(bz);
+        free(rSolid); free(rFluid); free(rSurface); free(rFlags);
+        free(gSolid); free(gFluid); free(gSurface); free(gFlags);
+        return;
+    }
+
+    long long flagsMismatch = 0;
+    int dyMax = 0;
+    long long hist[7] = { 0 }; // |dY| = 0, 1, 2, 3-4, 5-8, 9-16, >16
+    for (int p = 0; p < n; p++)
+    {
+        if (rFlags[p] != gFlags[p])
+            flagsMismatch++;
+        const int dy = gSolid[p] > rSolid[p] ? gSolid[p] - rSolid[p]
+            : rSolid[p] - gSolid[p];
+        if (dy > dyMax)
+            dyMax = dy;
+        hist[dy == 0 ? 0 : dy == 1 ? 1 : dy == 2 ? 2 : dy <= 4 ? 3
+            : dy <= 8 ? 4 : dy <= 16 ? 5 : 6]++;
+    }
+    const int bucket = bucketOf(ox, oz);
+    colDriftFlagsMismatch[bucket] += flagsMismatch;
+    colDriftFlagsPts[bucket] += n;
+    if (dyMax > colDriftDYMax[bucket])
+        colDriftDYMax[bucket] = dyMax;
+    for (int i = 0; i < 7; i++)
+        colDriftDYHist[bucket][i] += hist[i];
+
+    printf("  float columns drift: flags %lld/%lld (%.4f%%), max |dY| %d |"
+        " dY 0 %lld, 1 %lld, 2 %lld, 3-4 %lld, 5-8 %lld, 9-16 %lld,"
+        " >16 %lld\n", flagsMismatch, (long long) n,
+        100.0 * (double) flagsMismatch / (double) n, dyMax, hist[0],
+        hist[1], hist[2], hist[3], hist[4], hist[5], hist[6]);
+
+    const double flagsRate = (double) flagsMismatch / (double) n;
+    if (assertBounds && flagsRate >= 0.02)
+    {
+        printf("  FAIL: float columns flag mismatch %.4f%% >= 2.0%% smoke"
+            " bound\n", 100.0 * flagsRate);
+        *fail = 1;
+    }
+    if (assertBounds && dyMax > 8)
+    {
+        printf("  FAIL: float columns max |dY| %d > 8 smoke bound\n", dyMax);
+        *fail = 1;
+    }
+    if (!assertBounds)
+        printf("  (print-only case: no smoke bound asserted)\n");
+    *colPts += n;
+    free(bx);
+    free(bz);
+    free(rSolid);
+    free(rFluid);
+    free(rSurface);
+    free(rFlags);
+    free(gSolid);
+    free(gFluid);
+    free(gSurface);
+    free(gFlags);
+}
+
+static void colDriftSummary(void)
+{
+    printf("col float drift by bucket:\n");
+    for (int b = 0; b < BK_CNT; b++)
+    {
+        printf("  %s: flags %lld/%lld (%.4f%%), max |dY| %d | dY 0 %lld,"
+            " 1 %lld, 2 %lld, 3-4 %lld, 5-8 %lld, 9-16 %lld, >16 %lld\n",
+            bucketNames[b], colDriftFlagsMismatch[b], colDriftFlagsPts[b],
+            colDriftFlagsPts[b]
+                ? 100.0 * (double) colDriftFlagsMismatch[b]
+                    / (double) colDriftFlagsPts[b] : 0.0,
+            colDriftDYMax[b], colDriftDYHist[b][0], colDriftDYHist[b][1],
+            colDriftDYHist[b][2], colDriftDYHist[b][3], colDriftDYHist[b][4],
+            colDriftDYHist[b][5], colDriftDYHist[b][6]);
+    }
+}
+
+/*
+ * Per-anchor timing sweep of the col kernels: ns/anchor (dispatch +
+ * readback wall) per probe class for both builds - the Task B projection
+ * input. Class anchors come from documented regions; inland/farfield
+ * filter their candidate grid through the CPU reference (solidY > 62), so
+ * the sweep also re-verifies the fp64 build bit-exactly once per class.
+ */
+static void runCfxColumnsTimingCase(long long *colPts, int *fail)
+{
+    printf("col timing sweep (ns/anchor, dispatch+readback wall)\n");
+    fflush(stdout);
+    static const struct
+    {
+        const char *name;
+        uint64_t seed;
+        int ox, oz;
+        int classify; // 1: keep only CPU solidY > 62 candidates
+    } classes[] =
+    {
+        { "inland",   146008555ULL,          0,       0, 1 },
+        { "ocean",    42ULL,           -800000,  800000, 0 },
+        { "cave",     12345678901234567ULL, 800280, -799780, 0 },
+        { "farfield", 146008555ULL,   29000000, 29000000, 1 },
+    };
+    enum { N = 256, CAND = 1024, MIN_N = 128 };
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+
+    int *bx = malloc(sizeof(int) * (size_t) CAND);
+    int *bz = malloc(sizeof(int) * (size_t) CAND);
+    int *ax = malloc(sizeof(int) * (size_t) N);
+    int *az = malloc(sizeof(int) * (size_t) N);
+    int *rSolid = malloc(sizeof(int) * (size_t) N);
+    int *rFluid = malloc(sizeof(int) * (size_t) N);
+    int *rSurface = malloc(sizeof(int) * (size_t) N);
+    int *rFlags = malloc(sizeof(int) * (size_t) N);
+    int *gSolid = malloc(sizeof(int) * (size_t) N);
+    int *gFluid = malloc(sizeof(int) * (size_t) N);
+    int *gSurface = malloc(sizeof(int) * (size_t) N);
+    int *gFlags = malloc(sizeof(int) * (size_t) N);
+    if (!bx || !bz || !ax || !az || !rSolid || !rFluid || !rSurface
+        || !rFlags || !gSolid || !gFluid || !gSurface || !gFlags)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    for (size_t ci = 0; ci < sizeof(classes) / sizeof(classes[0]); ci++)
+    {
+        applySeed(&g, DIM_OVERWORLD, classes[ci].seed);
+        int n = 0;
+        for (int c = 0; c < CAND && n < N; c++)
+        {
+            const int x = classes[ci].ox + (c % 32) * 8;
+            const int z = classes[ci].oz + (c / 32) * 8;
+            int s, f, sv, fl;
+            if (mapOverworldSurfaceColumns(&s, &f, &sv, &fl, &g,
+                    &g.bn.terrain, x, z, 1, 1, 1))
+            {
+                fprintf(stderr,
+                    "gpu-test: mapOverworldSurfaceColumns failed\n");
+                exit(2);
+            }
+            if (classes[ci].classify && s <= 62)
+                continue;
+            ax[n] = x;
+            az[n] = z;
+            rSolid[n] = s;
+            rFluid[n] = f;
+            rSurface[n] = sv;
+            rFlags[n] = fl;
+            n++;
+        }
+        if (n < MIN_N)
+        {
+            printf("  FAIL: timing class %s gathered only %d anchors\n",
+                classes[ci].name, n);
+            *fail = 1;
+            continue;
+        }
+        // warmup + one bit-exact check per build family
+        if (gpuCfxSurfaceColumnsPoints(gSolid, gFluid, gSurface, gFlags,
+                &g.bn, ax, az, n) != 0)
+        {
+            printf("  FAIL: timing class %s fp64 dispatch refused\n",
+                classes[ci].name);
+            *fail = 1;
+            continue;
+        }
+        colComparePlanes("timing fp64", n, rSolid, rFluid, rSurface, rFlags,
+            gSolid, gFluid, gSurface, gFlags, fail);
+        if (gpuCfxSurfaceColumnsPointsFloat(gSolid, gFluid, gSurface, gFlags,
+                &g.bn, ax, az, n) != 0)
+        {
+            printf("  FAIL: timing class %s fp32 dispatch refused\n",
+                classes[ci].name);
+            *fail = 1;
+            continue;
+        }
+
+        const int passes = 8;
+        double wall[2] = { 0, 0 };
+        for (int build = 0; build < 2; build++)
+        {
+            const double t0 = nowSeconds();
+            for (int i = 0; i < passes; i++)
+            {
+                const int rc = build
+                    ? gpuCfxSurfaceColumnsPointsFloat(gSolid, gFluid,
+                        gSurface, gFlags, &g.bn, ax, az, n)
+                    : gpuCfxSurfaceColumnsPoints(gSolid, gFluid, gSurface,
+                        gFlags, &g.bn, ax, az, n);
+                if (rc != 0)
+                {
+                    printf("  FAIL: timing class %s build %d dispatch"
+                        " refused mid-sweep\n", classes[ci].name, build);
+                    *fail = 1;
+                    break;
+                }
+            }
+            wall[build] = nowSeconds() - t0;
+        }
+        printf("  %-9s n=%d fp64 %9.0f ns/anchor fp32 %9.0f ns/anchor\n",
+            classes[ci].name, n, wall[0] * 1e9 / (passes * (double) n),
+            wall[1] * 1e9 / (passes * (double) n));
+        *colPts += n;
+    }
+    free(bx);
+    free(bz);
+    free(ax);
+    free(az);
+    free(rSolid);
+    free(rFluid);
+    free(rSurface);
+    free(rFlags);
+    free(gSolid);
+    free(gFluid);
+    free(gSurface);
+    free(gFlags);
+}
+
+/*
+ * Metrics deltas of the two col entries: each dispatch adds two
+ * coordinate writes, one kernel launch, one readback, one member and its
+ * anchor total to the histograms, exactly like the other sparse entries.
+ */
+static void runCfxColumnsMetricsCase(uint64_t seed, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    enum { N = 33 };
+    int bx[N], bz[N];
+    for (int p = 0; p < N; p++)
+    {
+        bx[p] = (p % 8) * 8;
+        bz[p] = (p / 8) * 8;
+    }
+    int *oSolid = malloc(sizeof(int) * (size_t) N);
+    int *oFluid = malloc(sizeof(int) * (size_t) N);
+    int *oSurface = malloc(sizeof(int) * (size_t) N);
+    int *oFlags = malloc(sizeof(int) * (size_t) N);
+    if (!oSolid || !oFluid || !oSurface || !oFlags)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+    int pointSlot = 0;
+    while (pointSlot < 20 && (1LL << pointSlot) < N)
+        pointSlot++;
+
+    for (int twin = 0; twin < 2; twin++)
+    {
+        uint64_t before[GPU_METRICS_SLOTS], after[GPU_METRICS_SLOTS];
+        gpuQueryMetrics(before);
+        const int rc = twin
+            ? gpuCfxSurfaceColumnsPointsFloat(oSolid, oFluid, oSurface,
+                oFlags, &g.bn, bx, bz, N)
+            : gpuCfxSurfaceColumnsPoints(oSolid, oFluid, oSurface, oFlags,
+                &g.bn, bx, bz, N);
+        gpuQueryMetrics(after);
+        if (rc != 0)
+        {
+            printf("  FAIL: surface columns %s metrics dispatch refused"
+                " (rc %d)\n", twin ? "float" : "fp64", rc);
+            *fail = 1;
+            continue;
+        }
+        const MetricsPin pins[] =
+        {
+            { GPU_METRICS_BATCH_MEMBERS, 1, "columns batch members" },
+            { GPU_METRICS_BATCH_POINTS, N, "columns batch points" },
+            { GPU_METRICS_KERNEL_LAUNCHES, 1, "columns kernel launches" },
+            { GPU_METRICS_D2H_READS, 1, "columns d2h reads" },
+            { GPU_METRICS_H2D_WRITES, 2, "columns h2d writes" },
+            { GPU_METRICS_MEMBER_HIST + 1, 1, "columns member histogram" },
+            { GPU_METRICS_POINT_HIST + pointSlot, 1,
+                "columns point histogram" },
+        };
+        int bad = checkMetricsPins(before, after, pins,
+            (int)(sizeof(pins) / sizeof(pins[0])));
+        if (after[GPU_METRICS_HOST_WAIT_NANOS]
+            == before[GPU_METRICS_HOST_WAIT_NANOS])
+        {
+            printf("  FAIL: columns %s host wait timer did not advance\n",
+                twin ? "float" : "fp64");
+            bad = 1;
+        }
+        if (after[GPU_METRICS_HOST_SUBMIT_NANOS]
+            == before[GPU_METRICS_HOST_SUBMIT_NANOS])
+        {
+            printf("  FAIL: columns %s host submit timer did not advance\n",
+                twin ? "float" : "fp64");
+            bad = 1;
+        }
+        if (bad)
+            *fail = 1;
+        else
+            printf("  metrics: surface columns %s dispatch moved exactly as"
+                " pinned\n", twin ? "float" : "fp64");
+    }
+    free(oSolid);
+    free(oFluid);
+    free(oSurface);
+    free(oFlags);
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -3857,6 +4679,47 @@ int main(int argc, char **argv)
         runCfxSparseFloatDriftCase(mainMc, 0, seeds[0], -7500000, -7500000,
             &total, &fail);
     }
+    // Surface-columns point kernels: the col stage's exact seam. The fp64
+    // entry must match mapOverworldSurfaceColumns() plane by plane
+    // bit-exactly; the fp32 twin pins shape invariance and prints drift.
+    // These sections keep their own point counter so the pre-existing
+    // sections' accounting - and the BUDGET OK total - stays comparable
+    // run over run.
+    long long colPts = 0;
+    runCfxColumnsParityCase(mainMc, 0, seeds[0], 0, 0, &colPts, &fail);
+    runCfxColumnsParityCase(mainMc, 0, seeds[0], 1000000, 1000000, &colPts,
+        &fail);
+    runCfxColumnsParityCase(mainMc, 0, seeds[0], -48, -48, &colPts, &fail);
+    runCfxColumnsParityCase(MC_1_18, 0, seeds[0], 0, 0, &colPts, &fail);
+    runCfxColumnsParityCase(mainMc, 0, seeds[1], 0, 0, &colPts, &fail);
+    if (full)
+    {
+        runCfxColumnsParityCase(mainMc, 0, seeds[0], 7500000, 7500000,
+            &colPts, &fail);
+        runCfxColumnsParityCase(MC_26_3, 0, seeds[0], 1000000, 1000000,
+            &colPts, &fail);
+    }
+    runCfxColumnsRefusalCase(seeds[0], &fail);
+    runCfxColumnsFloatShapeCase(seeds[0], &colPts, &fail);
+    runCfxColumnsFloatDriftCase(mainMc, 0, seeds[0], 0, 0, 1, &colPts, &fail);
+    runCfxColumnsFloatDriftCase(mainMc, 0, seeds[0], 1000000, 1000000, 1,
+        &colPts, &fail);
+    // world border and the two cave-mouth-heavy probes (documented regions
+    // with worst adjacent-anchor |dY| jumps 112 of the probe scan) print
+    // without the smoke bounds: the border rides the pre-existing
+    // coordinate-quantization regime, and carved discontinuities are the
+    // documented gate-breaking class - the numbers feed the budget call
+    runCfxColumnsFloatDriftCase(mainMc, 0, seeds[0], 29900000, 29900000, 0,
+        &colPts, &fail);
+    runCfxColumnsFloatDriftCase(mainMc, 0, 12345678901234567ULL, 800280,
+        -799780, 0, &colPts, &fail);
+    runCfxColumnsFloatDriftCase(mainMc, 0, 12345678901234567ULL, 29000280,
+        29000120, 0, &colPts, &fail);
+    colDriftSummary();
+    runCfxColumnsTimingCase(&colPts, &fail);
+    runCfxColumnsMetricsCase(seeds[0], &fail);
+    printf("col sections: %lld anchor comparisons\n\n", colPts);
+
     runCfxMetricsCase(seeds[0], &total, &fail);
     runCfxModeCase(seeds[0], &total, &fail);
 

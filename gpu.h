@@ -367,6 +367,49 @@ int gpuCfxSurfaceBiomesSparseFloat(int *outIds, const BiomeNoise *bn,
     const int *terrainY, int edge, int stride, int nCells);
 
 /*
+ * The mod's cfxSurfaceColumns() point seam (the exact-columns stage): n
+ * anchors, anchor i at block coords (blockX[i], blockZ[i]), all solved in
+ * ONE kernel launch and read back in ONE read. The four output planes
+ * receive exactly what mapOverworldSurfaceColumns() fills for the same
+ * anchor on MC 1.18+: outSolidY[i] the first solid block of the column's
+ * banded surface search, outFluidY[i] the aquifer fluid surface (the
+ * INT32_MIN sentinel when no fluid stands above it), outSurfaceY[i] the
+ * fluid surface when it stands above the solid one and the solid surface
+ * otherwise, and outFlags[i] SURFACE_COLUMN_FLUID iff the fluid surface
+ * won - the same whole-or-nothing post-pass the CPU entry applies, so the
+ * caller fills its arrays from this dispatch alone. The kernel re-runs the
+ * CPU's double chains op-for-op (terrain splines, cave/noodle carving, the
+ * banded surface search, and the full aquifer stack over the packed AN_*
+ * noises and the per-seed aquifer hash seeds passed as runtime arguments)
+ * and is bit-exact against the CPU path; like the other cfx entries it
+ * needs an fp64 device. There is no failMask: a sparse chunk is rejected
+ * whole-or-nothing, and rejection fires before ANY GPU work or caller-
+ * output write. Returns 0 when the GPU filled all four planes for every
+ * anchor bit-exactly; nonzero means the whole chunk was refused and the
+ * caller runs the CPU path per anchor (NULL pointers, n outside [1, ~1M],
+ * a BiomeNoise not fully initialized by setBiomeSeed() or pre-1.18, mode
+ * off, disabled/dead engine, no fp64 device, table-pack failure, slab/
+ * allocation failure, or an enqueue failure).
+ */
+int gpuCfxSurfaceColumnsPoints(int *outSolidY, int *outFluidY,
+    int *outSurfaceY, int *outFlags, const BiomeNoise *bn,
+    const int *blockX, const int *blockZ, int n);
+
+/*
+ * Float twin of gpuCfxSurfaceColumnsPoints(): the SAME anchor request, the
+ * same four output planes, the same whole-or-nothing refusal firing before
+ * ANY GPU work or output write, served by the float program's column
+ * kernel. The planes approximate the CPU reference coordinate-dependently
+ * (drift-budgeted, NOT bit-exact - the fp64 entry stays the exact
+ * reference); the plane semantics and the INT32_MIN fluid sentinel are
+ * exact. No fp64 device requirement; availability is independent of the
+ * fp64 side.
+ */
+int gpuCfxSurfaceColumnsPointsFloat(int *outSolidY, int *outFluidY,
+    int *outSurfaceY, int *outFlags, const BiomeNoise *bn,
+    const int *blockX, const int *blockZ, int n);
+
+/*
  * Engine metrics: a fixed uint64 slot array accumulated by the cfx batch
  * and sparse entries, snapshot by gpuQueryMetrics(). The layout is mirrored
  * by the mod's Java reader, so the slot indices below are API, not internals.

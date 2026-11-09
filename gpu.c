@@ -55,8 +55,14 @@ _Static_assert(TN_SPAGHETTI_3D_RARITY == 0 && TN_SPAGHETTI_3D_THICKNESS == 1
     "kernel terrain noise indices");
 _Static_assert(SP_CONTINENTALNESS == 0 && SP_EROSION == 1
     && SP_RIDGES == 2 && SP_WEIRDNESS == 3, "kernel spline parameter ids");
+_Static_assert(AN_BARRIER == 0 && AN_FLOODEDNESS == 1 && AN_SPREAD == 2
+    && AN_LAVA == 3 && AN_MAX == 4, "kernel aquifer noise instance ids");
+_Static_assert(SURFACE_COLUMN_FLUID == 0x1, "kernel surface column flag");
 
-#define GPU_INST_COUNT (NP_MAX + 1 + TN_MAX)
+// Climate + jagged + terrain-noise + aquifer double-perlin instances; the
+// aquifer block rides last (kernel ids 27..30) so every offset the older
+// kernels' arguments carry stays stable.
+#define GPU_INST_COUNT (NP_MAX + 1 + TN_MAX + AN_MAX)
 // Dispatch size cap: ~1M points keeps one output slab bounded (~59 MB worst
 // case with the climate-np plane; two rotating slabs ~120 MB); larger
 // queries take the CPU fallback and stay correct.
@@ -123,6 +129,7 @@ typedef struct
     cl_mem outYi;  // cfx int height output
     cl_mem inX, inZ;   // cfx sparse height coords
     cl_mem inCX, inCZ; // cfx sparse biome cell origins
+    cl_mem outCol;     // cfx surface columns, 4 ints interleaved per anchor
     int cap;       // points all nine buffers are sized for
 } GpuSlab;
 
@@ -146,10 +153,12 @@ typedef struct
     cl_kernel kHeight;  // terrainHeightKernel, created from the built program
     cl_kernel kCfxHeight, kCfxBiome;  // cfxOverviewHeightKernel, cfxBiomeAtYKernel
     cl_kernel kCfxHeightPoints, kCfxBiomePoints;  // their sparse twins
+    cl_kernel kCfxColPoints;  // cfxSurfaceColumnsPointsKernel
     cl_kernel kCfxHeightPointsF, kCfxBiomePointsF;  // sparse twins in fp32
-    int cfxAvail;       // fp64 program built + all four cfx kernels live
+    cl_kernel kCfxColPointsF;  // the columns twin in fp32
+    int cfxAvail;       // fp64 program built + all five cfx kernels live
     int cfxInited;      // the one lazy cfx build attempt has been made
-    int cfxFloatAvail;  // float program built + both sparse float kernels live
+    int cfxFloatAvail;  // float program built + all three float kernels live
     int cfxFloatInited; // the one lazy float cfx build attempt has been made
     size_t localSize;
     GpuTables tables;
@@ -284,6 +293,8 @@ static void gpuReleaseSlab(GpuEngine *e, GpuSlab *slab)
         e->cl.fn.ReleaseMemObject(slab->inCX);
     if (slab->inCZ)
         e->cl.fn.ReleaseMemObject(slab->inCZ);
+    if (slab->outCol)
+        e->cl.fn.ReleaseMemObject(slab->outCol);
     memset(slab, 0, sizeof(*slab));
 }
 
@@ -525,15 +536,18 @@ static int gpuEnsureCfxLocked(GpuEngine *e)
         "cfxOverviewHeightPointsKernel");
     e->kCfxBiomePoints = gpuKernelFromProgram(e, e->cfxProgram,
         "cfxBiomeAtYPointsKernel");
+    e->kCfxColPoints = gpuKernelFromProgram(e, e->cfxProgram,
+        "cfxSurfaceColumnsPointsKernel");
     e->cfxAvail = e->kCfxHeight && e->kCfxBiome
-        && e->kCfxHeightPoints && e->kCfxBiomePoints;
+        && e->kCfxHeightPoints && e->kCfxBiomePoints && e->kCfxColPoints;
     if (!e->cfxAvail)
         return 0;
 
     // Fold the new kernels into the workgroup minimum.
     cl_kernel all[] =
     {
-        e->kCfxHeight, e->kCfxBiome, e->kCfxHeightPoints, e->kCfxBiomePoints
+        e->kCfxHeight, e->kCfxBiome, e->kCfxHeightPoints, e->kCfxBiomePoints,
+        e->kCfxColPoints
     };
     for (int i = 0; i < (int)(sizeof(all) / sizeof(*all)); i++)
     {
@@ -570,12 +584,18 @@ static int gpuEnsureCfxFloatLocked(GpuEngine *e)
         "cfxOverviewHeightPointsKernel");
     e->kCfxBiomePointsF = gpuKernelFromProgram(e, e->cfxFloatProgram,
         "cfxBiomeAtYPointsKernel");
-    e->cfxFloatAvail = e->kCfxHeightPointsF && e->kCfxBiomePointsF;
+    e->kCfxColPointsF = gpuKernelFromProgram(e, e->cfxFloatProgram,
+        "cfxSurfaceColumnsPointsKernel");
+    e->cfxFloatAvail = e->kCfxHeightPointsF && e->kCfxBiomePointsF
+        && e->kCfxColPointsF;
     if (!e->cfxFloatAvail)
         return 0;
 
     // Fold the new kernels into the workgroup minimum.
-    cl_kernel all[] = { e->kCfxHeightPointsF, e->kCfxBiomePointsF };
+    cl_kernel all[] =
+    {
+        e->kCfxHeightPointsF, e->kCfxBiomePointsF, e->kCfxColPointsF
+    };
     for (int i = 0; i < (int)(sizeof(all) / sizeof(*all)); i++)
     {
         size_t wgi = 0;
@@ -859,6 +879,8 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     cap += bn->jagged.octA.octcnt + bn->jagged.octB.octcnt;
     for (int i = 0; i < TN_MAX; i++)
         cap += bn->terrainNoise[i].octA.octcnt + bn->terrainNoise[i].octB.octcnt;
+    for (int i = 0; i < AN_MAX; i++)
+        cap += bn->aquiferNoise[i].octA.octcnt + bn->aquiferNoise[i].octB.octcnt;
     cap += bn->terrain.octmin.octcnt + bn->terrain.octmax.octcnt
         + bn->terrain.octmain.octcnt;
     if (cap <= 0 || cap > (1 << 16))
@@ -902,6 +924,13 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     t->octMainOff = cursor;
     for (int i = 0; i < bn->terrain.octmain.octcnt; i++)
         packPerlin(t, &bn->terrain.octmain.octaves[i], cursor++);
+
+    // The aquifer noises append after every existing instance AND after the
+    // terrain octaves, so all offsets the older kernels' arguments carry
+    // (instance noff entries and octMin/octMax/octMain) stay stable.
+    for (int i = 0; i < AN_MAX; i++, inst++)
+        if (packDoublePerlin(t, &bn->aquiferNoise[i], inst, &cursor, cap))
+            return 1;
     t->octTotal = cursor;
 
     // The fp32 cfx kernels read float mirrors of the double tables: the
@@ -1171,7 +1200,10 @@ static int gpuEnsureOutLocked(GpuEngine *e, GpuSlab *slab, int points)
     if (slab->inCX)
         slab->inCZ = gpuBuf(e, CL_MEM_READ_ONLY,
             sizeof(int) * (size_t)points, NULL);
-    if (!slab->inCZ)
+    if (slab->inCZ)
+        slab->outCol = gpuBuf(e, CL_MEM_READ_WRITE,
+            sizeof(int) * (size_t)points * 4, NULL);
+    if (!slab->outCol)
         return 1;
     slab->cap = points;
     return 0;
@@ -2791,6 +2823,202 @@ int gpuCfxSurfaceBiomesSparseFloat(int *outIds, const BiomeNoise *bn,
     }
     GPU_UNLOCK;
     return rc;
+}
+
+/*
+ * Shared body of the two surface-columns point entries (fp64 exact and
+ * fp32 drift-budgeted): n anchors, the coordinate buffers in, one kernel
+ * launch, one interleaved readback into a private staging buffer, then the
+ * plane de-interleave into the caller's four arrays. The staging keeps the
+ * readback at exactly one transfer (one D2H count per dispatch, like the
+ * other sparse entries) without forcing the caller's planes together; it
+ * is private to this dispatch, so no slab rotation can race the
+ * de-interleave. Whole-or-nothing: every refusal below fires before the
+ * first enqueue, and the caller's arrays are only touched after the
+ * readback drained successfully. The aquifer hash seeds travel as per-seed
+ * kernel arguments, read from the BiomeNoise at dispatch time - the pack
+ * cache deliberately stays (mc, probe), and a reseed re-uploads the seeds
+ * with the tables it already re-keys. Columns are height-plane outputs, so
+ * the family counter is the height one.
+ */
+static int gpuCfxColumnsDispatch(int *outSolidY, int *outFluidY,
+    int *outSurfaceY, int *outFlags, const BiomeNoise *bn,
+    const int *blockX, const int *blockZ, int n, int wantFloat)
+{
+    if (!outSolidY || !outFluidY || !outSurfaceY || !outFlags
+        || !bn || !blockX || !blockZ
+        || n < 1 || n > GPU_MAX_POINTS)
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+
+    // Metrics walls, same contract as the batch entries.
+    const uint64_t mutexT0 = nowNanos();
+    GPU_LOCK;
+    const uint64_t submitT0 = nowNanos();
+    g_gpu.metrics.slots[GPU_METRICS_MUTEX_WAIT_NANOS] += submitT0 - mutexT0;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init on purpose, same as the float paths.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    gpuEnsureRuntimeLocked(&g_gpu);
+    const int cfxReady = wantFloat
+        ? gpuEnsureCfxFloatLocked(&g_gpu) : gpuEnsureCfxLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead || !cfxReady)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu,
+                !g_gpu.clAvail || g_gpu.dead
+                    ? "no usable OpenCL device"
+                    : wantFloat
+                        ? "no float cfx kernel program"
+                        : "no fp64 OpenCL device for the cfx kernels");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, n))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    // Private staging for the interleaved readback: allocated before the
+    // first enqueue so an allocation failure is a plain whole-chunk
+    // refusal, and freed on every path below.
+    int *staging = malloc(sizeof(int) * (size_t) n * 4);
+    if (!staging)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = wantFloat ? g_gpu.kCfxColPointsF : g_gpu.kCfxColPoints;
+    cl_uint a = 0;
+    cl_int err = wantFloat
+        ? gpuSetCfxFloatTableArgsLocked(k, &a)
+        : gpuSetCfxTableArgsLocked(k, &a);
+    cl_ulong seedLoArg = bn->aquiferSeedLo;
+    cl_ulong seedHiArg = bn->aquiferSeedHi;
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &seedLoArg);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &seedHiArg);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inX);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inZ);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outCol);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &n);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        free(staging);
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    // Events are captured unconditionally (the rect entries only keep them
+    // under the profiling opt-in): the sparse drain tail needs handles to
+    // wait every enqueued command when a later enqueue fails.
+    cl_event ev[4] = { NULL, NULL, NULL, NULL };
+    cl_uint nEv = 0;
+    cl_uint nWrites = 0;
+    err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inX, CL_FALSE,
+        0, sizeof(int) * (size_t) n, blockX, 0, NULL, &ev[nEv]);
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        nWrites++;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
+        err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inZ,
+            CL_FALSE, 0, sizeof(int) * (size_t) n, blockZ, 0, NULL,
+            &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        nWrites++;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
+        size_t ls = g_gpu.localSize;
+        size_t global = ((size_t) n + ls - 1) / ls * ls;
+        err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 1, NULL,
+            &global, &ls, 0, NULL, &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_LAUNCHES]++;
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outCol,
+            CL_FALSE, 0, sizeof(int) * (size_t) n * 4, staging, 0, NULL,
+            &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        // One packed dispatch = one member: the chunk comes from one tile.
+        g_gpu.metrics.slots[GPU_METRICS_D2H_READS]++;
+        g_gpu.metrics.slots[GPU_METRICS_BATCH_MEMBERS]++;
+        g_gpu.metrics.slots[GPU_METRICS_BATCH_POINTS] += (uint64_t) n;
+        g_gpu.metrics.slots[GPU_METRICS_MEMBER_HIST + 1]++;
+        g_gpu.metrics.slots[GPU_METRICS_POINT_HIST
+            + gpuPointHistSlot((uint64_t) n)]++;
+    }
+    g_gpu.metrics.slots[GPU_METRICS_HOST_SUBMIT_NANOS]
+        += nowNanos() - submitT0;
+    GPU_UNLOCK;
+
+    uint64_t h2dNanos, kernNanos, d2hNanos, queueNanos;
+    const uint64_t waitT0 = nowNanos();
+    const int rc = gpuFinishSparseDispatch(err, ev, nEv, nWrites,
+        &h2dNanos, &kernNanos, &d2hNanos, &queueNanos,
+        wantFloat
+            ? "gpu cfx sparse float columns dispatch"
+            : "gpu cfx sparse columns dispatch",
+        &g_gpu.heightCount);
+    const uint64_t waited = nowNanos() - waitT0;
+    GPU_LOCK;
+    g_gpu.metrics.slots[GPU_METRICS_HOST_WAIT_NANOS] += waited;
+    if (rc == 0)
+    {
+        g_gpu.metrics.slots[GPU_METRICS_H2D_NANOS] += h2dNanos;
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_NANOS] += kernNanos;
+        g_gpu.metrics.slots[GPU_METRICS_D2H_NANOS] += d2hNanos;
+        g_gpu.metrics.slots[GPU_METRICS_QUEUE_DELAY_NANOS] += queueNanos;
+    }
+    GPU_UNLOCK;
+    if (rc == 0)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            outSolidY[i] = staging[i * 4 + 0];
+            outFluidY[i] = staging[i * 4 + 1];
+            outSurfaceY[i] = staging[i * 4 + 2];
+            outFlags[i] = staging[i * 4 + 3];
+        }
+    }
+    free(staging);
+    return rc;
+}
+
+int gpuCfxSurfaceColumnsPoints(int *outSolidY, int *outFluidY,
+    int *outSurfaceY, int *outFlags, const BiomeNoise *bn,
+    const int *blockX, const int *blockZ, int n)
+{
+    return gpuCfxColumnsDispatch(outSolidY, outFluidY, outSurfaceY, outFlags,
+        bn, blockX, blockZ, n, 0);
+}
+
+int gpuCfxSurfaceColumnsPointsFloat(int *outSolidY, int *outFluidY,
+    int *outSurfaceY, int *outFlags, const BiomeNoise *bn,
+    const int *blockX, const int *blockZ, int n)
+{
+    return gpuCfxColumnsDispatch(outSolidY, outFluidY, outSurfaceY, outFlags,
+        bn, blockX, blockZ, n, 1);
 }
 
 /*
