@@ -2590,6 +2590,649 @@ static void runCfxBiomesSparseRefusalCase(uint64_t seed, CaseStats *total,
             " and NULL pointers rejected before any write\n");
 }
 
+//----------------------------------------------------------------------
+// fp32 sparse twins: exact contracts within the float program, then drift
+// measurement against the CPU reference. The float kernels are the SAME
+// cfx source compiled with cfx_real=float, so anything cross-point or
+// cross-dispatch stays exact (one program, no per-point state) and only
+// the CPU-reference comparison drifts.
+
+/*
+ * Query-shape invariance of the fp32 heights twin, held bit-exact WITHIN
+ * the float program: a point packed into a chunk must compute the same
+ * height as the same point dispatched alone or inside differently sized
+ * chunks - the per-point math depends only on its coordinates, so any
+ * shape dependence is an indexing bug. Back-to-back dispatches from two
+ * origins walk the slab rotation and the table-cache reuse.
+ */
+static void runCfxHeightsSparseFloatCase(int mc, uint32_t flags,
+    uint64_t seed, int ox, int oz, CaseStats *total, int *fail)
+{
+    printf("cfx float sparse heights mc=%d seed=%llu origin=(%d,%d)\n",
+        mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    if (g.bn.nptype >= 0)
+    {
+        fprintf(stderr, "gpu-test: generator for mc %d not initialized\n", mc);
+        exit(2);
+    }
+
+    enum { N = 256 };
+    static const int chunkSizes[] = { 63, 64, 65, 127, N };
+    const int ox4 = floordiv(ox, 4);
+    const int oz4 = floordiv(oz, 4);
+    int *qx = malloc(sizeof(int) * (size_t) N);
+    int *qz = malloc(sizeof(int) * (size_t) N);
+    int *bx = malloc(sizeof(int) * (size_t) N);
+    int *bz = malloc(sizeof(int) * (size_t) N);
+    int *packed = malloc(sizeof(int) * (size_t) N);
+    int *run = malloc(sizeof(int) * (size_t) N);
+    if (!qx || !qz || !bx || !bz || !packed || !run)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    for (int si = 0; si < 2; si++)
+    {
+        const int stride = si ? 16 : 4;
+        int mf, mmf, tr;
+        cfxNoiseDetailForStrideRef(&g.bn.terrain, stride, &mf, &mmf, &tr);
+        cfxSparsePointList(qx, qz, ox4, oz4, stride, N);
+        int rc = gpuCfxOverviewHeightsSparseFloat(packed, &g.bn, qx, qz, N,
+            mf, mmf, tr);
+        if (rc != 0)
+        {
+            printf("  FAIL: heights float sparse packed n=%d stride=%d"
+                " rejected (rc %d)\n", N, stride, rc);
+            *fail = 1;
+            continue;
+        }
+
+        // every point alone must reproduce the packed value
+        int singlesBad = 0;
+        for (int p = 0; p < N; p++)
+        {
+            if (gpuCfxOverviewHeightsSparseFloat(&run[p], &g.bn, &qx[p],
+                    &qz[p], 1, mf, mmf, tr) != 0)
+            {
+                printf("  FAIL: heights float sparse single point %d"
+                    " rejected (stride %d)\n", p, stride);
+                *fail = 1;
+                singlesBad = 1;
+                break;
+            }
+        }
+        if (!singlesBad)
+        {
+            int mismatches = 0, first = -1;
+            for (int p = 0; p < N; p++)
+            {
+                if (run[p] != packed[p])
+                {
+                    mismatches++;
+                    if (first < 0)
+                        first = p;
+                }
+            }
+            if (mismatches)
+            {
+                printf("  FAIL: heights float sparse stride=%d: %d/%d"
+                    " single-vs-packed mismatches (first @p%d: %d vs %d)\n",
+                    stride, mismatches, N, first, run[first], packed[first]);
+                *fail = 1;
+            }
+        }
+
+        // odd chunk sizes must slice the same values
+        for (size_t ci = 0;
+                ci < sizeof(chunkSizes) / sizeof(chunkSizes[0]); ci++)
+        {
+            const int cs = chunkSizes[ci];
+            int rcc = gpuCfxOverviewHeightsSparseFloat(run, &g.bn, qx, qz,
+                cs, mf, mmf, tr);
+            if (rcc != 0)
+            {
+                printf("  FAIL: heights float sparse chunk n=%d stride=%d"
+                    " rejected (rc %d)\n", cs, stride, rcc);
+                *fail = 1;
+            }
+            else if (memcmp(run, packed, sizeof(int) * (size_t) cs) != 0)
+            {
+                printf("  FAIL: heights float sparse chunk n=%d stride=%d"
+                    " differs from the packed dispatch\n", cs, stride);
+                *fail = 1;
+            }
+        }
+
+        // back-to-back origins: the same list re-dispatched after a second
+        // origin's chunk must reproduce the packed values bit-exactly
+        cfxSparsePointList(bx, bz, ox4 + 8192, oz4 - 8192, stride, N);
+        if (gpuCfxOverviewHeightsSparseFloat(run, &g.bn, bx, bz, N,
+                mf, mmf, tr) != 0)
+        {
+            printf("  FAIL: heights float sparse second origin rejected\n");
+            *fail = 1;
+        }
+        else if (gpuCfxOverviewHeightsSparseFloat(run, &g.bn, qx, qz, N,
+                    mf, mmf, tr) != 0)
+        {
+            printf("  FAIL: heights float sparse back-to-back rerun"
+                " rejected\n");
+            *fail = 1;
+        }
+        else if (memcmp(run, packed, sizeof(int) * (size_t) N) != 0)
+        {
+            printf("  FAIL: heights float sparse back-to-back rerun changed"
+                " results\n");
+            *fail = 1;
+        }
+        total->pts += N;
+    }
+    free(qx);
+    free(qz);
+    free(bx);
+    free(bz);
+    free(packed);
+    free(run);
+}
+
+/*
+ * Query-shape invariance of the fp32 biomes twin: a cell packed into a
+ * multi-cell chunk must resolve the same ids as the same cell dispatched
+ * alone or inside differently sized chunks; back-to-back dispatches from
+ * two origins walk the slab rotation. terrainY comes from the CPU height
+ * solver so the clamping path is exercised with plausible values.
+ */
+static void runCfxBiomesSparseFloatCase(int mc, uint32_t flags,
+    uint64_t seed, int ox, int oz, CaseStats *total, int *fail)
+{
+    printf("cfx float sparse biomes mc=%d seed=%llu origin=(%d,%d)\n",
+        mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    if (g.bn.nptype >= 0)
+    {
+        fprintf(stderr, "gpu-test: generator for mc %d not initialized\n", mc);
+        exit(2);
+    }
+
+    static const int edges[] = { 2, 4 };
+    static const int strides[] = { 4, 16 };
+    static const int chunkCells[] = { 1, 7, 63, 64 };
+    enum { NC = 64, MAX_PER_CELL = 16 };
+    const int maxTotal = NC * MAX_PER_CELL;
+    int *cellX = malloc(sizeof(int) * (size_t) NC);
+    int *cellZ = malloc(sizeof(int) * (size_t) NC);
+    int *bx = malloc(sizeof(int) * (size_t) NC);
+    int *bz = malloc(sizeof(int) * (size_t) NC);
+    int *terrainY = malloc(sizeof(int) * (size_t) maxTotal);
+    int *packed = malloc(sizeof(int) * (size_t) maxTotal);
+    int *run = malloc(sizeof(int) * (size_t) maxTotal);
+    if (!cellX || !cellZ || !bx || !bz || !terrainY || !packed || !run)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    for (size_t sh = 0; sh < sizeof(edges) / sizeof(edges[0]); sh++)
+    {
+        const int edge = edges[sh];
+        const int stride = strides[sh];
+        const int perCell = edge * edge;
+        const int pts = NC * perCell;
+        int mf, mmf, tr;
+        cfxNoiseDetailForStrideRef(&g.bn.terrain, stride, &mf, &mmf, &tr);
+        for (int c = 0; c < NC; c++)
+        {
+            cellX[c] = ox + (c / 8) * edge * stride;
+            cellZ[c] = oz + (c % 8) * edge * stride;
+        }
+        for (int gi = 0; gi < pts; gi++)
+        {
+            const int cell = gi / perCell;
+            const int p = gi % perCell;
+            const int x = cellX[cell] + (p % edge) * stride;
+            const int z = cellZ[cell] + (p / edge) * stride;
+            terrainY[gi] = cfxModernOverviewHeightRef(&g.bn,
+                floordiv(x, 4), floordiv(z, 4), mf, mmf, tr);
+        }
+        int rc = gpuCfxSurfaceBiomesSparseFloat(packed, &g.bn, g.sha, cellX,
+            cellZ, terrainY, edge, stride, NC);
+        if (rc != 0)
+        {
+            printf("  FAIL: biomes float sparse packed nCells=%d edge=%d"
+                " stride=%d rejected (rc %d)\n", NC, edge, stride, rc);
+            *fail = 1;
+            continue;
+        }
+
+        // each cell alone must reproduce its packed slice
+        for (int c = 0; c < NC; c++)
+        {
+            int one[MAX_PER_CELL];
+            if (gpuCfxSurfaceBiomesSparseFloat(one, &g.bn, g.sha,
+                    &cellX[c], &cellZ[c], terrainY + c * perCell, edge,
+                    stride, 1) != 0)
+            {
+                printf("  FAIL: biomes float sparse single cell %d"
+                    " rejected (edge=%d stride=%d)\n", c, edge, stride);
+                *fail = 1;
+                break;
+            }
+            if (memcmp(one, packed + c * perCell,
+                    sizeof(int) * (size_t) perCell) != 0)
+            {
+                printf("  FAIL: biomes float sparse cell %d alone differs"
+                    " from the packed dispatch (edge=%d stride=%d)\n", c,
+                    edge, stride);
+                *fail = 1;
+                break;
+            }
+        }
+
+        // chunked prefixes must slice the same values
+        for (size_t ci = 0;
+                ci < sizeof(chunkCells) / sizeof(chunkCells[0]); ci++)
+        {
+            const int cc = chunkCells[ci];
+            int rcc = gpuCfxSurfaceBiomesSparseFloat(run, &g.bn, g.sha,
+                cellX, cellZ, terrainY, edge, stride, cc);
+            if (rcc != 0)
+            {
+                printf("  FAIL: biomes float sparse chunk nCells=%d"
+                    " edge=%d stride=%d rejected (rc %d)\n", cc, edge,
+                    stride, rcc);
+                *fail = 1;
+            }
+            else if (memcmp(run, packed,
+                    sizeof(int) * (size_t)(cc * perCell)) != 0)
+            {
+                printf("  FAIL: biomes float sparse chunk nCells=%d edge=%d"
+                    " stride=%d differs from the packed dispatch\n", cc,
+                    edge, stride);
+                *fail = 1;
+            }
+        }
+
+        // back-to-back origins: the same cell grid re-dispatched after a
+        // second origin's chunk must reproduce the packed ids bit-exactly
+        for (int c = 0; c < NC; c++)
+        {
+            bx[c] = ox + 8192 + (c / 8) * edge * stride;
+            bz[c] = oz - 8192 + (c % 8) * edge * stride;
+        }
+        if (gpuCfxSurfaceBiomesSparseFloat(run, &g.bn, g.sha, bx, bz,
+                terrainY, edge, stride, NC) != 0)
+        {
+            printf("  FAIL: biomes float sparse second origin rejected\n");
+            *fail = 1;
+        }
+        else if (gpuCfxSurfaceBiomesSparseFloat(run, &g.bn, g.sha, cellX,
+                    cellZ, terrainY, edge, stride, NC) != 0)
+        {
+            printf("  FAIL: biomes float sparse back-to-back rerun"
+                " rejected\n");
+            *fail = 1;
+        }
+        else if (memcmp(run, packed, sizeof(int) * (size_t) pts) != 0)
+        {
+            printf("  FAIL: biomes float sparse back-to-back rerun changed"
+                " results\n");
+            *fail = 1;
+        }
+        total->pts += pts;
+    }
+    free(cellX);
+    free(cellZ);
+    free(bx);
+    free(bz);
+    free(terrainY);
+    free(packed);
+    free(run);
+}
+
+// Whole-chunk refusal contract of the fp32 heights twin, same canary
+// pattern as the fp64 case: every rejection must fire before any lock,
+// upload, enqueue or output write.
+static void runCfxHeightsSparseFloatRefusalCase(uint64_t seed,
+    CaseStats *total, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    // gpu.c's GPU_MAX_POINTS dispatch cap (kept private there).
+    enum { CAP_POINTS = 1 << 20 };
+    const int one[1] = { 0 };
+    int canary[4] = { (int) 0x5A5A5A5A, (int) 0x5A5A5A5A,
+        (int) 0x5A5A5A5A, (int) 0x5A5A5A5A };
+    const struct
+    {
+        const char *what;
+        int *outY;
+        const int *x4;
+        const int *z4;
+        int n, mf, mmf, tr;
+    } rejects[] =
+    {
+        { "n=0",                    canary, one,  one,  0, 0, 0,  0 },
+        { "n over cap",             canary, one,  one,  CAP_POINTS + 1,
+          0, 0, 0 },
+        { "NULL outY",              NULL,   one,  one,  1, 0, 0,  0 },
+        { "NULL x4",                canary, NULL, one,  1, 0, 0,  0 },
+        { "NULL z4",                canary, one,  NULL, 1, 0, 0,  0 },
+        { "mainFirst out of range", canary, one,  one,  1, 8, 0,  0 },
+        { "minMaxFirst out of range", canary, one, one, 1, 0, 16, 0 },
+        { "truncated not 0/1",      canary, one,  one,  1, 0, 0,  2 },
+    };
+    for (size_t i = 0; i < sizeof(rejects) / sizeof(rejects[0]); i++)
+    {
+        int rc = gpuCfxOverviewHeightsSparseFloat(rejects[i].outY, &g.bn,
+            rejects[i].x4, rejects[i].z4, rejects[i].n, rejects[i].mf,
+            rejects[i].mmf, rejects[i].tr);
+        if (rc == 0)
+        {
+            printf("  FAIL: heights float sparse accepted %s\n",
+                rejects[i].what);
+            *fail = 1;
+        }
+        for (int p = 0; p < 4; p++)
+        {
+            if (canary[p] != (int) 0x5A5A5A5A)
+            {
+                printf("  FAIL: heights float sparse %s wrote outputs"
+                    " before rejecting\n", rejects[i].what);
+                *fail = 1;
+                for (int q = 0; q < 4; q++)
+                    canary[q] = (int) 0x5A5A5A5A;
+                break;
+            }
+        }
+    }
+    if (!*fail)
+        printf("  heights float sparse refusal: n=0, over-cap, NULL"
+            " pointers and bad detail scalars rejected before any write\n");
+}
+
+// Same whole-chunk refusal contract for the fp32 biomes twin.
+static void runCfxBiomesSparseFloatRefusalCase(uint64_t seed,
+    CaseStats *total, int *fail)
+{
+    Generator g;
+    setupGenerator(&g, MC_1_21_4, 0);
+    applySeed(&g, DIM_OVERWORLD, seed);
+
+    // gpu.c's GPU_MAX_POINTS dispatch cap (kept private there).
+    enum { CAP_POINTS = 1 << 20 };
+    const int one[1] = { 0 };
+    int canary[4] = { (int) 0x5A5A5A5A, (int) 0x5A5A5A5A,
+        (int) 0x5A5A5A5A, (int) 0x5A5A5A5A };
+    const struct
+    {
+        const char *what;
+        int *outIds;
+        const int *cellX;
+        const int *cellZ;
+        const int *terrainY;
+        int edge, stride, nCells;
+    } rejects[] =
+    {
+        { "edge=0",        canary, one, one, one, 0, 4, 1 },
+        { "stride=0",      canary, one, one, one, 1, 0, 1 },
+        { "nCells=0",      canary, one, one, one, 1, 4, 0 },
+        { "cap overflow",  canary, one, one, one, 2, 4,
+          CAP_POINTS / 4 + 1 },
+        { "NULL outIds",   NULL,   one, one, one, 1, 4, 1 },
+        { "NULL cellX",    canary, NULL, one, one, 1, 4, 1 },
+        { "NULL cellZ",    canary, one, NULL, one, 1, 4, 1 },
+        { "NULL terrainY", canary, one, one, NULL, 1, 4, 1 },
+    };
+    for (size_t i = 0; i < sizeof(rejects) / sizeof(rejects[0]); i++)
+    {
+        int rc = gpuCfxSurfaceBiomesSparseFloat(rejects[i].outIds, &g.bn,
+            g.sha, rejects[i].cellX, rejects[i].cellZ, rejects[i].terrainY,
+            rejects[i].edge, rejects[i].stride, rejects[i].nCells);
+        if (rc == 0)
+        {
+            printf("  FAIL: biomes float sparse accepted %s\n",
+                rejects[i].what);
+            *fail = 1;
+        }
+        for (int p = 0; p < 4; p++)
+        {
+            if (canary[p] != (int) 0x5A5A5A5A)
+            {
+                printf("  FAIL: biomes float sparse %s wrote outputs"
+                    " before rejecting\n", rejects[i].what);
+                *fail = 1;
+                for (int q = 0; q < 4; q++)
+                    canary[q] = (int) 0x5A5A5A5A;
+                break;
+            }
+        }
+    }
+    if (!*fail)
+        printf("  biomes float sparse refusal: edge/stride/nCells=0, cap"
+            " overflow and NULL pointers rejected before any write\n");
+}
+
+/*
+ * Distinct-point quart sample for the drift case: a jittered grid at the
+ * refinement chunks' own scale, so every height point is a unique
+ * coordinate (the parity lists' duplicates add no drift information).
+ */
+static void cfxSparseDriftPoints(int *x4, int *z4, int ox4, int oz4,
+    int stride, int n)
+{
+    for (int i = 0; i < n; i++)
+    {
+        uint32_t r = (uint32_t)(i * 2654435761u)
+            ^ (uint32_t)(ox4 * 31 + oz4 * 17 + stride * 7);
+        r ^= r >> 13;
+        const int dx = (int)(r & 7u);
+        r = r * 1664525u + 1013904223u;
+        const int dz = (int)((r >> 16) & 7u);
+        x4[i] = ox4 + (i % 32) * stride * 3 + dx;
+        z4[i] = oz4 + (i / 32) * stride * 3 + dz;
+    }
+}
+
+/*
+ * Drift measurement of the fp32 sparse twins against the CPU reference
+ * over a fat distinct-point sample: the port's contract is a budgeted
+ * approximation, so this case PRINTS the biome mismatch rate and the
+ * height dY distribution and asserts only loose smoke bounds a broken
+ * port fails loudly (biome mismatch < 2.0%, |dY| <= 8). The printed
+ * numbers feed the post-land budget calibration; precise budgets are out
+ * of scope here (pre-calibration waived).
+ */
+static void runCfxSparseFloatDriftCase(int mc, uint32_t flags, uint64_t seed,
+    int ox, int oz, CaseStats *total, int *fail)
+{
+    printf("cfx float sparse drift mc=%d seed=%llu origin=(%d,%d)\n",
+        mc, (unsigned long long) seed, ox, oz);
+    fflush(stdout);
+
+    Generator g;
+    setupGenerator(&g, mc, flags);
+    applySeed(&g, DIM_OVERWORLD, seed);
+    if (g.bn.nptype >= 0)
+    {
+        fprintf(stderr, "gpu-test: generator for mc %d not initialized\n", mc);
+        exit(2);
+    }
+
+    static const int strides[] = { 4, 16 };
+    enum { HEIGHT_N = 2048, DRIFT_CELLS = 256, EDGE = 4 };
+    const int perCell = EDGE * EDGE;
+    const int biomeTotal = DRIFT_CELLS * perCell;
+
+    int *qx = malloc(sizeof(int) * (size_t) HEIGHT_N);
+    int *qz = malloc(sizeof(int) * (size_t) HEIGHT_N);
+    int *ref = malloc(sizeof(int) * (size_t) HEIGHT_N);
+    int *gpu = malloc(sizeof(int) * (size_t) HEIGHT_N);
+    int *cellX = malloc(sizeof(int) * (size_t) DRIFT_CELLS);
+    int *cellZ = malloc(sizeof(int) * (size_t) DRIFT_CELLS);
+    int *terrainY = malloc(sizeof(int) * (size_t) biomeTotal);
+    int *bref = malloc(sizeof(int) * (size_t) biomeTotal);
+    int *bgpu = malloc(sizeof(int) * (size_t) biomeTotal);
+    if (!qx || !qz || !ref || !gpu || !cellX || !cellZ || !terrainY
+        || !bref || !bgpu)
+    {
+        fprintf(stderr, "gpu-test: out of memory\n");
+        exit(2);
+    }
+
+    long long hPts = 0, hMismatch = 0;
+    int dYMax = 0;
+    long long hist[7] = { 0 }; // |dY| = 0, 1, 2, 3-4, 5-8, 9-16, >16
+    long long bPts = 0, bMismatch = 0;
+
+    for (size_t si = 0; si < sizeof(strides) / sizeof(strides[0]); si++)
+    {
+        const int stride = strides[si];
+        int mf, mmf, tr;
+        cfxNoiseDetailForStrideRef(&g.bn.terrain, stride, &mf, &mmf, &tr);
+
+        // heights: a distinct-point chunk vs the CPU solver
+        cfxSparseDriftPoints(qx, qz, floordiv(ox, 4), floordiv(oz, 4),
+            stride, HEIGHT_N);
+        for (int p = 0; p < HEIGHT_N; p++)
+            ref[p] = cfxModernOverviewHeightRef(&g.bn, qx[p], qz[p], mf,
+                mmf, tr);
+        if (gpuCfxOverviewHeightsSparseFloat(gpu, &g.bn, qx, qz, HEIGHT_N,
+                mf, mmf, tr) != 0)
+        {
+            printf("  FAIL: float sparse heights drift dispatch rejected"
+                " (stride %d)\n", stride);
+            *fail = 1;
+            continue;
+        }
+        for (int p = 0; p < HEIGHT_N; p++)
+        {
+            const int dy = gpu[p] > ref[p] ? gpu[p] - ref[p]
+                : ref[p] - gpu[p];
+            if (dy)
+                hMismatch++;
+            if (dy > dYMax)
+                dYMax = dy;
+            hist[dy == 0 ? 0 : dy == 1 ? 1 : dy == 2 ? 2 : dy <= 4 ? 3
+                : dy <= 8 ? 4 : dy <= 16 ? 5 : 6]++;
+            hPts++;
+        }
+
+        // biomes: caller-Y cells vs voronoi + climate on the CPU
+        for (int c = 0; c < DRIFT_CELLS; c++)
+        {
+            cellX[c] = ox + (c / 16) * EDGE * stride;
+            cellZ[c] = oz + (c % 16) * EDGE * stride;
+        }
+        for (int gi = 0; gi < biomeTotal; gi++)
+        {
+            const int cell = gi / perCell;
+            const int p = gi % perCell;
+            const int x = cellX[cell] + (p % EDGE) * stride;
+            const int z = cellZ[cell] + (p / EDGE) * stride;
+            terrainY[gi] = cfxModernOverviewHeightRef(&g.bn,
+                floordiv(x, 4), floordiv(z, 4), mf, mmf, tr);
+        }
+        for (int gi = 0; gi < biomeTotal; gi++)
+        {
+            const int cell = gi / perCell;
+            const int p = gi % perCell;
+            const int x = cellX[cell] + (p % EDGE) * stride;
+            const int z = cellZ[cell] + (p / EDGE) * stride;
+            int x4, y4, z4;
+            voronoiAccess3D(g.sha, x,
+                terrainY[gi] < 62 ? 62 : terrainY[gi], z, &x4, &y4, &z4);
+            bref[gi] = sampleBiomeNoise(&g.bn, NULL, x4, y4, z4, NULL, 0);
+        }
+        if (gpuCfxSurfaceBiomesSparseFloat(bgpu, &g.bn, g.sha, cellX, cellZ,
+                terrainY, EDGE, stride, DRIFT_CELLS) != 0)
+        {
+            printf("  FAIL: float sparse biomes drift dispatch rejected"
+                " (stride %d)\n", stride);
+            *fail = 1;
+            continue;
+        }
+        for (int gi = 0; gi < biomeTotal; gi++)
+        {
+            if (bgpu[gi] != bref[gi])
+                bMismatch++;
+            bPts++;
+        }
+    }
+
+    printf("  float drift origin=(%d,%d): heights %lld pts, dY=0 %lld,"
+        " 1 %lld, 2 %lld, 3-4 %lld, 5-8 %lld, 9-16 %lld, >16 %lld,"
+        " max |dY| %d | biomes %lld pts, mismatch %lld (%.4f%%)\n",
+        ox, oz, hPts, hist[0], hist[1], hist[2], hist[3], hist[4], hist[5],
+        hist[6], dYMax, bPts, bMismatch,
+        bPts ? 100.0 * (double) bMismatch / (double) bPts : 0.0);
+
+    // Loose smoke bounds: a broken port (wrong table, mangled indexing)
+    // produces order-of-magnitude rate flips, not drift-sized deviations.
+    const double biomeRate = bPts
+        ? (double) bMismatch / (double) bPts : 0.0;
+    if (biomeRate >= 0.02)
+    {
+        printf("  FAIL: float sparse biome mismatch %.4f%% >= 2.0%% smoke"
+            " bound\n", 100.0 * biomeRate);
+        *fail = 1;
+    }
+    if (dYMax > 8)
+    {
+        printf("  FAIL: float sparse height max |dY| %d > 8 smoke bound\n",
+            dYMax);
+        *fail = 1;
+    }
+    total->pts += hPts + bPts;
+    free(qx);
+    free(qz);
+    free(ref);
+    free(gpu);
+    free(cellX);
+    free(cellZ);
+    free(terrainY);
+    free(bref);
+    free(bgpu);
+}
+
+// One pinned metrics-delta table check shared by the batch, sparse and
+// float-sparse sub-cases: each pin demands the slot's delta equal want.
+typedef struct
+{
+    int slot;
+    long long want;
+    const char *name;
+} MetricsPin;
+
+static int checkMetricsPins(const uint64_t *before, const uint64_t *after,
+    const MetricsPin *pins, int cnt)
+{
+    int bad = 0;
+    for (int c = 0; c < cnt; c++)
+    {
+        const long long got = (long long) (after[pins[c].slot]
+            - before[pins[c].slot]);
+        if (got != pins[c].want)
+        {
+            printf("  FAIL: %s slot %d moved by %lld, want %lld\n",
+                pins[c].name, pins[c].slot, got, pins[c].want);
+            bad = 1;
+        }
+    }
+    return bad;
+}
+
 // The batch entries own the engine metrics slots (gpu.h layout): one height
 // batch plus one biome batch with the same member count must move exactly
 // the counters the layout pins, and the four event-timer slots must stay
@@ -2670,12 +3313,7 @@ static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
     }
     else
     {
-        const struct
-        {
-            int slot;
-            long long want;
-            const char *name;
-        } counters[] =
+        const MetricsPin counters[] =
         {
             { GPU_METRICS_BATCH_MEMBERS, 2 * CNT, "batch members" },
             { GPU_METRICS_BATCH_POINTS, 2 * (long long) totalPts,
@@ -2686,19 +3324,8 @@ static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
             { memberSlot, 2, "member histogram" },
             { pointSlotIdx, 2, "point histogram" },
         };
-        int bad = 0;
-        for (size_t c = 0; c < sizeof(counters) / sizeof(counters[0]); c++)
-        {
-            const long long got = (long long) (after[counters[c].slot]
-                - before[counters[c].slot]);
-            if (got != counters[c].want)
-            {
-                printf("  FAIL: %s slot %d moved by %lld, want %lld\n",
-                    counters[c].name, counters[c].slot, got,
-                    counters[c].want);
-                bad = 1;
-            }
-        }
+        int bad = checkMetricsPins(before, after, counters,
+            (int)(sizeof(counters) / sizeof(counters[0])));
         if (after[GPU_METRICS_HOST_WAIT_NANOS]
             == before[GPU_METRICS_HOST_WAIT_NANOS])
         {
@@ -2828,12 +3455,7 @@ static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
     }
     else
     {
-        const struct
-        {
-            int slot;
-            long long want;
-            const char *name;
-        } spCounters[] =
+        const MetricsPin spCounters[] =
         {
             { GPU_METRICS_BATCH_MEMBERS, 2, "sparse batch members" },
             { GPU_METRICS_BATCH_POINTS, SP_N + spTotal, "sparse batch points" },
@@ -2843,20 +3465,8 @@ static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
             { GPU_METRICS_MEMBER_HIST + 1, 2, "sparse member histogram" },
             { GPU_METRICS_POINT_HIST + spSlot, 2, "sparse point histogram" },
         };
-        int spBad = 0;
-        for (size_t c = 0; c < sizeof(spCounters) / sizeof(spCounters[0]);
-                c++)
-        {
-            const long long got = (long long) (afterS[spCounters[c].slot]
-                - beforeS[spCounters[c].slot]);
-            if (got != spCounters[c].want)
-            {
-                printf("  FAIL: %s slot %d moved by %lld, want %lld\n",
-                    spCounters[c].name, spCounters[c].slot, got,
-                    spCounters[c].want);
-                spBad = 1;
-            }
-        }
+        int spBad = checkMetricsPins(beforeS, afterS, spCounters,
+            (int)(sizeof(spCounters) / sizeof(spCounters[0])));
         if (afterS[GPU_METRICS_HOST_WAIT_NANOS]
             == beforeS[GPU_METRICS_HOST_WAIT_NANOS])
         {
@@ -2873,6 +3483,61 @@ static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
             *fail = 1;
         else
             printf("  metrics: sparse dispatches moved exactly as pinned\n");
+    }
+
+    // The fp32 sparse twins share the slot layout and the same per-dispatch
+    // movements as the fp64 sparse entries above: one heights chunk (two
+    // coordinate writes), one biomes chunk (three writes), each adding one
+    // kernel, one read, one member, and both totals landing in the same
+    // point-hist slot. Results are not compared here - the drift case owns
+    // them; the output buffers are reused, nothing reads them back.
+    uint64_t beforeF[GPU_METRICS_SLOTS], afterF[GPU_METRICS_SLOTS];
+    gpuQueryMetrics(beforeF);
+    int rcHF = gpuCfxOverviewHeightsSparseFloat(hsY, &g.bn, hsX, hsZ, SP_N,
+        0, 0, 0);
+    int rcBF = gpuCfxSurfaceBiomesSparseFloat(sid, &g.bn, g.sha, scx, scz,
+        sy, SP_EDGE, SP_STRIDE, SP_CELLS);
+    gpuQueryMetrics(afterF);
+    if (rcHF != 0 || rcBF != 0)
+    {
+        printf("  FAIL: metrics case float sparse dispatches refused"
+            " (%d %d)\n", rcHF, rcBF);
+        *fail = 1;
+    }
+    else
+    {
+        const MetricsPin fPins[] =
+        {
+            { GPU_METRICS_BATCH_MEMBERS, 2, "float sparse batch members" },
+            { GPU_METRICS_BATCH_POINTS, SP_N + spTotal,
+                "float sparse batch points" },
+            { GPU_METRICS_KERNEL_LAUNCHES, 2, "float sparse kernel launches" },
+            { GPU_METRICS_D2H_READS, 2, "float sparse d2h reads" },
+            { GPU_METRICS_H2D_WRITES, 2 + 3, "float sparse h2d writes" },
+            { GPU_METRICS_MEMBER_HIST + 1, 2, "float sparse member histogram" },
+            { GPU_METRICS_POINT_HIST + spSlot, 2,
+                "float sparse point histogram" },
+        };
+        int fBad = checkMetricsPins(beforeF, afterF, fPins,
+            (int)(sizeof(fPins) / sizeof(fPins[0])));
+        if (afterF[GPU_METRICS_HOST_WAIT_NANOS]
+            == beforeF[GPU_METRICS_HOST_WAIT_NANOS])
+        {
+            printf("  FAIL: float sparse host wait timer did not advance\n");
+            fBad = 1;
+        }
+        if (afterF[GPU_METRICS_HOST_SUBMIT_NANOS]
+            == beforeF[GPU_METRICS_HOST_SUBMIT_NANOS])
+        {
+            printf("  FAIL: float sparse host submit timer did not"
+                " advance\n");
+            fBad = 1;
+        }
+        if (fBad)
+            *fail = 1;
+        else
+            printf("  metrics: float sparse dispatches moved exactly as"
+                " pinned\n");
     }
     free(sy);
     free(sid);
@@ -3165,6 +3830,32 @@ int main(int argc, char **argv)
             100000, &total, &fail);
         runCfxBiomesSparseCase(mainMc, LARGE_BIOMES, seeds[0], 100000,
             100000, &total, &fail);
+    }
+
+    // fp32 sparse twins: the float program's exact contracts first (shape
+    // invariance within one program, refusal canaries, metrics deltas in
+    // runCfxMetricsCase), then the drift measurement against the CPU
+    // reference with loose smoke bounds - its printed numbers feed the
+    // post-land calibration. Same origin coverage as the fp64 sparse
+    // matrix; --full adds the two world-border extremes as drift probes.
+    runCfxHeightsSparseFloatRefusalCase(seeds[0], &total, &fail);
+    runCfxBiomesSparseFloatRefusalCase(seeds[0], &total, &fail);
+    for (int oi = 0; oi < (full
+            ? (int)(sizeof(origins) / sizeof(origins[0])) : 3); oi++)
+    {
+        runCfxHeightsSparseFloatCase(mainMc, 0, seeds[0], origins[oi][0],
+            origins[oi][1], &total, &fail);
+        runCfxBiomesSparseFloatCase(mainMc, 0, seeds[0], origins[oi][0],
+            origins[oi][1], &total, &fail);
+        runCfxSparseFloatDriftCase(mainMc, 0, seeds[0], origins[oi][0],
+            origins[oi][1], &total, &fail);
+    }
+    if (full)
+    {
+        runCfxSparseFloatDriftCase(mainMc, 0, seeds[0], 7500000, 7500000,
+            &total, &fail);
+        runCfxSparseFloatDriftCase(mainMc, 0, seeds[0], -7500000, -7500000,
+            &total, &fail);
     }
     runCfxMetricsCase(seeds[0], &total, &fail);
     runCfxModeCase(seeds[0], &total, &fail);

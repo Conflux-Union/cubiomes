@@ -316,6 +316,57 @@ int gpuCfxSurfaceBiomesSparse(int *outIds, const BiomeNoise *bn, uint64_t sha,
     const int *terrainY, int edge, int stride, int nCells);
 
 /*
+ * Float-precision sparse twins of the two entries above, for the part of
+ * the mod's product seam where drift is budgeted: the kernels are the SAME
+ * cfx expression compiled a second time in single precision (cfx_real=float
+ * against float table mirrors), so outputs approximate the CPU reference
+ * coordinate-dependently and are NOT bit-exact - neither against the fp64
+ * entries, which stay the exact reference. The request shapes, validation,
+ * whole-or-nothing refusal, slab/buffer usage, drain tail and metrics slots
+ * are identical to the fp64 twins, and the family counters count these
+ * dispatches like any other. They run on any OpenCL device (no
+ * cl_khr_fp64 requirement) and their availability is independent of the
+ * fp64 side.
+ */
+
+/*
+ * Float twin of gpuCfxOverviewHeightsSparse(): `n` arbitrary quart points
+ * (x4[i], z4[i]) solved in ONE kernel launch and read back in ONE read,
+ * outY[i] receiving the point's height as the single-precision execution
+ * of the same per-point expression. The detail scalars are one set shared
+ * by every point of the chunk. Same whole-or-nothing refusal as the fp64
+ * entry, firing before ANY GPU work or caller-output write: nonzero means
+ * the whole chunk was refused and the caller runs the CPU path per point
+ * (NULL pointers, n outside [1, ~1M], detail scalars out of range -
+ * mainFirst 0..7, minMaxFirst 0..15, truncated 0/1 - a BiomeNoise not
+ * fully initialized by setBiomeSeed() or pre-1.18, mode off, disabled/
+ * dead engine, table-pack failure, slab-growth/allocation failure, or an
+ * enqueue failure).
+ */
+int gpuCfxOverviewHeightsSparseFloat(int *outY, const BiomeNoise *bn,
+    const int *x4, const int *z4, int n,
+    int mainFirst, int minMaxFirst, int truncated);
+
+/*
+ * Float twin of gpuCfxSurfaceBiomesSparse(): nCells cells, cell j covering
+ * edge*edge points spaced `stride` apart starting at (cellX[j], cellZ[j]),
+ * resolved in ONE kernel launch and read back in ONE read over the
+ * contiguous chunk-local span [0..nCells*edge*edge), with terrainY packed
+ * at the same flat index (clamped at 62 by the kernel, exactly like the
+ * shim). ids are the single-precision execution of the same per-point
+ * chain. Same whole-or-nothing refusal as the fp64 entry, firing before
+ * ANY GPU work or caller-output write: nonzero means the whole chunk was
+ * refused and the caller runs the CPU path per point (NULL pointers,
+ * edge/stride/nCells below 1, the points total over ~1M, a BiomeNoise not
+ * fully initialized by setBiomeSeed() or pre-1.18, mode off, disabled/
+ * dead engine, table-pack failure, slab-growth/allocation failure, or an
+ * enqueue failure).
+ */
+int gpuCfxSurfaceBiomesSparseFloat(int *outIds, const BiomeNoise *bn,
+    uint64_t sha, const int *cellX, const int *cellZ,
+    const int *terrainY, int edge, int stride, int nCells);
+
+/*
  * Engine metrics: a fixed uint64 slot array accumulated by the cfx batch
  * and sparse entries, snapshot by gpuQueryMetrics(). The layout is mirrored
  * by the mod's Java reader, so the slot indices below are API, not internals.

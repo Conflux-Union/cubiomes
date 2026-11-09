@@ -85,9 +85,11 @@ typedef struct
     uint8_t *perm;   // octTotal * 257
     float *pinfo;    // octTotal * 8 (float copy, float kernels)
     double *pinfoD;  // octTotal * 8 (double copy, cfx kernels); slot 7 = h2
+    float *pinfoF;   // octTotal * 8 (float mirror of pinfoD, fp32 cfx kernels)
     int noff[GPU_INST_COUNT * 4];
     float namp[GPU_INST_COUNT];
     double nampD[GPU_INST_COUNT];
+    float nampF[GPU_INST_COUNT];  // float mirror of nampD, fp32 cfx kernels
     int sNodeTotal;
     int *styp, *slen, *schild;
     float *sloc, *sder;
@@ -140,11 +142,15 @@ typedef struct
     int forceWarned;
     GpuCl cl;
     cl_program cfxProgram;  // fp64 cfx kernels; separate from the float program
+    cl_program cfxFloatProgram;  // fp32 cfx kernels (-DCFX_REAL=float build)
     cl_kernel kHeight;  // terrainHeightKernel, created from the built program
     cl_kernel kCfxHeight, kCfxBiome;  // cfxOverviewHeightKernel, cfxBiomeAtYKernel
     cl_kernel kCfxHeightPoints, kCfxBiomePoints;  // their sparse twins
+    cl_kernel kCfxHeightPointsF, kCfxBiomePointsF;  // sparse twins in fp32
     int cfxAvail;       // fp64 program built + all four cfx kernels live
     int cfxInited;      // the one lazy cfx build attempt has been made
+    int cfxFloatAvail;  // float program built + both sparse float kernels live
+    int cfxFloatInited; // the one lazy float cfx build attempt has been made
     size_t localSize;
     GpuTables tables;
     uint64_t keyProbe;
@@ -156,6 +162,7 @@ typedef struct
     GpuMetrics metrics;  // gpu.h slot layout
     cl_mem mPerm, mPinfo, mNoff, mNamp;
     cl_mem mPinfoD, mNampD;
+    cl_mem mPinfoF, mNampF;  // float mirrors, fp32 cfx kernels
     cl_mem mStyp, mSlen, mSloc, mSder, mSchild;
     cl_mem mSteps, mParam, mNodes;
     GpuSlab slabs[2];
@@ -171,9 +178,9 @@ static GpuEngine g_gpu =
 #endif
     -1, GPU_MODE_AUTO,
     // Everything after modeUser/modeEnv is zero-initialized: modeEnvParsed,
-    // clInited, clAvail, dead, forceWarned, cl, kHeight, cfxAvail,
-    // localSize (re-set at first init), tables, cache key, counters,
-    // slabs.
+    // clInited, clAvail, dead, forceWarned, cl, kHeight, the cfx program and
+    // availability flags, localSize (re-set at first init), tables, cache
+    // key, counters, slabs.
 };
 
 static void gpuClErr(GpuEngine *e, cl_int err, const char *what)
@@ -233,7 +240,7 @@ static void gpuReleasePack(GpuEngine *e)
     cl_mem *bufs[] =
     {
         &e->mPerm, &e->mPinfo, &e->mNoff, &e->mNamp,
-        &e->mPinfoD, &e->mNampD,
+        &e->mPinfoD, &e->mNampD, &e->mPinfoF, &e->mNampF,
         &e->mStyp, &e->mSlen, &e->mSloc, &e->mSder, &e->mSchild,
         &e->mSteps, &e->mParam, &e->mNodes,
     };
@@ -246,6 +253,7 @@ static void gpuReleasePack(GpuEngine *e)
     free(e->tables.perm);
     free(e->tables.pinfo);
     free(e->tables.pinfoD);
+    free(e->tables.pinfoF);
     free(e->tables.styp);
     free(e->tables.slen);
     free(e->tables.schild);
@@ -366,26 +374,20 @@ static int gpuDeviceHasFp64(const GpuCl *cl)
 }
 
 /*
- * Builds the fp64 cfx program from the pragma + cfx source section. A
+ * Builds one OpenCL program from the given source parts and options. A
  * build failure prints the compiler log once and reports unavailable, so
- * a device that advertises the extension but cannot compile the kernels
- * degrades to the CPU path like any other engine problem.
+ * a device that cannot compile a program degrades to the CPU path like
+ * any other engine problem.
  */
-static cl_program gpuBuildCfxProgram(GpuEngine *e)
+static cl_program gpuBuildProgram(GpuEngine *e, const char *const *parts,
+    const size_t *lens, cl_uint n, const char *opts, const char *what)
 {
-    const char *parts[2] = { GPU_CL_PRAGMA_FP64, GPU_CL_SRC_CFX };
-    const size_t lens[2] =
-    {
-        strlen(GPU_CL_PRAGMA_FP64),
-        strlen(GPU_CL_SRC_CFX),
-    };
     cl_int err = CL_SUCCESS;
-    cl_program program = e->cl.fn.CreateProgramWithSource(e->cl.context, 2,
-        parts, lens, &err);
+    cl_program program = e->cl.fn.CreateProgramWithSource(e->cl.context, n,
+        (const char **) parts, lens, &err);
     if (!program || err != CL_SUCCESS)
         return NULL;
-    err = e->cl.fn.BuildProgram(program, 1, &e->cl.device, GPU_CL_OPTS,
-        NULL, NULL);
+    err = e->cl.fn.BuildProgram(program, 1, &e->cl.device, opts, NULL, NULL);
     if (err != CL_SUCCESS)
     {
         size_t logLen = 0;
@@ -399,8 +401,8 @@ static cl_program gpuBuildCfxProgram(GpuEngine *e)
                 e->cl.fn.GetProgramBuildInfo(program, e->cl.device,
                     CL_PROGRAM_BUILD_LOG, logLen, log, NULL);
                 log[logLen - 1] = 0;
-                fprintf(stderr, "gpu: cfx fp64 program build failed:\n%s\n",
-                    log);
+                fprintf(stderr, "gpu: %s program build failed:\n%s\n",
+                    what, log);
                 free(log);
             }
         }
@@ -408,6 +410,38 @@ static cl_program gpuBuildCfxProgram(GpuEngine *e)
         return NULL;
     }
     return program;
+}
+
+/*
+ * The fp64 cfx program: fp64 pragma + the cfx source section, cfx_real
+ * left at its double default. Its outputs must stay bit-identical to the
+ * shim's CPU chains (the exact-contract gpu-test matrix is the proof).
+ */
+static cl_program gpuBuildCfxProgram(GpuEngine *e)
+{
+    const char *parts[2] = { GPU_CL_PRAGMA_FP64, GPU_CL_SRC_CFX };
+    const size_t lens[2] =
+    {
+        strlen(GPU_CL_PRAGMA_FP64),
+        strlen(GPU_CL_SRC_CFX),
+    };
+    return gpuBuildProgram(e, parts, lens, 2, GPU_CL_OPTS, "cfx fp64");
+}
+
+/*
+ * The fp32 cfx program: the SAME cfx source section with cfx_real=float.
+ * -cl-single-precision-constant makes the unsuffixed literals follow the
+ * typedef, so the kernels execute the identical expression in single
+ * precision - a drift-budgeted approximation, never bit-exact. No fp64
+ * pragma or device check: float execution needs no extensions.
+ */
+static cl_program gpuBuildCfxFloatProgram(GpuEngine *e)
+{
+    const char *src = GPU_CL_SRC_CFX;
+    const size_t len = sizeof(GPU_CL_SRC_CFX) - 1;
+    return gpuBuildProgram(e, &src, &len, 1,
+        GPU_CL_OPTS " -cl-single-precision-constant -DCFX_REAL=float",
+        "cfx float");
 }
 
 static cl_kernel gpuKernelFromProgram(GpuEngine *e, cl_program program,
@@ -496,6 +530,47 @@ static int gpuEnsureCfxLocked(GpuEngine *e)
     {
         e->kCfxHeight, e->kCfxBiome, e->kCfxHeightPoints, e->kCfxBiomePoints
     };
+    for (int i = 0; i < (int)(sizeof(all) / sizeof(*all)); i++)
+    {
+        size_t wgi = 0;
+        e->cl.fn.GetKernelWorkGroupInfo(all[i], e->cl.device,
+            CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgi), &wgi, NULL);
+        if (wgi > 0 && wgi < e->localSize)
+            e->localSize = wgi < GPU_LOCAL_SIZE_MAX ? wgi : GPU_LOCAL_SIZE_MAX;
+    }
+    return 1;
+}
+
+/*
+ * Lazy fp32 build for the sparse float cfx kernels, mirroring the fp64
+ * ensure's one-shot discipline (separate inited flag, no retry after a
+ * failed build) with two differences: float execution needs no cl_khr_fp64,
+ * so there is no extension check, and its availability is independent of
+ * the fp64 side - either program failing to build leaves the other intact.
+ */
+static int gpuEnsureCfxFloatLocked(GpuEngine *e)
+{
+    if (e->cfxFloatInited)
+        return e->cfxFloatAvail;
+    e->cfxFloatInited = 1;
+    // The float build runs on any device, so this ensure can be reached on
+    // machines whose runtime never initialized (no loader, no GPU); refuse
+    // there instead of calling into an unresolved loader table.
+    if (!e->clAvail)
+        return 0;
+    e->cfxFloatProgram = gpuBuildCfxFloatProgram(e);
+    if (!e->cfxFloatProgram)
+        return 0;
+    e->kCfxHeightPointsF = gpuKernelFromProgram(e, e->cfxFloatProgram,
+        "cfxOverviewHeightPointsKernel");
+    e->kCfxBiomePointsF = gpuKernelFromProgram(e, e->cfxFloatProgram,
+        "cfxBiomeAtYPointsKernel");
+    e->cfxFloatAvail = e->kCfxHeightPointsF && e->kCfxBiomePointsF;
+    if (!e->cfxFloatAvail)
+        return 0;
+
+    // Fold the new kernels into the workgroup minimum.
+    cl_kernel all[] = { e->kCfxHeightPointsF, e->kCfxBiomePointsF };
     for (int i = 0; i < (int)(sizeof(all) / sizeof(*all)); i++)
     {
         size_t wgi = 0;
@@ -797,8 +872,9 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     t->perm = malloc((size_t)cap * 257);
     t->pinfo = malloc(sizeof(float) * (size_t)cap * 8);
     t->pinfoD = malloc(sizeof(double) * (size_t)cap * 8);
+    t->pinfoF = malloc(sizeof(float) * (size_t)cap * 8);
     if (!t->styp || !t->slen || !t->schild || !t->sloc || !t->sder
-        || !t->perm || !t->pinfo || !t->pinfoD)
+        || !t->perm || !t->pinfo || !t->pinfoD || !t->pinfoF)
         return 1;
 
     int cursor = 0;
@@ -822,6 +898,14 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     for (int i = 0; i < bn->terrain.octmain.octcnt; i++)
         packPerlin(t, &bn->terrain.octmain.octaves[i], cursor++);
     t->octTotal = cursor;
+
+    // The fp32 cfx kernels read float mirrors of the double tables: the
+    // same packing narrowed per element (slot 7 stays h2, where the float
+    // family's own pinfo pads zero - it derives h2 from info[1] instead).
+    for (int i = 0; i < t->octTotal * 8; i++)
+        t->pinfoF[i] = (float) t->pinfoD[i];
+    for (int i = 0; i < GPU_INST_COUNT; i++)
+        t->nampF[i] = (float) t->nampD[i];
 
     if (packSplineStack(t, &bn->ss, bn->sp, &t->rootSp))
         return 1;
@@ -940,15 +1024,19 @@ static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn)
         sizeof(float) * (size_t)e->tables.octTotal * 8, e->tables.pinfo);
     e->mPinfoD = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(double) * (size_t)e->tables.octTotal * 8, e->tables.pinfoD);
+    e->mPinfoF = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        sizeof(float) * (size_t)e->tables.octTotal * 8, e->tables.pinfoF);
     e->mNoff = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(e->tables.noff), e->tables.noff);
     e->mNamp = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(e->tables.namp), e->tables.namp);
     e->mNampD = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
         sizeof(e->tables.nampD), e->tables.nampD);
+    e->mNampF = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+        sizeof(e->tables.nampF), e->tables.nampF);
     size_t nodes = (size_t)e->tables.sNodeTotal;
-    if (e->mPerm && e->mPinfo && e->mPinfoD && e->mNoff && e->mNamp
-        && e->mNampD)
+    if (e->mPerm && e->mPinfo && e->mPinfoD && e->mPinfoF && e->mNoff
+        && e->mNamp && e->mNampD && e->mNampF)
     {
         e->mStyp = gpuBuf(e, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             sizeof(int) * nodes, e->tables.styp);
@@ -1564,6 +1652,54 @@ static cl_int gpuSetCfxTableArgsLocked(cl_kernel k, cl_uint *a)
 }
 
 /*
+ * The fp32 program's packed-table argument prefix: the same order as the
+ * fp64 setter, with the float table mirrors (mPinfoF/mNampF) and the float
+ * SurfaceNoise scalars in place of the double copies. The int buffers and
+ * offsets are precision-neutral and shared with the fp64 program.
+ */
+static cl_int gpuSetCfxFloatTableArgsLocked(cl_kernel k, cl_uint *a)
+{
+    cl_int err = CL_SUCCESS;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mPerm);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mPinfoF);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNoff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNampF);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mStyp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSlen);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSloc);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSder);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSchild);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootSp);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootFactor);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int),
+        &g_gpu.tables.rootJagged);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mSteps);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mParam);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_mem), &g_gpu.mNodes);
+    cl_uint btLen = g_gpu.tables.btLen;
+    cl_uint btOrder = g_gpu.tables.btOrder;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btLen);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_uint), &btOrder);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
+        &g_gpu.tables.snXZScale);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
+        &g_gpu.tables.snYScale);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
+        &g_gpu.tables.snXZFactor);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(float),
+        &g_gpu.tables.snYFactor);
+    cl_int octMinOff = g_gpu.tables.octMinOff;
+    cl_int octMaxOff = g_gpu.tables.octMaxOff;
+    cl_int octMainOff = g_gpu.tables.octMainOff;
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMinOff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMaxOff);
+    err |= g_gpu.cl.fn.SetKernelArg(k, (*a)++, sizeof(cl_int), &octMainOff);
+    return err;
+}
+
+/*
  * One guarded dispatch of the shim's cfxModernOverviewHeight() over a
  * rectangular quart lattice: heights[i] receives the solver result for
  * (x4 + col*stepX4, z4 + row*stepZ4). The caller derives the lattice and
@@ -1993,6 +2129,150 @@ int gpuCfxOverviewHeightsSparse(int *outY, const BiomeNoise *bn,
 }
 
 /*
+ * The fp32 twin of gpuCfxOverviewHeightsSparse(): one whole sparse heights
+ * chunk in a single dispatch, served by the float program's points kernel.
+ * Request shape, whole-or-nothing refusal, slab buffers, drain tail and
+ * metrics slots are identical to the fp64 entry; the kernel executes the
+ * SAME cfx expression compiled to single precision, so outputs approximate
+ * the CPU reference coordinate-dependently and are NOT bit-exact - the
+ * fp64 entry stays the exact reference. The float program needs no
+ * cl_khr_fp64 device and its availability is independent of the fp64 side.
+ */
+int gpuCfxOverviewHeightsSparseFloat(int *outY, const BiomeNoise *bn,
+    const int *x4, const int *z4, int n,
+    int mainFirst, int minMaxFirst, int truncated)
+{
+    if (!outY || !bn || !x4 || !z4
+        || n < 1 || n > GPU_MAX_POINTS
+        || mainFirst < 0 || mainFirst > 7
+        || minMaxFirst < 0 || minMaxFirst > 15
+        || (truncated != 0 && truncated != 1))
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+
+    // Metrics walls, same contract as the batch entries.
+    const uint64_t mutexT0 = nowNanos();
+    GPU_LOCK;
+    const uint64_t submitT0 = nowNanos();
+    g_gpu.metrics.slots[GPU_METRICS_MUTEX_WAIT_NANOS] += submitT0 - mutexT0;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init on purpose, same as the float paths.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    gpuEnsureRuntimeLocked(&g_gpu);
+    const int cfxReady = gpuEnsureCfxFloatLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead || !cfxReady)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu,
+                !g_gpu.clAvail || g_gpu.dead
+                    ? "no usable OpenCL device"
+                    : "no float cfx kernel program");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, n))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = g_gpu.kCfxHeightPointsF;
+    cl_uint a = 0;
+    cl_int err = gpuSetCfxFloatTableArgsLocked(k, &a);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inX);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inZ);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outYi);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &n);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &mainFirst);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &minMaxFirst);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &truncated);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    // Events are captured unconditionally (the rect entries only keep them
+    // under the profiling opt-in): the sparse drain tail needs handles to
+    // wait every enqueued command when a later enqueue fails.
+    cl_event ev[4] = { NULL, NULL, NULL, NULL };
+    cl_uint nEv = 0;
+    cl_uint nWrites = 0;
+    err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inX, CL_FALSE,
+        0, sizeof(int) * (size_t)n, x4, 0, NULL, &ev[nEv]);
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        nWrites++;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
+        err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inZ,
+            CL_FALSE, 0, sizeof(int) * (size_t)n, z4, 0, NULL, &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        nWrites++;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
+        size_t ls = g_gpu.localSize;
+        size_t global = ((size_t)n + ls - 1) / ls * ls;
+        err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 1, NULL,
+            &global, &ls, 0, NULL, &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_LAUNCHES]++;
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outYi,
+            CL_FALSE, 0, sizeof(int) * (size_t)n, outY, 0, NULL, &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        // One packed dispatch = one member: the chunk comes from one tile.
+        g_gpu.metrics.slots[GPU_METRICS_D2H_READS]++;
+        g_gpu.metrics.slots[GPU_METRICS_BATCH_MEMBERS]++;
+        g_gpu.metrics.slots[GPU_METRICS_BATCH_POINTS] += (uint64_t) n;
+        g_gpu.metrics.slots[GPU_METRICS_MEMBER_HIST + 1]++;
+        g_gpu.metrics.slots[GPU_METRICS_POINT_HIST
+            + gpuPointHistSlot((uint64_t) n)]++;
+    }
+    g_gpu.metrics.slots[GPU_METRICS_HOST_SUBMIT_NANOS]
+        += nowNanos() - submitT0;
+    GPU_UNLOCK;
+
+    uint64_t h2dNanos, kernNanos, d2hNanos, queueNanos;
+    const uint64_t waitT0 = nowNanos();
+    const int rc = gpuFinishSparseDispatch(err, ev, nEv, nWrites,
+        &h2dNanos, &kernNanos, &d2hNanos, &queueNanos,
+        "gpu cfx sparse float height dispatch", &g_gpu.heightCount);
+    const uint64_t waited = nowNanos() - waitT0;
+    GPU_LOCK;
+    g_gpu.metrics.slots[GPU_METRICS_HOST_WAIT_NANOS] += waited;
+    if (rc == 0)
+    {
+        g_gpu.metrics.slots[GPU_METRICS_H2D_NANOS] += h2dNanos;
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_NANOS] += kernNanos;
+        g_gpu.metrics.slots[GPU_METRICS_D2H_NANOS] += d2hNanos;
+        g_gpu.metrics.slots[GPU_METRICS_QUEUE_DELAY_NANOS] += queueNanos;
+    }
+    GPU_UNLOCK;
+    return rc;
+}
+
+/*
  * One submission of gpuCfxSurfaceBiomes() for n independent caller-Y
  * blocks: one lock acquisition, one table pack, one slab, one readback
  * wait for the whole set. Block i resolves the same voronoi/climate chain
@@ -2339,6 +2619,161 @@ int gpuCfxSurfaceBiomesSparse(int *outIds, const BiomeNoise *bn, uint64_t sha,
     const int rc = gpuFinishSparseDispatch(err, ev, nEv, nWrites,
         &h2dNanos, &kernNanos, &d2hNanos, &queueNanos,
         "gpu cfx sparse biome dispatch", &g_gpu.dispatchCount);
+    const uint64_t waited = nowNanos() - waitT0;
+    GPU_LOCK;
+    g_gpu.metrics.slots[GPU_METRICS_HOST_WAIT_NANOS] += waited;
+    if (rc == 0)
+    {
+        g_gpu.metrics.slots[GPU_METRICS_H2D_NANOS] += h2dNanos;
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_NANOS] += kernNanos;
+        g_gpu.metrics.slots[GPU_METRICS_D2H_NANOS] += d2hNanos;
+        g_gpu.metrics.slots[GPU_METRICS_QUEUE_DELAY_NANOS] += queueNanos;
+    }
+    GPU_UNLOCK;
+    return rc;
+}
+
+/*
+ * The fp32 twin of gpuCfxSurfaceBiomesSparse(): one whole sparse biomes
+ * chunk in a single dispatch, served by the float program's points kernel.
+ * Request shape, whole-or-nothing refusal, slab buffers, drain tail and
+ * metrics slots are identical to the fp64 entry; the per-point voronoi/
+ * climate chain is the SAME expression compiled to single precision, so
+ * ids approximate the CPU reference coordinate-dependently and are NOT
+ * bit-exact - the fp64 entry stays the exact reference. No fp64 device
+ * requirement; availability is independent of the fp64 side.
+ */
+int gpuCfxSurfaceBiomesSparseFloat(int *outIds, const BiomeNoise *bn,
+    uint64_t sha, const int *cellX, const int *cellZ,
+    const int *terrainY, int edge, int stride, int nCells)
+{
+    if (!outIds || !bn || !cellX || !cellZ || !terrainY
+        || edge < 1 || stride < 1 || nCells < 1
+        || edge > GPU_MAX_POINTS || nCells > GPU_MAX_POINTS
+        || (int64_t) nCells * (int64_t) edge * (int64_t) edge
+            > GPU_MAX_POINTS)
+        return 1;
+    if (bn->nptype >= 0 || bn->mc < MC_1_18)
+        return 1;
+    const int total = nCells * edge * edge;
+
+    // Metrics walls, same contract as the batch entries.
+    const uint64_t mutexT0 = nowNanos();
+    GPU_LOCK;
+    const uint64_t submitT0 = nowNanos();
+    g_gpu.metrics.slots[GPU_METRICS_MUTEX_WAIT_NANOS] += submitT0 - mutexT0;
+    int mode = gpuResolveModeLocked(&g_gpu);
+    // OFF precedes the runtime init on purpose, same as the float paths.
+    if (mode == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    gpuEnsureRuntimeLocked(&g_gpu);
+    const int cfxReady = gpuEnsureCfxFloatLocked(&g_gpu);
+    if (!g_gpu.clAvail || g_gpu.dead || !cfxReady)
+    {
+        if (mode == GPU_MODE_FORCE)
+            gpuForceWarnLocked(&g_gpu,
+                !g_gpu.clAvail || g_gpu.dead
+                    ? "no usable OpenCL device"
+                    : "no float cfx kernel program");
+        GPU_UNLOCK;
+        return 1;
+    }
+    if (!gpuPackForLocked(&g_gpu, bn))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+    GpuSlab *slab = &g_gpu.slabs[g_gpu.activeSlab];
+    g_gpu.activeSlab ^= 1;
+    if (gpuEnsureOutLocked(&g_gpu, slab, total))
+    {
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_kernel k = g_gpu.kCfxBiomePointsF;
+    cl_uint a = 0;
+    cl_int err = gpuSetCfxFloatTableArgsLocked(k, &a);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inCX);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inCZ);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->inY);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_mem), &slab->outId);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &total);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &edge);
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_int), &stride);
+    cl_ulong shaArg = sha;
+    err |= g_gpu.cl.fn.SetKernelArg(k, a++, sizeof(cl_ulong), &shaArg);
+    if (err != CL_SUCCESS)
+    {
+        gpuClErr(&g_gpu, err, "clSetKernelArg");
+        GPU_UNLOCK;
+        return 1;
+    }
+
+    cl_event ev[5] = { NULL, NULL, NULL, NULL, NULL };
+    cl_uint nEv = 0;
+    cl_uint nWrites = 0;
+    err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inCX, CL_FALSE,
+        0, sizeof(int) * (size_t)nCells, cellX, 0, NULL, &ev[nEv]);
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        nWrites++;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
+        err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inCZ,
+            CL_FALSE, 0, sizeof(int) * (size_t)nCells, cellZ, 0, NULL,
+            &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        nWrites++;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
+        err = g_gpu.cl.fn.EnqueueWriteBuffer(g_gpu.cl.queue, slab->inY,
+            CL_FALSE, 0, sizeof(int) * (size_t)total, terrainY, 0, NULL,
+            &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        nWrites++;
+        g_gpu.metrics.slots[GPU_METRICS_H2D_WRITES]++;
+        size_t ls = g_gpu.localSize;
+        size_t global = ((size_t)total + ls - 1) / ls * ls;
+        err = g_gpu.cl.fn.EnqueueNDRangeKernel(g_gpu.cl.queue, k, 1, NULL,
+            &global, &ls, 0, NULL, &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        g_gpu.metrics.slots[GPU_METRICS_KERNEL_LAUNCHES]++;
+        err = g_gpu.cl.fn.EnqueueReadBuffer(g_gpu.cl.queue, slab->outId,
+            CL_FALSE, 0, sizeof(int) * (size_t)total, outIds, 0, NULL,
+            &ev[nEv]);
+    }
+    if (err == CL_SUCCESS)
+    {
+        nEv++;
+        // One packed dispatch = one member: the chunk comes from one tile.
+        g_gpu.metrics.slots[GPU_METRICS_D2H_READS]++;
+        g_gpu.metrics.slots[GPU_METRICS_BATCH_MEMBERS]++;
+        g_gpu.metrics.slots[GPU_METRICS_BATCH_POINTS] += (uint64_t) total;
+        g_gpu.metrics.slots[GPU_METRICS_MEMBER_HIST + 1]++;
+        g_gpu.metrics.slots[GPU_METRICS_POINT_HIST
+            + gpuPointHistSlot((uint64_t) total)]++;
+    }
+    g_gpu.metrics.slots[GPU_METRICS_HOST_SUBMIT_NANOS]
+        += nowNanos() - submitT0;
+    GPU_UNLOCK;
+
+    uint64_t h2dNanos, kernNanos, d2hNanos, queueNanos;
+    const uint64_t waitT0 = nowNanos();
+    const int rc = gpuFinishSparseDispatch(err, ev, nEv, nWrites,
+        &h2dNanos, &kernNanos, &d2hNanos, &queueNanos,
+        "gpu cfx sparse float biome dispatch", &g_gpu.dispatchCount);
     const uint64_t waited = nowNanos() - waitT0;
     GPU_LOCK;
     g_gpu.metrics.slots[GPU_METRICS_HOST_WAIT_NANOS] += waited;
