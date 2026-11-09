@@ -507,6 +507,11 @@ static int gpuEnsureCfxLocked(GpuEngine *e)
     if (e->cfxInited)
         return e->cfxAvail;
     e->cfxInited = 1;
+    /* Without a live runtime (no loader, no GPU) the fn table stays all
+     * NULL and gpuDeviceHasFp64 would call through a zeroed function
+     * pointer; refuse like gpuEnsureCfxFloatLocked. */
+    if (!e->clAvail)
+        return 0;
     if (!gpuDeviceHasFp64(&e->cl))
         return 0;
     e->cfxProgram = gpuBuildCfxProgram(e);
