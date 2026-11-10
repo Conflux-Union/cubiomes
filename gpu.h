@@ -93,7 +93,8 @@ int gpuRuntimeInitialized(void);
 /* Nonzero while a background thread is compiling either OpenCL program.
  * Transient by construction (each program builds once per process); lets
  * batch callers fall back per call instead of tripping their permanent
- * refusal latch. */
+ * refusal latch. Force mode is the caller's exception: it must not take
+ * the fallback but wait the build out (the dispatches do). */
 int gpuBuildBusy(void);
 
 /*

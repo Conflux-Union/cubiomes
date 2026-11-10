@@ -24,10 +24,17 @@
 #include <windows.h>
 #define GPU_LOCK AcquireSRWLockExclusive(&g_gpu.lock)
 #define GPU_UNLOCK ReleaseSRWLockExclusive(&g_gpu.lock)
+/* Force-mode build wait: sleeps on the cond (releasing the lock) until a
+ * builder's install broadcast wakes it; the caller re-checks in a loop. */
+#define GPU_CONDWAIT SleepConditionVariableSRW(&g_gpu.cond, &g_gpu.lock, \
+    INFINITE, 0)
+#define GPU_CONDWAKE WakeAllConditionVariable(&g_gpu.cond)
 #else
 #include <pthread.h>
 #define GPU_LOCK pthread_mutex_lock(&g_gpu.lock)
 #define GPU_UNLOCK pthread_mutex_unlock(&g_gpu.lock)
+#define GPU_CONDWAIT pthread_cond_wait(&g_gpu.cond, &g_gpu.lock)
+#define GPU_CONDWAKE pthread_cond_broadcast(&g_gpu.cond)
 #endif
 
 #include "tables/btree18.h"
@@ -136,8 +143,10 @@ typedef struct
 {
 #if defined(_WIN32)
     SRWLOCK lock;
+    CONDITION_VARIABLE cond;
 #else
     pthread_mutex_t lock;
+    pthread_cond_t cond;
 #endif
     int modeUser;    // -1 when the env/default decides
     int modeEnv;     // resolved env value
@@ -178,8 +187,10 @@ static GpuEngine g_gpu =
 {
 #if defined(_WIN32)
     SRWLOCK_INIT,
+    CONDITION_VARIABLE_INIT,
 #else
     PTHREAD_MUTEX_INITIALIZER,
+    PTHREAD_COND_INITIALIZER,
 #endif
     -1, GPU_MODE_AUTO,
     // Everything after modeUser/modeEnv is zero-initialized: modeEnvParsed,
@@ -433,11 +444,16 @@ static cl_kernel gpuKernelFromProgram(const GpuCl *cl, cl_program program,
  * and take their CPU exit instead of queueing behind the JIT. The first
  * caller becomes the builder - with the client warmup that is virtually
  * always the warmup thread - and concurrent callers return on clBuilding.
- * One attempt is latched: a failed build keeps clInited with clAvail 0 and
- * is never retried, matching the engine's permanent-unavailable semantics.
+ * Force mode is the exception: it must not serve the CPU reference, so a
+ * forced caller waits on the cond until the builder installs (a failed
+ * build wakes it into the regular force-warn exit). One attempt is
+ * latched: a failed build keeps clInited with clAvail 0 and is never
+ * retried, matching the engine's permanent-unavailable semantics.
  */
 static void gpuEnsureRuntimeLocked(GpuEngine *e)
 {
+    while (e->clBuilding && gpuResolveModeLocked(e) == GPU_MODE_FORCE)
+        GPU_CONDWAIT;
     if (e->clInited || e->clBuilding)
         return;
     e->clBuilding = 1;
@@ -462,6 +478,7 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
     e->clInited = 1;
     e->clAvail = ok;
     e->clBuilding = 0;
+    GPU_CONDWAKE;
     if (!ok)
         return;
 
@@ -486,7 +503,8 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
  * dispatch rather than at engine init, so consumers that only ever use
  * the float climate paths never pay this program's JIT compile cost.
  * Busy-safe like the runtime ensure: while another thread compiles, this
- * answers 0 and the dispatch serves the CPU for that one call; a runtime
+ * answers 0 and the dispatch serves the CPU for that one call - except in
+ * force mode, which waits the build out on the cond instead. A runtime
  * that has not been attempted yet (still building) also answers 0 without
  * latching, so the cfx build happens once the runtime lands. Only a
  * settled runtime latches the single attempt - a failed build is not
@@ -495,6 +513,8 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
  */
 static int gpuEnsureCfxLocked(GpuEngine *e)
 {
+    while (e->cfxBuilding && gpuResolveModeLocked(e) == GPU_MODE_FORCE)
+        GPU_CONDWAIT;
     if (e->cfxInited || e->cfxBuilding)
         return e->cfxAvail;
     if (!e->clInited)
@@ -533,6 +553,7 @@ static int gpuEnsureCfxLocked(GpuEngine *e)
     e->kCfxBiomePoints = kBiomePoints;
     e->cfxAvail = program && kHeight && kBiome && kHeightPoints && kBiomePoints;
     e->cfxBuilding = 0;
+    GPU_CONDWAKE;
     if (!e->cfxAvail)
         return 0;
 

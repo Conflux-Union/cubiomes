@@ -69,6 +69,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <pthread.h>
 
 #define DENSE_W 96
 #define DENSE_H 96
@@ -4166,6 +4167,14 @@ static void runCfxColumnsMetricsCase(uint64_t seed, int *fail)
 }
 #endif /* parked surface-columns GPU path */
 
+/* The client's startup warmup thread, for the force-mode race smoke. */
+static void *warmupThread(void *arg)
+{
+    (void) arg;
+    gpuWarmup();
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     int full = 0;
@@ -4221,6 +4230,29 @@ int main(int argc, char **argv)
         }
         printf("skip: CUBIOMES_GPU=off (runtime untouched, verified)\n");
         return 0;
+    }
+    if (gpuGetMode() == GPU_MODE_FORCE)
+    {
+        /* Race the startup warmup: spawn it, then dispatch at once. Force
+         * must wait the compile out on the engine cond and land on the GPU
+         * - never serve the CPU reference for the busy window (pinned by
+         * the engagement counter). Arrival before the builder start is
+         * equally legal: the dispatch builds inline. */
+        pthread_t warm;
+        pthread_create(&warm, NULL, warmupThread, NULL);
+        int ids[16];
+        mapOverworldSurfaceBiome(ids, &probe.bn, probe.sha, 4, 0, 0, 4, 4);
+        pthread_join(warm, NULL);
+        if (gpuDispatchCount() == 0)
+        {
+            if (gpuDeviceName()[0] == 0)
+            {
+                printf("skip: no usable OpenCL device (CUBIOMES_GPU=force)\n");
+                return 0;
+            }
+            printf("FAIL: forced dispatch served the CPU during warmup\n");
+            return 1;
+        }
     }
     /* The availability probe is a pure peek (no init side effect), so warm
      * the engine first - the same entry the mod's client calls at startup. */
