@@ -86,6 +86,16 @@ const char *gpuDeviceName(void);
  * OFF mode must leave this at zero for the whole process lifetime. */
 int gpuRuntimeInitialized(void);
 
+/*
+ * Nonzero once a GPU error has latched the engine dead for the process:
+ * every dispatch falls back to the CPU loops from then on, but the mode
+ * and the probed device name keep their values. Read-only peek that, unlike
+ * gpuDeviceName(), never triggers runtime initialization. Consumers that
+ * key results on the actually-serving engine (e.g. the baseline cache's
+ * engine identity) must consult this, not the device name.
+ */
+int gpuEngineDead(void);
+
 /* Number of surface-biome dispatches the engine has completed successfully
  * (kernel run + results read back), process-global. Diagnostic aid for
  * verifying that a code path actually engaged the GPU. Height dispatches are

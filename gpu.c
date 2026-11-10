@@ -999,6 +999,14 @@ int gpuRuntimeInitialized(void)
     return inited;
 }
 
+int gpuEngineDead(void)
+{
+    GPU_LOCK;
+    int dead = g_gpu.dead;
+    GPU_UNLOCK;
+    return dead;
+}
+
 uint64_t gpuDispatchCount(void)
 {
     GPU_LOCK;
