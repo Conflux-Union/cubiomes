@@ -144,6 +144,7 @@ typedef struct
     int modeEnvParsed;
     int clInited;
     int clAvail;
+    int clBuilding;  // a thread is compiling the runtime program (transient)
     int dead;
     int forceWarned;
     GpuCl cl;
@@ -156,6 +157,7 @@ typedef struct
 #endif
     int cfxAvail;       // cfx program built + all four cfx kernels live
     int cfxInited;      // the one lazy cfx build attempt has been made
+    int cfxBuilding;    // a thread is compiling the cfx program (transient)
     size_t localSize;
     GpuTables tables;
     uint64_t keyProbe;
@@ -181,9 +183,9 @@ static GpuEngine g_gpu =
 #endif
     -1, GPU_MODE_AUTO,
     // Everything after modeUser/modeEnv is zero-initialized: modeEnvParsed,
-    // clInited, clAvail, dead, forceWarned, cl, kHeight, the cfx program and
-    // availability flags, localSize (re-set at first init), tables, cache
-    // key, counters, slabs.
+    // clInited, clAvail, clBuilding, dead, forceWarned, cl, kHeight, the cfx
+    // program and availability/building flags, localSize (re-set at first
+    // init), tables, cache key, counters, slabs.
 };
 
 static void gpuClErr(GpuEngine *e, cl_int err, const char *what)
@@ -362,28 +364,29 @@ int gpuGetMode(void)
  * Builds one OpenCL program from the given source parts and options. A
  * build failure prints the compiler log once and reports unavailable, so
  * a device that cannot compile a program degrades to the CPU path like
- * any other engine problem.
+ * any other engine problem. Operates on a plain GpuCl so the caller can
+ * pass either the installed runtime or a builder's private copy.
  */
-static cl_program gpuBuildProgram(GpuEngine *e, const char *const *parts,
+static cl_program gpuBuildProgram(const GpuCl *cl, const char *const *parts,
     const size_t *lens, cl_uint n, const char *opts, const char *what)
 {
     cl_int err = CL_SUCCESS;
-    cl_program program = e->cl.fn.CreateProgramWithSource(e->cl.context, n,
+    cl_program program = cl->fn.CreateProgramWithSource(cl->context, n,
         (const char **) parts, lens, &err);
     if (!program || err != CL_SUCCESS)
         return NULL;
-    err = e->cl.fn.BuildProgram(program, 1, &e->cl.device, opts, NULL, NULL);
+    err = cl->fn.BuildProgram(program, 1, &cl->device, opts, NULL, NULL);
     if (err != CL_SUCCESS)
     {
         size_t logLen = 0;
-        e->cl.fn.GetProgramBuildInfo(program, e->cl.device,
+        cl->fn.GetProgramBuildInfo(program, cl->device,
             CL_PROGRAM_BUILD_LOG, 0, NULL, &logLen);
         if (logLen > 0)
         {
             char *log = (char *) malloc(logLen + 1);
             if (log)
             {
-                e->cl.fn.GetProgramBuildInfo(program, e->cl.device,
+                cl->fn.GetProgramBuildInfo(program, cl->device,
                     CL_PROGRAM_BUILD_LOG, logLen, log, NULL);
                 log[logLen - 1] = 0;
                 fprintf(stderr, "gpu: %s program build failed:\n%s\n",
@@ -391,7 +394,7 @@ static cl_program gpuBuildProgram(GpuEngine *e, const char *const *parts,
                 free(log);
             }
         }
-        e->cl.fn.ReleaseProgram(program);
+        cl->fn.ReleaseProgram(program);
         return NULL;
     }
     return program;
@@ -405,46 +408,62 @@ static cl_program gpuBuildProgram(GpuEngine *e, const char *const *parts,
  * CPU chains, never bit-exact. No extension pragma or device check:
  * float execution needs no extensions.
  */
-static cl_program gpuBuildCfxProgram(GpuEngine *e)
+static cl_program gpuBuildCfxProgram(const GpuCl *cl)
 {
     const char *src = GPU_CL_SRC_CFX;
     const size_t len = sizeof(GPU_CL_SRC_CFX) - 1;
-    return gpuBuildProgram(e, &src, &len, 1,
+    return gpuBuildProgram(cl, &src, &len, 1,
         GPU_CL_OPTS " -cl-single-precision-constant", "cfx float");
 }
 
-static cl_kernel gpuKernelFromProgram(GpuEngine *e, cl_program program,
+static cl_kernel gpuKernelFromProgram(const GpuCl *cl, cl_program program,
     const char *name)
 {
     cl_int err = CL_SUCCESS;
-    cl_kernel k = e->cl.fn.CreateKernel(program, name, &err);
+    cl_kernel k = cl->fn.CreateKernel(program, name, &err);
     if (!k || err != CL_SUCCESS)
         return NULL;
     return k;
 }
 
+/*
+ * Builds the OpenCL runtime (loader, context, program, kernels) on first
+ * use. Called with the engine lock held; the lock is released for the
+ * compile itself, so dispatches arriving in that window observe clAvail 0
+ * and take their CPU exit instead of queueing behind the JIT. The first
+ * caller becomes the builder - with the client warmup that is virtually
+ * always the warmup thread - and concurrent callers return on clBuilding.
+ * One attempt is latched: a failed build keeps clInited with clAvail 0 and
+ * is never retried, matching the engine's permanent-unavailable semantics.
+ */
 static void gpuEnsureRuntimeLocked(GpuEngine *e)
 {
-    if (e->clInited)
+    if (e->clInited || e->clBuilding)
         return;
-    e->clInited = 1;
+    e->clBuilding = 1;
     e->localSize = 64;
-    if (gpuClInit(&e->cl) != 0)
-        return;
-    e->clAvail = 1;
-    if (gpuClBuild(&e->cl, GPU_CL_SRC, GPU_CL_OPTS, "surfaceBiomeKernel"))
+    GPU_UNLOCK;
+
+    GpuCl cl;
+    cl_kernel kHeight = NULL;
+    int ok = gpuClInit(&cl) == 0
+        && gpuClBuild(&cl, GPU_CL_SRC, GPU_CL_OPTS, "surfaceBiomeKernel") == 0;
+    if (ok)
     {
-        e->clAvail = 0;
-        return;
+        cl_int err = CL_SUCCESS;
+        kHeight = cl.fn.CreateKernel(cl.program, "terrainHeightKernel", &err);
+        ok = kHeight && err == CL_SUCCESS;
     }
-    cl_int err = CL_SUCCESS;
-    e->kHeight = e->cl.fn.CreateKernel(e->cl.program, "terrainHeightKernel",
-        &err);
-    if (!e->kHeight || err != CL_SUCCESS)
-    {
-        e->clAvail = 0;
+
+    GPU_LOCK;
+    /* Install in one locked step: a reader sees no runtime or a complete one. */
+    e->cl = cl;
+    e->kHeight = kHeight;
+    e->clInited = 1;
+    e->clAvail = ok;
+    e->clBuilding = 0;
+    if (!ok)
         return;
-    }
 
     // One local size serves every built kernel: the smallest workgroup
     // limit wins. The cfx program may not exist yet (built lazily on the
@@ -466,38 +485,54 @@ static void gpuEnsureRuntimeLocked(GpuEngine *e)
  * Lazy build for the cfx product kernels: compiled on the first cfx
  * dispatch rather than at engine init, so consumers that only ever use
  * the float climate paths never pay this program's JIT compile cost.
- * Safe under the engine mutex (the cfx dispatches hold it); cfxInited
- * latches the single attempt - a failed build is not retried, and the
- * dispatches fall back to the CPU for the process lifetime like any
- * other engine problem.
+ * Busy-safe like the runtime ensure: while another thread compiles, this
+ * answers 0 and the dispatch serves the CPU for that one call; a runtime
+ * that has not been attempted yet (still building) also answers 0 without
+ * latching, so the cfx build happens once the runtime lands. Only a
+ * settled runtime latches the single attempt - a failed build is not
+ * retried, and the dispatches fall back to the CPU for the process
+ * lifetime like any other engine problem.
  */
 static int gpuEnsureCfxLocked(GpuEngine *e)
 {
-    if (e->cfxInited)
+    if (e->cfxInited || e->cfxBuilding)
         return e->cfxAvail;
+    if (!e->clInited)
+        return 0;
     e->cfxInited = 1;
-    /* Without a live runtime (no loader, no GPU) the fn table stays all
-     * NULL; refuse like the runtime ensure instead of calling into an
-     * unresolved loader table. */
+    /* Without a live runtime the fn table stays all NULL; refuse like the
+     * runtime ensure instead of calling into an unresolved loader table. */
     if (!e->clAvail)
         return 0;
-    e->cfxProgram = gpuBuildCfxProgram(e);
-    if (!e->cfxProgram)
-        return 0;
-    e->kCfxHeight = gpuKernelFromProgram(e, e->cfxProgram,
-        "cfxOverviewHeightKernel");
-    e->kCfxBiome = gpuKernelFromProgram(e, e->cfxProgram,
-        "cfxBiomeAtYKernel");
-    e->kCfxHeightPoints = gpuKernelFromProgram(e, e->cfxProgram,
-        "cfxOverviewHeightPointsKernel");
-    e->kCfxBiomePoints = gpuKernelFromProgram(e, e->cfxProgram,
-        "cfxBiomeAtYPointsKernel");
-#if 0 /* parked surface-columns GPU path */
-    e->kCfxColPoints = gpuKernelFromProgram(e, e->cfxProgram,
-        "cfxSurfaceColumnsPointsKernel");
-#endif
-    e->cfxAvail = e->kCfxHeight && e->kCfxBiome
-        && e->kCfxHeightPoints && e->kCfxBiomePoints;
+    e->cfxBuilding = 1;
+    /* The installed runtime's loader table, context and device are
+     * immutable once installed, so the build runs on a copy outside the
+     * lock. */
+    GpuCl cl = e->cl;
+    GPU_UNLOCK;
+
+    cl_program program = gpuBuildCfxProgram(&cl);
+    cl_kernel kHeight = NULL, kBiome = NULL, kHeightPoints = NULL,
+        kBiomePoints = NULL;
+    if (program)
+    {
+        kHeight = gpuKernelFromProgram(&cl, program,
+            "cfxOverviewHeightKernel");
+        kBiome = gpuKernelFromProgram(&cl, program, "cfxBiomeAtYKernel");
+        kHeightPoints = gpuKernelFromProgram(&cl, program,
+            "cfxOverviewHeightPointsKernel");
+        kBiomePoints = gpuKernelFromProgram(&cl, program,
+            "cfxBiomeAtYPointsKernel");
+    }
+
+    GPU_LOCK;
+    e->cfxProgram = program;
+    e->kCfxHeight = kHeight;
+    e->kCfxBiome = kBiome;
+    e->kCfxHeightPoints = kHeightPoints;
+    e->kCfxBiomePoints = kBiomePoints;
+    e->cfxAvail = program && kHeight && kBiome && kHeightPoints && kBiomePoints;
+    e->cfxBuilding = 0;
     if (!e->cfxAvail)
         return 0;
 
@@ -983,10 +1018,11 @@ static int gpuPackForLocked(GpuEngine *e, const BiomeNoise *bn)
 const char *gpuDeviceName(void)
 {
     GPU_LOCK;
+    /* Peek only: a stats reader must not become the JIT builder - the
+     * warmup and the dispatches own the build. */
     int mode = gpuResolveModeLocked(&g_gpu);
-    if (mode != GPU_MODE_OFF)
-        gpuEnsureRuntimeLocked(&g_gpu);
-    const char *name = g_gpu.clAvail ? g_gpu.cl.devName : "";
+    const char *name = mode != GPU_MODE_OFF && g_gpu.clAvail
+        ? g_gpu.cl.devName : "";
     GPU_UNLOCK;
     return name;
 }
@@ -997,6 +1033,44 @@ int gpuRuntimeInitialized(void)
     int inited = g_gpu.clInited;
     GPU_UNLOCK;
     return inited;
+}
+
+/* Whether a background thread is currently compiling either OpenCL program. */
+int gpuBuildBusy(void)
+{
+    GPU_LOCK;
+    int busy = g_gpu.clBuilding || g_gpu.cfxBuilding;
+    GPU_UNLOCK;
+    return busy;
+}
+
+int gpuWarmup(void)
+{
+    GPU_LOCK;
+    if (gpuResolveModeLocked(&g_gpu) == GPU_MODE_OFF)
+    {
+        GPU_UNLOCK;
+        return -1;
+    }
+    const int busy = g_gpu.clBuilding || g_gpu.cfxBuilding;
+    const int settled = g_gpu.clInited
+        && (g_gpu.cfxInited || !g_gpu.clAvail);
+    const uint64_t t0 = nowNanos();
+    gpuEnsureRuntimeLocked(&g_gpu);
+    if (g_gpu.clAvail)
+        gpuEnsureCfxLocked(&g_gpu);
+    const int status = (g_gpu.clAvail ? 1 : 0) | (g_gpu.cfxAvail ? 2 : 0);
+    char dev[sizeof g_gpu.cl.devName];
+    memcpy(dev, g_gpu.cl.devName, sizeof dev);
+    GPU_UNLOCK;
+    /* Log only when this call did the work: the duration (seconds warm,
+     * minutes cold) explains why early prediction tiles came from the CPU. */
+    if (!busy && !settled)
+        fprintf(stderr, "gpu: OpenCL warmup finished in %.1fs"
+            " (climate=%d cfx=%d device=\"%s\")\n",
+            (double) (nowNanos() - t0) / 1e9,
+            status & 1, (status >> 1) & 1, dev);
+    return status;
 }
 
 int gpuEngineDead(void)
@@ -1039,8 +1113,8 @@ static int gpuSurfaceBiomeAvailable(const BiomeNoise *bn)
         return 0;
     GPU_LOCK;
     int mode = gpuResolveModeLocked(&g_gpu);
-    if (mode != GPU_MODE_OFF)
-        gpuEnsureRuntimeLocked(&g_gpu);
+    /* Peek, never build: during the warmup compile this reports unavailable
+     * and the caller serves the CPU reference for that call. */
     int healthy = g_gpu.clAvail && !g_gpu.dead;
     if (!healthy && mode == GPU_MODE_FORCE)
         gpuForceWarnLocked(&g_gpu, "no usable OpenCL device");

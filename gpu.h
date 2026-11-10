@@ -73,18 +73,37 @@ int gpuGetMode(void);
  * 1.18+ Overworld biome-noise generator (the supported version/dimension
  * combination). Scale coverage is fixed: the dispatch supports the surface
  * scales 1 (block + voronoi) and 4 (quart). Does not validate the requested
- * area; the dispatch re-checks its own arguments.
+ * area; the dispatch re-checks its own arguments. Peek-only like
+ * gpuDeviceName(): it reports the currently built engine and never
+ * initializes, so a cold process answers "unavailable" until the warmup or
+ * a dispatch has compiled the programs.
  */
 int gpuAvailable(const Generator *g);
 
 /* Name of the probed OpenCL device, or an empty string before first use /
- * when unavailable. Diagnostic aid, not part of the dispatch contract. */
+ * when unavailable. Diagnostic aid, not part of the dispatch contract.
+ * Peek-only: never triggers the runtime build. */
 const char *gpuDeviceName(void);
 
 /* Returns nonzero once the engine has initialized the OpenCL runtime
  * (loader load + device probe + program build). Diagnostic aid for tests:
  * OFF mode must leave this at zero for the whole process lifetime. */
 int gpuRuntimeInitialized(void);
+
+/* Nonzero while a background thread is compiling either OpenCL program.
+ * Transient by construction (each program builds once per process); lets
+ * batch callers fall back per call instead of tripping their permanent
+ * refusal latch. */
+int gpuBuildBusy(void);
+
+/*
+ * Compiles both OpenCL programs now instead of on the first dispatch: the
+ * caller becomes the builder while concurrent dispatches serve the CPU
+ * reference (see gpuEnsureRuntimeLocked in gpu.c). Returns -1 when the
+ * engine mode is off, else bit 1 = climate runtime, bit 2 = cfx program.
+ * Idempotent per process.
+ */
+int gpuWarmup(void);
 
 /*
  * Nonzero once a GPU error has latched the engine dead for the process:

@@ -4222,6 +4222,9 @@ int main(int argc, char **argv)
         printf("skip: CUBIOMES_GPU=off (runtime untouched, verified)\n");
         return 0;
     }
+    /* The availability probe is a pure peek (no init side effect), so warm
+     * the engine first - the same entry the mod's client calls at startup. */
+    gpuWarmup();
     if (!gpuAvailable(&probe))
     {
         printf("skip: no usable OpenCL device (CUBIOMES_GPU=%s)\n",
