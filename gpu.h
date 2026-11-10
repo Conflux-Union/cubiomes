@@ -366,6 +366,7 @@ int gpuCfxSurfaceBiomesSparseFloat(int *outIds, const BiomeNoise *bn,
     uint64_t sha, const int *cellX, const int *cellZ,
     const int *terrainY, int edge, int stride, int nCells);
 
+#if 0 /* parked: surface-columns GPU path - net-wall negative in the product seam per the seeded e2e A/B (opening wall +6.2%, first tile +76%); restore = flip the parked guards in both repos and rebuild */
 /*
  * The mod's cfxSurfaceColumns() point seam (the exact-columns stage): n
  * anchors, anchor i at block coords (blockX[i], blockZ[i]), all solved in
@@ -408,6 +409,7 @@ int gpuCfxSurfaceColumnsPoints(int *outSolidY, int *outFluidY,
 int gpuCfxSurfaceColumnsPointsFloat(int *outSolidY, int *outFluidY,
     int *outSurfaceY, int *outFlags, const BiomeNoise *bn,
     const int *blockX, const int *blockZ, int n);
+#endif /* parked surface-columns GPU path */
 
 /*
  * Engine metrics: a fixed uint64 slot array accumulated by the cfx batch

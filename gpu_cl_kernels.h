@@ -2245,6 +2245,7 @@ static const char GPU_CL_SRC_CFX[] =
 "    voronoiAccess3DK(sha, sampleX, surface, sampleZ, &x4, &y4, &z4);\n"
 "    outId[gi] = sampleBiomeNoiseD(&ctx, x4, y4, z4);\n"
 "}\n"
+#if 0 /* parked: surface-columns GPU path - net-wall negative in the product seam per the seeded e2e A/B (opening wall +6.2%, first tile +76%); restore = flip the parked guards in both repos and rebuild */
 "// ---- surface columns (the col stage's exact seam) ----\n"
 "//\n"
 "// mapOverworldSurfaceColumns() for MC 1.18+: one anchor per work item, the\n"
@@ -3362,6 +3363,7 @@ static const char GPU_CL_SRC_CFX[] =
 "    outCol[gi * 4 + 2] = surfaceY;\n"
 "    outCol[gi * 4 + 3] = flags;\n"
 "}\n"
+#endif /* parked surface-columns GPU path */
 ;
 
 #endif

@@ -55,6 +55,8 @@ _Static_assert(TN_SPAGHETTI_3D_RARITY == 0 && TN_SPAGHETTI_3D_THICKNESS == 1
     "kernel terrain noise indices");
 _Static_assert(SP_CONTINENTALNESS == 0 && SP_EROSION == 1
     && SP_RIDGES == 2 && SP_WEIRDNESS == 3, "kernel spline parameter ids");
+
+#if 0 /* parked: surface-columns GPU path - net-wall negative in the product seam per the seeded e2e A/B (opening wall +6.2%, first tile +76%); restore = flip the parked guards in both repos and rebuild */
 _Static_assert(AN_BARRIER == 0 && AN_FLOODEDNESS == 1 && AN_SPREAD == 2
     && AN_LAVA == 3 && AN_MAX == 4, "kernel aquifer noise instance ids");
 _Static_assert(SURFACE_COLUMN_FLUID == 0x1, "kernel surface column flag");
@@ -63,6 +65,9 @@ _Static_assert(SURFACE_COLUMN_FLUID == 0x1, "kernel surface column flag");
 // aquifer block rides last (kernel ids 27..30) so every offset the older
 // kernels' arguments carry stays stable.
 #define GPU_INST_COUNT (NP_MAX + 1 + TN_MAX + AN_MAX)
+#else
+#define GPU_INST_COUNT (NP_MAX + 1 + TN_MAX)
+#endif
 // Dispatch size cap: ~1M points keeps one output slab bounded (~59 MB worst
 // case with the climate-np plane; two rotating slabs ~120 MB); larger
 // queries take the CPU fallback and stay correct.
@@ -129,7 +134,9 @@ typedef struct
     cl_mem outYi;  // cfx int height output
     cl_mem inX, inZ;   // cfx sparse height coords
     cl_mem inCX, inCZ; // cfx sparse biome cell origins
+#if 0 /* parked surface-columns GPU path */
     cl_mem outCol;     // cfx surface columns, 4 ints interleaved per anchor
+#endif
     int cap;       // points all nine buffers are sized for
 } GpuSlab;
 
@@ -153,12 +160,16 @@ typedef struct
     cl_kernel kHeight;  // terrainHeightKernel, created from the built program
     cl_kernel kCfxHeight, kCfxBiome;  // cfxOverviewHeightKernel, cfxBiomeAtYKernel
     cl_kernel kCfxHeightPoints, kCfxBiomePoints;  // their sparse twins
+#if 0 /* parked surface-columns GPU path */
     cl_kernel kCfxColPoints;  // cfxSurfaceColumnsPointsKernel
+#endif
     cl_kernel kCfxHeightPointsF, kCfxBiomePointsF;  // sparse twins in fp32
+#if 0 /* parked surface-columns GPU path */
     cl_kernel kCfxColPointsF;  // the columns twin in fp32
-    int cfxAvail;       // fp64 program built + all five cfx kernels live
+#endif
+    int cfxAvail;       // fp64 program built + all four cfx kernels live
     int cfxInited;      // the one lazy cfx build attempt has been made
-    int cfxFloatAvail;  // float program built + all three float kernels live
+    int cfxFloatAvail;  // float program built + both sparse float kernels live
     int cfxFloatInited; // the one lazy float cfx build attempt has been made
     size_t localSize;
     GpuTables tables;
@@ -293,8 +304,10 @@ static void gpuReleaseSlab(GpuEngine *e, GpuSlab *slab)
         e->cl.fn.ReleaseMemObject(slab->inCX);
     if (slab->inCZ)
         e->cl.fn.ReleaseMemObject(slab->inCZ);
+#if 0 /* parked surface-columns GPU path */
     if (slab->outCol)
         e->cl.fn.ReleaseMemObject(slab->outCol);
+#endif
     memset(slab, 0, sizeof(*slab));
 }
 
@@ -536,18 +549,23 @@ static int gpuEnsureCfxLocked(GpuEngine *e)
         "cfxOverviewHeightPointsKernel");
     e->kCfxBiomePoints = gpuKernelFromProgram(e, e->cfxProgram,
         "cfxBiomeAtYPointsKernel");
+#if 0 /* parked surface-columns GPU path */
     e->kCfxColPoints = gpuKernelFromProgram(e, e->cfxProgram,
         "cfxSurfaceColumnsPointsKernel");
+#endif
     e->cfxAvail = e->kCfxHeight && e->kCfxBiome
-        && e->kCfxHeightPoints && e->kCfxBiomePoints && e->kCfxColPoints;
+        && e->kCfxHeightPoints && e->kCfxBiomePoints;
     if (!e->cfxAvail)
         return 0;
 
     // Fold the new kernels into the workgroup minimum.
     cl_kernel all[] =
     {
-        e->kCfxHeight, e->kCfxBiome, e->kCfxHeightPoints, e->kCfxBiomePoints,
+        e->kCfxHeight, e->kCfxBiome, e->kCfxHeightPoints, e->kCfxBiomePoints
+#if 0 /* parked surface-columns GPU path */
+        ,
         e->kCfxColPoints
+#endif
     };
     for (int i = 0; i < (int)(sizeof(all) / sizeof(*all)); i++)
     {
@@ -584,17 +602,22 @@ static int gpuEnsureCfxFloatLocked(GpuEngine *e)
         "cfxOverviewHeightPointsKernel");
     e->kCfxBiomePointsF = gpuKernelFromProgram(e, e->cfxFloatProgram,
         "cfxBiomeAtYPointsKernel");
+#if 0 /* parked surface-columns GPU path */
     e->kCfxColPointsF = gpuKernelFromProgram(e, e->cfxFloatProgram,
         "cfxSurfaceColumnsPointsKernel");
-    e->cfxFloatAvail = e->kCfxHeightPointsF && e->kCfxBiomePointsF
-        && e->kCfxColPointsF;
+#endif
+    e->cfxFloatAvail = e->kCfxHeightPointsF && e->kCfxBiomePointsF;
     if (!e->cfxFloatAvail)
         return 0;
 
     // Fold the new kernels into the workgroup minimum.
     cl_kernel all[] =
     {
-        e->kCfxHeightPointsF, e->kCfxBiomePointsF, e->kCfxColPointsF
+        e->kCfxHeightPointsF, e->kCfxBiomePointsF
+#if 0 /* parked surface-columns GPU path */
+        ,
+        e->kCfxColPointsF
+#endif
     };
     for (int i = 0; i < (int)(sizeof(all) / sizeof(*all)); i++)
     {
@@ -879,8 +902,10 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     cap += bn->jagged.octA.octcnt + bn->jagged.octB.octcnt;
     for (int i = 0; i < TN_MAX; i++)
         cap += bn->terrainNoise[i].octA.octcnt + bn->terrainNoise[i].octB.octcnt;
+#if 0 /* parked surface-columns GPU path */
     for (int i = 0; i < AN_MAX; i++)
         cap += bn->aquiferNoise[i].octA.octcnt + bn->aquiferNoise[i].octB.octcnt;
+#endif
     cap += bn->terrain.octmin.octcnt + bn->terrain.octmax.octcnt
         + bn->terrain.octmain.octcnt;
     if (cap <= 0 || cap > (1 << 16))
@@ -925,12 +950,14 @@ static int packTables(GpuTables *t, const BiomeNoise *bn)
     for (int i = 0; i < bn->terrain.octmain.octcnt; i++)
         packPerlin(t, &bn->terrain.octmain.octaves[i], cursor++);
 
+#if 0 /* parked surface-columns GPU path */
     // The aquifer noises append after every existing instance AND after the
     // terrain octaves, so all offsets the older kernels' arguments carry
     // (instance noff entries and octMin/octMax/octMain) stay stable.
     for (int i = 0; i < AN_MAX; i++, inst++)
         if (packDoublePerlin(t, &bn->aquiferNoise[i], inst, &cursor, cap))
             return 1;
+#endif
     t->octTotal = cursor;
 
     // The fp32 cfx kernels read float mirrors of the double tables: the
@@ -1200,10 +1227,14 @@ static int gpuEnsureOutLocked(GpuEngine *e, GpuSlab *slab, int points)
     if (slab->inCX)
         slab->inCZ = gpuBuf(e, CL_MEM_READ_ONLY,
             sizeof(int) * (size_t)points, NULL);
+#if 0 /* parked surface-columns GPU path */
     if (slab->inCZ)
         slab->outCol = gpuBuf(e, CL_MEM_READ_WRITE,
             sizeof(int) * (size_t)points * 4, NULL);
     if (!slab->outCol)
+        return 1;
+#endif
+    if (!slab->inCZ)
         return 1;
     slab->cap = points;
     return 0;
@@ -2825,6 +2856,7 @@ int gpuCfxSurfaceBiomesSparseFloat(int *outIds, const BiomeNoise *bn,
     return rc;
 }
 
+#if 0 /* parked: surface-columns GPU path - net-wall negative in the product seam per the seeded e2e A/B (opening wall +6.2%, first tile +76%); restore = flip the parked guards in both repos and rebuild */
 /*
  * Shared body of the two surface-columns point entries (fp64 exact and
  * fp32 drift-budgeted): n anchors, the coordinate buffers in, one kernel
@@ -3020,6 +3052,7 @@ int gpuCfxSurfaceColumnsPointsFloat(int *outSolidY, int *outFluidY,
     return gpuCfxColumnsDispatch(outSolidY, outFluidY, outSurfaceY, outFlags,
         bn, blockX, blockZ, n, 1);
 }
+#endif /* parked surface-columns GPU path */
 
 /*
  * One guarded dispatch of the shim's cfxSurfaceBiomes() inner loop: for

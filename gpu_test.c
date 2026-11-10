@@ -3546,6 +3546,7 @@ static void runCfxMetricsCase(uint64_t seed, CaseStats *total, int *fail)
     free(terrainY);
 }
 
+#if 0 /* parked: surface-columns GPU path - net-wall negative in the product seam per the seeded e2e A/B (opening wall +6.2%, first tile +76%); restore = flip the parked guards in both repos and rebuild */
 //----------------------------------------------------------------------
 // Surface-columns point kernels (the col stage's exact GPU seam).
 
@@ -4367,6 +4368,7 @@ static void runCfxColumnsMetricsCase(uint64_t seed, int *fail)
     free(oSurface);
     free(oFlags);
 }
+#endif /* parked surface-columns GPU path */
 
 int main(int argc, char **argv)
 {
@@ -4679,6 +4681,7 @@ int main(int argc, char **argv)
         runCfxSparseFloatDriftCase(mainMc, 0, seeds[0], -7500000, -7500000,
             &total, &fail);
     }
+#if 0 /* parked: surface-columns GPU path - net-wall negative in the product seam per the seeded e2e A/B (opening wall +6.2%, first tile +76%); restore = flip the parked guards in both repos and rebuild */
     // Surface-columns point kernels: the col stage's exact seam. The fp64
     // entry must match mapOverworldSurfaceColumns() plane by plane
     // bit-exactly; the fp32 twin pins shape invariance and prints drift.
@@ -4719,6 +4722,7 @@ int main(int argc, char **argv)
     runCfxColumnsTimingCase(&colPts, &fail);
     runCfxColumnsMetricsCase(seeds[0], &fail);
     printf("col sections: %lld anchor comparisons\n\n", colPts);
+#endif /* parked surface-columns GPU path */
 
     runCfxMetricsCase(seeds[0], &total, &fail);
     runCfxModeCase(seeds[0], &total, &fail);
