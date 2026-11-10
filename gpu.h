@@ -176,16 +176,16 @@ int gpuMapOverworldTerrainHeightRows(float *y, int *ids, const BiomeNoise *bn,
     int x, int z, int w, int rows, int zStride);
 
 /*
- * Bit-exact dispatches for the mod's product hot path (confluxnative.c).
- * Unlike the float approximations above, these re-run the shim's own CPU
- * chains in double precision and must stay bit-identical to them: the shim
- * compiles with -ffp-contract=off, the kernels run with FP_CONTRACT OFF,
- * and the packed tables carry the seed-derived noise parameters at full
- * double fidelity. They need an fp64 OpenCL device (cl_khr_fp64); without
- * one they return nonzero on every call and the caller stays on the CPU.
- * Mode handling, engine latching and table caching are shared with the
- * float dispatches; the counters count by family (height vs biome), not
- * per kernel flavor.
+ * Dispatches for the mod's product hot path (confluxnative.c). Like the
+ * float approximations above they re-run the shim's own CPU chains, but
+ * in single precision: outputs approximate the double CPU chains
+ * coordinate-dependently and are gated by the gpu_test drift harness,
+ * not by bit identity. The shim compiles with -ffp-contract=off, the
+ * kernels run with FP_CONTRACT OFF, and the same packed tables serve
+ * both kernel families. They run on any OpenCL device - no extension
+ * requirement. Mode handling, engine latching and table caching are
+ * shared with the float dispatches; the counters count by family
+ * (height vs biome), not per kernel flavor.
  */
 
 /*
@@ -196,9 +196,8 @@ int gpuMapOverworldTerrainHeightRows(float *y, int *ids, const BiomeNoise *bn,
  * its direct path) and the cheap integer interpolation between lattice
  * points. mainFirst/minMaxFirst/truncated are the shim's
  * cfxNoiseDetailForStride() result for the sampling stride. Returns 0 when
- * the GPU filled all gridW*gridH heights bit-exactly; nonzero means run
- * the CPU path (unsupported arguments, disabled/dead engine, no fp64
- * device, or any GPU error).
+ * the GPU filled all gridW*gridH heights; nonzero means run the CPU path
+ * (unsupported arguments, disabled/dead engine, or any GPU error).
  */
 int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
     int x4, int z4, int gridW, int gridH, int stepX4, int stepZ4,
@@ -216,12 +215,12 @@ int gpuCfxOverviewHeights(int *heights, const BiomeNoise *bn,
  * bitmask) and the sum of gridW[i]*gridH[i] is capped like the single
  * entry. Returns 0 when the batch was attempted: blocks whose enqueue
  * failed host-side carry bit i in *failMask, their output range is left
- * untouched and the rest is filled bit-exactly, so the caller CPU-repairs
- * exactly those blocks. Nonzero means the whole batch was refused before
- * any GPU work or output write (bad arguments incl. the caps, disabled/
- * dead engine, no fp64 device), *failMask is untouched, and the caller
+ * untouched and the rest is filled by the kernel, so the caller
+ * CPU-repairs exactly those blocks. Nonzero means the whole batch was
+ * refused before any GPU work or output write (bad arguments incl. the
+ * caps, disabled/dead engine), *failMask is untouched, and the caller
  * falls back per block. Bit-exact against dispatching the same blocks
- * one by one.
+ * one by one (same program, no per-point state).
  */
 int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
     const long *flatOffsets, const BiomeNoise *bn, const int *x4,
@@ -232,13 +231,11 @@ int gpuCfxOverviewHeightsBatch(int *failMask, int *heights,
 /*
  * The shim's cfxSurfaceBiomes() inner loop: for each point (blockX +
  * col*stride, blockZ + row*stride), terrainY[row*w + col] (clamped at 62,
- * exactly like the shim) picks the voronoi nucleus and the double climate
- * stack resolves the surface biome id into ids[row*w + col]. terrainY is
- * row-major w*rows and uploads per call. The CPU nucleus memo this may
- * replace is itself bit-identical to the shim's plain loop, so the kernel
- * inherits bit-exactness against both. Batch-size policy (skip tiny refine
- * cells) belongs to the caller; this guard rejects only unsupported shapes
- * (pre-1.18, over-cap batches, engine problems, no fp64 device).
+ * exactly like the shim) picks the voronoi nucleus and the single-precision
+ * climate stack resolves the surface biome id into ids[row*w + col].
+ * terrainY is row-major w*rows and uploads per call. Batch-size policy
+ * (skip tiny refine cells) belongs to the caller; this guard rejects only
+ * unsupported shapes (pre-1.18, over-cap batches, engine problems).
  */
 int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
     int blockX, int blockZ, int w, int rows, int stride,
@@ -259,14 +256,15 @@ int gpuCfxSurfaceBiomes(int *ids, const BiomeNoise *bn, uint64_t sha,
  * is an int bitmask) and the sum of w[i]*rows[i] is capped like the single
  * entry. Returns 0 when the batch was attempted: blocks whose enqueue
  * failed host-side carry bit i in *failMask, their output range is left
- * untouched and the rest is filled bit-exactly, so the caller CPU-repairs
- * exactly those blocks. Nonzero means the whole batch was refused before
- * any GPU work or output write (bad arguments incl. the n cap, a negative
- * flatOffsets entry or the points cap; mode off; disabled/dead engine or
- * no fp64 device; table-pack failure; slab-growth/allocation failure; the
- * terrainY upload failing to enqueue), *failMask is untouched, and the
- * caller falls back per block. Bit-exact against dispatching the same
- * blocks one by one.
+ * untouched and the rest is filled by the kernel, so the caller
+ * CPU-repairs exactly those blocks. Nonzero means the whole batch was
+ * refused before any GPU work or output write (bad arguments incl. the n
+ * cap, a negative flatOffsets entry or the points cap; mode off;
+ * disabled/dead engine; table-pack failure; slab-growth/allocation
+ * failure; the terrainY upload failing to enqueue), *failMask is
+ * untouched, and the caller falls back per block. Bit-exact against
+ * dispatching the same blocks one by one (same program, no per-point
+ * state).
  */
 int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
     const BiomeNoise *bn, uint64_t sha,
@@ -280,12 +278,12 @@ int gpuCfxSurfaceBiomesBatch(int *failMask, int *ids, const long *flatOffsets,
  * detail scalars are one set shared by every point of the chunk. There is
  * no failMask: a sparse chunk is rejected whole-or-nothing, and rejection
  * fires before ANY GPU work or caller-output write. Returns 0 when the GPU
- * filled all n heights bit-exactly; nonzero means the whole chunk was
+ * filled all n heights; nonzero means the whole chunk was
  * refused and the caller runs the CPU path per point (NULL pointers, n
  * outside [1, ~1M], detail scalars out of range - mainFirst 0..7,
  * minMaxFirst 0..15, truncated 0/1 - a BiomeNoise not fully initialized by
- * setBiomeSeed() or pre-1.18, mode off, disabled/dead engine, no fp64
- * device, table-pack failure, slab-growth/allocation failure, or an
+ * setBiomeSeed() or pre-1.18, mode off, disabled/dead engine,
+ * table-pack failure, slab-growth/allocation failure, or an
  * enqueue failure). Bit-exact against the rect entry over the same points.
  */
 int gpuCfxOverviewHeightsSparse(int *outY, const BiomeNoise *bn,
@@ -303,11 +301,11 @@ int gpuCfxOverviewHeightsSparse(int *outY, const BiomeNoise *bn,
  * exactly like the shim). sha is shared by every point. Like the heights
  * entry there is no failMask: rejection is whole-or-nothing and fires
  * before ANY GPU work or output write. Returns 0 when the GPU filled all
- * nCells*edge*edge ids bit-exactly; nonzero means the whole chunk was
+ * nCells*edge*edge ids; nonzero means the whole chunk was
  * refused and the caller runs the CPU path per point (NULL pointers,
  * edge/stride/nCells below 1, the points total over ~1M, a BiomeNoise not
  * fully initialized by setBiomeSeed() or pre-1.18, mode off, disabled/
- * dead engine, no fp64 device, table-pack failure, slab-growth/allocation
+ * dead engine, table-pack failure, slab-growth/allocation
  * failure, or an enqueue failure). Bit-exact against the rect entry over
  * the same points.
  */
@@ -315,96 +313,31 @@ int gpuCfxSurfaceBiomesSparse(int *outIds, const BiomeNoise *bn, uint64_t sha,
     const int *cellX, const int *cellZ,
     const int *terrainY, int edge, int stride, int nCells);
 
-/*
- * Float-precision sparse twins of the two entries above, for the part of
- * the mod's product seam where drift is budgeted: the kernels are the SAME
- * cfx expression compiled a second time in single precision (cfx_real=float
- * against float table mirrors), so outputs approximate the CPU reference
- * coordinate-dependently and are NOT bit-exact - neither against the fp64
- * entries, which stay the exact reference. The request shapes, validation,
- * whole-or-nothing refusal, slab/buffer usage, drain tail and metrics slots
- * are identical to the fp64 twins, and the family counters count these
- * dispatches like any other. They run on any OpenCL device (no
- * cl_khr_fp64 requirement) and their availability is independent of the
- * fp64 side.
- */
-
-/*
- * Float twin of gpuCfxOverviewHeightsSparse(): `n` arbitrary quart points
- * (x4[i], z4[i]) solved in ONE kernel launch and read back in ONE read,
- * outY[i] receiving the point's height as the single-precision execution
- * of the same per-point expression. The detail scalars are one set shared
- * by every point of the chunk. Same whole-or-nothing refusal as the fp64
- * entry, firing before ANY GPU work or caller-output write: nonzero means
- * the whole chunk was refused and the caller runs the CPU path per point
- * (NULL pointers, n outside [1, ~1M], detail scalars out of range -
- * mainFirst 0..7, minMaxFirst 0..15, truncated 0/1 - a BiomeNoise not
- * fully initialized by setBiomeSeed() or pre-1.18, mode off, disabled/
- * dead engine, table-pack failure, slab-growth/allocation failure, or an
- * enqueue failure).
- */
-int gpuCfxOverviewHeightsSparseFloat(int *outY, const BiomeNoise *bn,
-    const int *x4, const int *z4, int n,
-    int mainFirst, int minMaxFirst, int truncated);
-
-/*
- * Float twin of gpuCfxSurfaceBiomesSparse(): nCells cells, cell j covering
- * edge*edge points spaced `stride` apart starting at (cellX[j], cellZ[j]),
- * resolved in ONE kernel launch and read back in ONE read over the
- * contiguous chunk-local span [0..nCells*edge*edge), with terrainY packed
- * at the same flat index (clamped at 62 by the kernel, exactly like the
- * shim). ids are the single-precision execution of the same per-point
- * chain. Same whole-or-nothing refusal as the fp64 entry, firing before
- * ANY GPU work or caller-output write: nonzero means the whole chunk was
- * refused and the caller runs the CPU path per point (NULL pointers,
- * edge/stride/nCells below 1, the points total over ~1M, a BiomeNoise not
- * fully initialized by setBiomeSeed() or pre-1.18, mode off, disabled/
- * dead engine, table-pack failure, slab-growth/allocation failure, or an
- * enqueue failure).
- */
-int gpuCfxSurfaceBiomesSparseFloat(int *outIds, const BiomeNoise *bn,
-    uint64_t sha, const int *cellX, const int *cellZ,
-    const int *terrainY, int edge, int stride, int nCells);
-
 #if 0 /* parked: surface-columns GPU path - net-wall negative in the product seam per the seeded e2e A/B (opening wall +6.2%, first tile +76%); restore = flip the parked guards in both repos and rebuild */
 /*
  * The mod's cfxSurfaceColumns() point seam (the exact-columns stage): n
  * anchors, anchor i at block coords (blockX[i], blockZ[i]), all solved in
  * ONE kernel launch and read back in ONE read. The four output planes
- * receive exactly what mapOverworldSurfaceColumns() fills for the same
- * anchor on MC 1.18+: outSolidY[i] the first solid block of the column's
+ * mirror what mapOverworldSurfaceColumns() fills for the same anchor on
+ * MC 1.18+: outSolidY[i] the first solid block of the column's
  * banded surface search, outFluidY[i] the aquifer fluid surface (the
  * INT32_MIN sentinel when no fluid stands above it), outSurfaceY[i] the
  * fluid surface when it stands above the solid one and the solid surface
  * otherwise, and outFlags[i] SURFACE_COLUMN_FLUID iff the fluid surface
  * won - the same whole-or-nothing post-pass the CPU entry applies, so the
  * caller fills its arrays from this dispatch alone. The kernel re-runs the
- * CPU's double chains op-for-op (terrain splines, cave/noodle carving, the
+ * CPU's chains op-for-op (terrain splines, cave/noodle carving, the
  * banded surface search, and the full aquifer stack over the packed AN_*
  * noises and the per-seed aquifer hash seeds passed as runtime arguments)
- * and is bit-exact against the CPU path; like the other cfx entries it
- * needs an fp64 device. There is no failMask: a sparse chunk is rejected
+ * in single precision, so the planes drift budgeted against the CPU path.
+ * There is no failMask: a sparse chunk is rejected
  * whole-or-nothing, and rejection fires before ANY GPU work or caller-
  * output write. Returns 0 when the GPU filled all four planes for every
- * anchor bit-exactly; nonzero means the whole chunk was refused and the
+ * anchor; nonzero means the whole chunk was refused and the
  * caller runs the CPU path per anchor (NULL pointers, n outside [1, ~1M],
  * a BiomeNoise not fully initialized by setBiomeSeed() or pre-1.18, mode
- * off, disabled/dead engine, no fp64 device, table-pack failure, slab/
+ * off, disabled/dead engine, table-pack failure, slab/
  * allocation failure, or an enqueue failure).
- */
-int gpuCfxSurfaceColumnsPoints(int *outSolidY, int *outFluidY,
-    int *outSurfaceY, int *outFlags, const BiomeNoise *bn,
-    const int *blockX, const int *blockZ, int n);
-
-/*
- * Float twin of gpuCfxSurfaceColumnsPoints(): the SAME anchor request, the
- * same four output planes, the same whole-or-nothing refusal firing before
- * ANY GPU work or output write, served by the float program's column
- * kernel. The planes approximate the CPU reference coordinate-dependently
- * (drift-budgeted, NOT bit-exact - the fp64 entry stays the exact
- * reference); the plane semantics and the INT32_MIN fluid sentinel are
- * exact. No fp64 device requirement; availability is independent of the
- * fp64 side.
  */
 int gpuCfxSurfaceColumnsPointsFloat(int *outSolidY, int *outFluidY,
     int *outSurfaceY, int *outFlags, const BiomeNoise *bn,

@@ -36,17 +36,11 @@
  * first line: the CPU references compile with -ffp-contract=off, so the
  * kernels must not contract either, and the pragma travels with the source
  * text rather than any build-site composition. GPU_CL_SRC builds the float
- * program alone. GPU_CL_SRC_CFX compiles TWICE (gpu.c): as the fp64 cfx
- * program (GPU_CL_PRAGMA_FP64 first, built only when the device advertises
- * cl_khr_fp64) whose math must stay bit-identical to the shim's CPU chains,
- * and as the fp32 sparse program (this source alone with -DCFX_REAL=float
- * -cl-single-precision-constant) whose approximate outputs are drift-budgeted.
- * A device without fp64 still builds both float programs unchanged and only
- * the fp64 cfx dispatches fall back to the CPU.
+ * program alone. GPU_CL_SRC_CFX compiles as the second program with
+ * -cl-single-precision-constant (gpu.c): every kernel executes the same
+ * expression as the shim's double CPU chains but in single precision, so
+ * outputs are a coordinate-dependent drift-budgeted approximation.
  */
-static const char GPU_CL_PRAGMA_FP64[] =
-"#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n";
-
 static const char GPU_CL_SRC[] =
 "#pragma OPENCL FP_CONTRACT OFF\n"
 "\n"
@@ -1240,16 +1234,12 @@ static const char GPU_CL_SRC[] =
 /*
  * The mod's product hot path section (confluxnative.c): the analytic
  * overview-height solver and the caller-Y surface-biome sample. The math is
- * written once against the cfx_real typedef below and compiled twice. The
- * fp64 program (fp64 pragma first, then this source) re-runs the shim's CPU
- * chains bit-identically: built lazily on the first cfx dispatch and only on
- * cl_khr_fp64 devices, and a device without fp64 keeps building only the
- * float program(s) while these dispatches fall back to the CPU. The float
- * program (this source alone, -DCFX_REAL=float -cl-single-precision-constant)
- * serves the mod's sparse float entries with the SAME expression executed in
- * single precision - approximate, drift-budgeted, never bit-exact. Everything
- * in the fp64 build must stay bit-identical to the shim's CPU chains, which
- * run with -ffp-contract=off on both sides:
+ * written once against the cfx_real typedef (float) and compiled once, with
+ * -cl-single-precision-constant (gpu.c): every kernel re-runs the shim's
+ * CPU chain expression in single precision, so outputs approximate the
+ * double CPU chains coordinate-dependently and are gated by the drift
+ * budgets in gpu_test.c, not by bit identity. The chains themselves run
+ * with -ffp-contract=off on both sides:
  *
  * - Arithmetic mirrors the shim op-for-op (same association, same
  *   (float)/(int) narrowing points; FP_CONTRACT OFF forbids FMA reshaping).
@@ -1266,17 +1256,12 @@ static const char GPU_CL_SRC[] =
  * program above: it carries its own copies of the shared integer helpers
  * (mcStepSeedK, voronoiAccess3DK, npDistK, btreeLookupK, TO_NP,
  * floordivK) - fix bugs on both sides in the same commit. The cfx_real
- * helpers below are the double twins of the float ones above, and the
- * float build is their single-precision execution.
+ * helpers below are the single-precision twins of the float ones above.
  */
 static const char GPU_CL_SRC_CFX[] =
 "#pragma OPENCL FP_CONTRACT OFF\n"
 "\n"
-"#ifdef CFX_REAL\n"
-"typedef CFX_REAL cfx_real;\n"
-"#else\n"
-"typedef double cfx_real;\n"
-"#endif\n"
+"typedef float cfx_real;\n"
 "\n"
 "#define CFX_JAGGED_KEEP_OCTAVES 4\n"
 "#define CFX_OVERVIEW_ITERATIONS 2\n"
